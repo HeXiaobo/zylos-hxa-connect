@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.3] - 2026-05-18
+
+### Fixed
+- Post-upgrade hook now backs up `config.json` to
+  `config.json.backup.<ISO-timestamp>` before mutation and uses atomic
+  write (temp + rename) for the new config (#105)
+
+### Removed
+- Reverted in-config `_legacy_*` field injection
+  (`_legacy_display_name`) in favor of whole-file backups; the original
+  config schema is preserved (#105)
+
 ## [1.7.2] - 2026-04-12
 
 ### Added
