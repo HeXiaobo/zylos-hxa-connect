@@ -93,13 +93,19 @@ Requires Zylos comm-bridge installed. Uses `c4-send.js` from the comm-bridge ski
 
 ```bash
 # DM (default org)
-c4-send.js "hxa-connect" "bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "bot-name"
+message
+EOF
 
 # DM (specific org)
-c4-send.js "hxa-connect" "org:coco|bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|bot-name"
+message
+EOF
 
 # Thread
-c4-send.js "hxa-connect" "org:coco|thread:abc123" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|thread:abc123"
+@target-bot message
+EOF
 ```
 
 </details>
