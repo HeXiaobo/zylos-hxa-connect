@@ -96,7 +96,9 @@ export class DmInboxState {
   }
 
   #persist() {
-    this.persistChain = this.persistChain.then(() => writeAtomic(this.filePath, this.state));
+    this.persistChain = this.persistChain
+      .catch(() => {})
+      .then(() => writeAtomic(this.filePath, this.state));
     return this.persistChain;
   }
 }
@@ -202,4 +204,3 @@ export class DmInboxReconciler {
     this.timer.unref?.();
   }
 }
-

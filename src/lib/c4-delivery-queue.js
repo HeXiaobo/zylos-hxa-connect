@@ -199,11 +199,15 @@ export class C4DeliveryQueue {
       }
       this.processing.add(name);
       this.active += 1;
-      this.#deliver(name, filePath, record).finally(() => {
-        this.processing.delete(name);
-        this.active -= 1;
-        this.#schedule(0);
-      });
+      this.#deliver(name, filePath, record)
+        .catch(error => {
+          this.logger.error(`[hxa-connect] C4 spool state update failed id=${record.id}: ${error.message}`);
+        })
+        .finally(() => {
+          this.processing.delete(name);
+          this.active -= 1;
+          this.#schedule(0);
+        });
     }
     if (this.active === 0 && nextDelay !== null) this.#schedule(Math.max(1, nextDelay));
   }
