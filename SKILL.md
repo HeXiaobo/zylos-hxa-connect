@@ -19,6 +19,8 @@ lifecycle:
   preserve:
     - config.json
     - logs/
+    - dm-inbox-state.json
+    - c4-spool/
 
 upgrade:
   repo: coco-xyz/zylos-hxa-connect

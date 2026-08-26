@@ -132,6 +132,29 @@ Map<label, { client, threadCtx, config }>
 - Failed orgs are removed from the map; if all fail, process exits
 - Graceful shutdown disconnects all clients
 
+## Durable DM Intake
+
+DM delivery is at-least-once from the Hub to C4 and idempotent at the Core
+boundary:
+
+1. The WebSocket remains the low-latency path.
+2. Every 15 seconds, each org compares the Hub's authoritative `inbox(since)`
+   result with `~/zylos/components/hxa-connect/dm-inbox-state.json`.
+3. A message absent from the persistent seen set is written atomically to
+   `~/zylos/components/hxa-connect/c4-spool/` before the handler acknowledges
+   local acceptance.
+4. The spool retries C4 delivery with bounded exponential backoff and survives
+   PM2 restarts. It is bounded at 2,000 entries; a full spool fails visibly and
+   leaves the Hub message unresolved for the next inbox poll.
+5. When Core exposes assistant response streams, the org, event kind, and Hub
+   message ID derive stable request/source IDs. Replaying the same spool entry
+   or inbox overlap therefore reuses the original turn.
+
+The checkpoint poll deliberately overlaps five minutes. Rate-limited DMs are
+not marked seen, so they remain inside the reconciliation window until the
+token bucket admits them. Policy, self-message, and size rejections are marked
+seen but always logged with an explicit reason and Hub message ID.
+
 ## Access Control
 
 Per-org DM and thread (group) access control. No owner concept — purely policy-based. Each org has independent policies under `orgs.<label>.access`.
