@@ -155,6 +155,22 @@ not marked seen, so they remain inside the reconciliation window until the
 token bucket admits them. Policy, self-message, and size rejections are marked
 seen but always logged with an explicit reason and Hub message ID.
 
+## Durable Assistant Replies
+
+HXA provides `scripts/stream.js` as the channel adapter for Core's assistant
+response stream. Non-terminal progress events are acknowledged without
+creating chat noise. A `RunCompleted` or `RunFailed` event is converted into
+one visible DM or thread response.
+
+Terminal delivery is recorded under
+`~/zylos/components/hxa-connect/assistant-response-deliveries/` before the Hub
+request starts. Replaying the same request ID and event sequence therefore
+does not send twice. If the Hub request returns an ambiguous transport error,
+the next Core retry first queries the authoritative inbox (or thread history)
+for the same self-authored content and source channel. It resends only when no
+matching Hub message exists. DM response routes retain the triggering Hub
+message ID so reconciliation can recover the exact direct-channel ID.
+
 ## Access Control
 
 Per-org DM and thread (group) access control. No owner concept — purely policy-based. Each org has independent policies under `orgs.<label>.access`.

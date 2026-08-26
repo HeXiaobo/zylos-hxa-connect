@@ -18,7 +18,13 @@
  */
 
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
+import os from 'node:os';
+import path from 'node:path';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import {
+  AssistantResponseDeliveryStore,
+  createAssistantResponseSender,
+} from '../src/lib/assistant-response-delivery.js';
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 
@@ -89,6 +95,37 @@ const client = new HxaConnectClient({
   token: org.agentToken,
   ...(org.orgId && { orgId: org.orgId }),
 });
+
+const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+if (assistantRequestId) {
+  const home = process.env.HOME || os.homedir();
+  const store = new AssistantResponseDeliveryStore({
+    directory: path.join(home, 'zylos/components/hxa-connect/assistant-response-deliveries'),
+  });
+  const sender = createAssistantResponseSender({
+    store,
+    defaultOrgLabel: effectiveLabel,
+    resolveOrg: async label => {
+      if (label !== effectiveLabel) {
+        throw new Error(`HXA response org mismatch: ${label}`);
+      }
+      return { client, agentId: org.agentId, agentName: org.agentName };
+    },
+  });
+  try {
+    const result = await sender.send({
+      requestId: assistantRequestId,
+      endpointId: rawEndpoint,
+      content: message,
+      suppressSkip: target.startsWith('thread:'),
+    });
+    console.log(`Sent assistant response to ${target} (${result.status}${result.replayed ? ', replay' : ''})`);
+    process.exit(0);
+  } catch (error) {
+    console.error(`Error sending assistant response to ${target}: ${error.message}`);
+    process.exit(1);
+  }
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

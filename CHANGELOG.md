@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.5] - 2026-08-27
+
+### Added
+- A native C4 assistant response-stream adapter for HXA DMs and threads. Runtime
+  terminal events now produce the actual Hub reply instead of closing the
+  assistant request without an outbound message.
+- A persistent terminal-delivery ledger. Core replays are idempotent, and an
+  ambiguous Hub transport result is reconciled against the authoritative inbox
+  or thread before any resend.
+
+### Fixed
+- DM response routes now retain the triggering Hub message ID, allowing
+  ambiguous delivery reconciliation to prove the exact direct channel instead
+  of matching only on bot name and text.
+
 ## [1.7.4] - 2026-08-27
 
 ### Added

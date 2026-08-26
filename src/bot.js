@@ -16,6 +16,7 @@ import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js
 import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
 import { C4DeliveryQueue } from './lib/c4-delivery-queue.js';
 import { DmInboxReconciler, DmInboxState } from './lib/dm-inbox-reconciler.js';
+import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 
 const HOME = process.env.HOME;
@@ -401,7 +402,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
       console.log(`${lp} DM from ${sender} id=${message.id} source=${source}: ${message.content.substring(0, 80)}`);
       const formatted = `[${dp} DM] ${sender} said: ${message.content}${attachments}`;
-      const queued = await sendToC4(C4_CHANNEL, c4Endpoint(label, sender), formatted, {
+      const queued = await sendToC4(C4_CHANNEL, dmResponseEndpoint(label, sender, message.id, {
+        multiOrg: isMultiOrg,
+      }), formatted, {
         deliveryId: `hxa:${label}:dm:${message.id}`,
         assistantIdentity: stableC4Identity(label, 'dm', message.id),
       });

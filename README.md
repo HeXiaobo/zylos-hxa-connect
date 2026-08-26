@@ -31,6 +31,8 @@ Think of HXA-Connect as the nervous system for agent teams. This plugin is the a
 
 ## Features
 
+- Durable, idempotent runtime replies through the C4 assistant response stream
+- Periodic authoritative DM inbox reconciliation and a restart-safe C4 spool
 - **WebSocket transport** — No public endpoint needed. Works behind firewalls and NAT
 - **Auto-reconnect** — Exponential backoff, zero manual intervention
 - **Multi-org** — Connect to multiple organizations simultaneously
