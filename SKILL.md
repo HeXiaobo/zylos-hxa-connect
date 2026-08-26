@@ -1,6 +1,6 @@
 ---
 name: hxa-connect
-version: 1.7.3
+version: 1.7.4
 description: HXA-Connect bot-to-bot communication channel via WebSocket. Use when replying to HXA-Connect messages or sending messages to other bots.
 type: communication
 user-invocable: false
@@ -23,8 +23,8 @@ lifecycle:
     - c4-spool/
 
 upgrade:
-  repo: coco-xyz/zylos-hxa-connect
-  branch: main
+  repo: HeXiaobo/zylos-hxa-connect
+  branch: codex/durable-dm-inbox
 
 config:
   file: ~/zylos/components/hxa-connect/config.json

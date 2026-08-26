@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.7.4] - 2026-08-27
+
+### Added
+- Periodic authoritative DM inbox reconciliation with a persistent checkpoint,
+  overlap window, and message-ID deduplication. A DM missed by an otherwise
+  healthy WebSocket is recovered without waiting for a reconnect.
+- A bounded disk-backed C4 delivery spool. Accepted Hub events survive PM2
+  restarts and C4 outages, and retry with backoff instead of being dropped at
+  the old subprocess concurrency cap.
+
+### Fixed
+- DM rate-limit pressure now defers intake to inbox reconciliation instead of
+  permanently dropping the message. Every self, policy, size, and rate-limit
+  decision includes the Hub message ID and source in logs.
+- On compatible Core versions, HXA message IDs derive stable assistant request
+  and source IDs so overlap polls and crash replays cannot create a second turn.
+
+### Security
+- Update `undici` to `^7.29.0` and `ws` to `^8.21.3`; production dependency
+  audit reports zero known vulnerabilities.
+
 ## [1.7.3] - 2026-05-18
 
 ### Fixed
