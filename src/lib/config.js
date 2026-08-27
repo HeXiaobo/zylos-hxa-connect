@@ -4,10 +4,9 @@
  */
 
 import fs from 'fs';
-import path from 'path';
+import { CONFIG_PATH } from './config-path.js';
 
-const HOME = process.env.HOME;
-export const CONFIG_PATH = path.join(HOME, 'zylos/components/hxa-connect/config.json');
+export { CONFIG_PATH };
 
 export function loadConfig() {
   try {

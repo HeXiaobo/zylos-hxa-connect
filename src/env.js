@@ -5,9 +5,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import { CONFIG_PATH } from './lib/config-path.js';
 
 const HOME = process.env.HOME;
-const CONFIG_PATH = path.join(HOME, 'zylos/components/hxa-connect/config.json');
 const ENV_PATH = path.join(HOME, 'zylos/.env');
 
 const LABEL_RE = /^[a-z0-9][a-z0-9-]*$/;
@@ -26,7 +26,10 @@ if (fs.existsSync(ENV_PATH)) {
   }
 }
 
-export const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+export const PROXY_URL = process.env.HXA_CONNECT_PROXY
+  || process.env.HTTPS_PROXY
+  || process.env.HTTP_PROXY
+  || '';
 
 export function loadConfig() {
   let raw;
