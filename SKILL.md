@@ -25,7 +25,7 @@ lifecycle:
 
 upgrade:
   repo: HeXiaobo/zylos-hxa-connect
-  branch: codex/durable-dm-inbox
+  branch: main
 
 config:
   file: ~/zylos/components/hxa-connect/config.json
