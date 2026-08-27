@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { getConfigPath } from '../src/lib/config-path.js';
 
 function timestampSuffix() {
   return new Date().toISOString().replace(/[:.]/g, '-');
@@ -25,7 +26,7 @@ function atomicWriteJSON(filePath, obj) {
 }
 
 const LOG_PREFIX = '[hxa-connect post-upgrade]';
-const configPath = path.join(process.env.HOME, 'zylos/components/hxa-connect/config.json');
+const configPath = getConfigPath();
 
 if (!fs.existsSync(configPath)) {
   console.log(`${LOG_PREFIX} No config file found, nothing to migrate.`);

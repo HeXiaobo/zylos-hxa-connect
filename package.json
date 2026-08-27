@@ -1,12 +1,12 @@
 {
   "name": "zylos-hxa-connect",
-  "version": "1.7.3",
+  "version": "1.7.5",
   "type": "module",
   "private": true,
   "dependencies": {
     "@coco-xyz/hxa-connect-sdk": "^1.6.0",
     "https-proxy-agent": "^7.0.5",
-    "undici": "^7.24.6",
-    "ws": "^8.18.0"
+    "undici": "^7.29.0",
+    "ws": "^8.21.3"
   }
 }

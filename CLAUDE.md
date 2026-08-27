@@ -4,11 +4,11 @@ Development guidelines for zylos-hxa-connect.
 
 ## Project Conventions
 
-- **ESM only** — Use `import`/`export`, never `require()`. All files use ES Modules (`"type": "module"` in package.json)
+- **ESM by default** — Use `import`/`export` for application code. PM2's `ecosystem.config.cjs` and its shared `src/lib/config-path.cjs` adapter are the CommonJS compatibility boundary.
 - **Node.js 20+** — Minimum runtime version
 - **Conventional commits** — `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`
 - **No `files` in package.json** — Rely on `.gitignore` to exclude unnecessary files
-- **Secrets in `.env` only** — Never commit secrets. Use `~/zylos/.env` for credentials, `config.json` for non-sensitive runtime config
+- **Secrets in `.env` only** — Never commit secrets. Use `${ZYLOS_DIR}/.env` when `ZYLOS_DIR` is non-empty, otherwise `~/zylos/.env`; keep non-sensitive runtime config in `config.json`.
 - **English for code** — Comments, commit messages, PR descriptions, and documentation in English
 
 ## Release Process

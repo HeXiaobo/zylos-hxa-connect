@@ -8,16 +8,28 @@
  */
 
 import * as hxaSdk from '@coco-xyz/hxa-connect-sdk';
-import { execFile } from 'child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js';
 import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
-import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
+import { C4DeliveryQueue } from './lib/c4-delivery-queue.js';
+import { DmInboxReconciler, DmInboxState } from './lib/dm-inbox-reconciler.js';
+import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
+import { getMediaBaseDir, generateFilename } from './lib/media.js';
+import { getRuntimePaths } from './lib/config-path.js';
 
-const HOME = process.env.HOME;
-const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const {
+  c4ReceivePath: C4_RECEIVE,
+  c4SpoolDir: C4_SPOOL_DIR,
+  dmInboxStatePath: DM_INBOX_STATE_PATH,
+} = getRuntimePaths();
+const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
+const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
+  && configuredDmReconcileInterval >= 5_000
+  ? configuredDmReconcileInterval
+  : 15_000;
 
 const config = migrateConfig();
 const resolved = resolveOrgs(config);
@@ -155,7 +167,7 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
   if (!parts || !parts.length) return {};
 
   const localPaths = {};
-  const orgDir = path.join(MEDIA_BASE_DIR, orgLabel);
+  const orgDir = path.join(getMediaBaseDir(), orgLabel);
 
   try {
     await fs.promises.mkdir(orgDir, { recursive: true });
@@ -194,6 +206,23 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
 }
 
 await setupFetchProxy();
+
+const c4ReceiveSource = (() => {
+  try {
+    return fs.readFileSync(C4_RECEIVE, 'utf8');
+  } catch {
+    return '';
+  }
+})();
+const supportsAssistantResponseStream = c4ReceiveSource.includes('--assistant-request-id')
+  && c4ReceiveSource.includes('--assistant-source-id');
+const c4Queue = new C4DeliveryQueue({
+  spoolDir: C4_SPOOL_DIR,
+  c4ReceivePath: C4_RECEIVE,
+});
+const dmInboxState = new DmInboxState({ filePath: DM_INBOX_STATE_PATH });
+await c4Queue.start();
+await dmInboxState.load();
 
 const MAX_WS_PAYLOAD = 1048576; // 1 MB
 const MAX_CONTENT_LENGTH = 51200; // 50 KB
@@ -238,11 +267,6 @@ function getRateLimiter(key) {
   return bucket;
 }
 
-// ─── C4 Concurrency Cap (M-07) ──────────────────────────
-
-const MAX_CONCURRENT_C4 = 10;
-let _activeC4Calls = 0;
-
 const wsOptions = {
   maxPayload: MAX_WS_PAYLOAD,
   ...(PROXY_URL ? { agent: new HttpsProxyAgent(PROXY_URL) } : {}),
@@ -250,41 +274,30 @@ const wsOptions = {
 
 // ─── C4 Bridge ─────────────────────────────────────────────
 
-function sendToC4(channel, endpoint, content) {
-  if (!content) return;
-  if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-    console.warn(`[hxa-connect] C4 concurrency cap reached (${MAX_CONCURRENT_C4}), dropping message`);
-    return;
-  }
-  _activeC4Calls++;
-  const c4Args = [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
+function stableC4Identity(label, kind, sourceId) {
+  const digest = createHash('sha256').update(`${label}\0${kind}\0${sourceId}`).digest('hex');
+  return {
+    requestId: `hxa.${kind}.${digest}`,
+    sourceId: `hxa:${kind}:${digest}`,
+  };
+}
 
-  execFile('node', c4Args, { encoding: 'utf8' }, (error, stdout) => {
-    _activeC4Calls--;
-    if (!error) {
-      console.log(`[hxa-connect] -> C4: ${content.substring(0, 80)}...`);
-      return;
-    }
-    try {
-      const response = JSON.parse(error.stdout || stdout || '{}');
-      if (response.ok === false && response.error?.message) {
-        console.warn(`[hxa-connect] C4 rejected: ${response.error.message}`);
-        return;
-      }
-    } catch {}
-    console.warn(`[hxa-connect] C4 send failed, retrying: ${error.message}`);
-    setTimeout(() => {
-      if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-        console.warn(`[hxa-connect] C4 concurrency cap reached on retry, dropping`);
-        return;
-      }
-      _activeC4Calls++;
-      execFile('node', c4Args, { encoding: 'utf8' }, (retryErr) => {
-        _activeC4Calls--;
-        if (retryErr) console.error(`[hxa-connect] C4 retry failed: ${retryErr.message}`);
-        else console.log(`[hxa-connect] -> C4 (retry): ${content.substring(0, 80)}...`);
-      });
-    }, 2000);
+async function sendToC4(channel, endpoint, content, {
+  deliveryId = `hxa:generated:${randomUUID()}`,
+  assistantIdentity = null,
+} = {}) {
+  if (!content) return { queued: false, replayed: false };
+  const args = ['--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
+  if (supportsAssistantResponseStream && assistantIdentity) {
+    args.push(
+      '--assistant-request-id', assistantIdentity.requestId,
+      '--assistant-source-id', assistantIdentity.sourceId,
+    );
+  }
+  return c4Queue.enqueue({
+    id: deliveryId,
+    args,
+    preview: content.substring(0, 80),
   });
 }
 
@@ -342,41 +355,80 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     return true;
   };
 
+  const dmInFlight = new Map();
+
+  function normalizeDm(raw) {
+    const message = raw?.message || raw || {};
+    return {
+      id: message.id || raw?.id || null,
+      sender_id: message.sender_id || raw?.sender_id || null,
+      sender_name: message.sender_name || raw?.sender_name || 'unknown',
+      content: message.content || raw?.content || '',
+      parts: message.parts || raw?.parts || [],
+      metadata: message.metadata || raw?.metadata || null,
+      created_at: message.created_at || raw?.created_at || Date.now(),
+    };
+  }
+
+  async function processDm(raw, source) {
+    const message = normalizeDm(raw);
+    if (!message.id) {
+      console.warn(`${lp} DM discarded source=${source} reason=missing_message_id sender=${message.sender_name}`);
+      return { action: 'discarded', reason: 'missing_message_id' };
+    }
+    if (dmInFlight.has(message.id)) return dmInFlight.get(message.id);
+    const promise = (async () => {
+      const sender = message.sender_name;
+      if (isSelf(message.sender_id, message.metadata)) {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} reason=self_message`);
+        return { action: 'discarded', reason: 'self_message' };
+      }
+      if (!isDmAllowed(org.access, sender)) {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=dm_policy`);
+        return { action: 'discarded', reason: 'dm_policy' };
+      }
+
+      const rlKey = `${label}:dm:${message.sender_id || sender}`;
+      if (!getRateLimiter(rlKey).consume()) {
+        console.warn(`${lp} DM deferred id=${message.id} source=${source} sender=${sender} reason=rate_limit`);
+        return { action: 'retry', reason: 'rate_limit' };
+      }
+
+      const localPaths = await downloadMediaParts(message.parts, client, label, lp);
+      const attachments = formatAttachments(message.parts, localPaths);
+      if ((message.content.length + attachments.length) > MAX_CONTENT_LENGTH) {
+        console.warn(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=content_too_large bytes=${message.content.length + attachments.length}`);
+        return { action: 'discarded', reason: 'content_too_large' };
+      }
+
+      console.log(`${lp} DM from ${sender} id=${message.id} source=${source}: ${message.content.substring(0, 80)}`);
+      const formatted = `[${dp} DM] ${sender} said: ${message.content}${attachments}`;
+      const queued = await sendToC4(C4_CHANNEL, dmResponseEndpoint(label, sender, message.id, {
+        multiOrg: isMultiOrg,
+      }), formatted, {
+        deliveryId: `hxa:${label}:dm:${message.id}`,
+        assistantIdentity: stableC4Identity(label, 'dm', message.id),
+      });
+      return { action: 'accepted', ...queued };
+    })().finally(() => dmInFlight.delete(message.id));
+    dmInFlight.set(message.id, promise);
+    return promise;
+  }
+
+  const dmReconciler = new DmInboxReconciler({
+    label,
+    client,
+    state: dmInboxState,
+    processMessage: processDm,
+    intervalMs: DM_RECONCILE_INTERVAL_MS,
+  });
+
   // ─── Event Handlers ───────────────────────────────────
 
-  client.on('message', async (msg) => {
-    try {
-      const sender = msg.sender_name || 'unknown';
-      const content = msg.message?.content || msg.content || '';
-      if (isSelf(msg.message?.sender_id, msg.message?.metadata)) return;
-
-      if (!isDmAllowed(org.access, sender)) {
-        console.log(`${lp} DM from ${sender} rejected (dmPolicy: ${org.access?.dmPolicy || 'open'})`);
-        return;
-      }
-
-      const rlKey = `${label}:dm:${msg.message?.sender_id || sender}`;
-      if (!getRateLimiter(rlKey).consume()) {
-        console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
-        return;
-      }
-
-      // Download media after policy checks to avoid wasted effort
-      const msgParts = msg.message?.parts || msg.parts;
-      const localPaths = await downloadMediaParts(msgParts, client, label, lp);
-      const attachments = formatAttachments(msgParts, localPaths);
-
-      if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
-        console.warn(`${lp} DM from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
-        return;
-      }
-
-      console.log(`${lp} DM from ${sender}: ${content.substring(0, 80)}`);
-      const formatted = `[${dp} DM] ${sender} said: ${content}${attachments}`;
-      sendToC4(C4_CHANNEL, c4Endpoint(label, sender), formatted);
-    } catch (err) {
+  client.on('message', (msg) => {
+    dmReconciler.observeLive(normalizeDm(msg)).catch(err => {
       console.error(`${lp} DM handler error: ${err.message}`);
-    }
+    });
   });
 
   // channel_message handler removed — channels are DMs, group channels no longer exist.
@@ -525,7 +577,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       } else {
         console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
       }
-      sendToC4(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
+      await sendToC4(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''), {
+        deliveryId: hasCurrentMessage
+          ? `hxa:${label}:thread:${threadId}:${message.id}`
+          : `hxa:${label}:thread-lifecycle:${threadId}:${randomUUID()}`,
+        assistantIdentity: hasCurrentMessage
+          ? stableC4Identity(label, 'thread', `${threadId}:${message.id}`)
+          : null,
+      });
     } catch (err) {
       console.error(`${lp} Thread handler error: ${err.message}`);
     }
@@ -584,7 +643,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botId = msg.bot?.id || 'unknown';
     console.log(`${lp} Bot join request: ${botName} (awaiting approval)`);
     const formatted = `[${dp}] [priority:high] [action:notify-owner] Bot "${botName}" (id: ${botId}) is requesting to join the org (pending admin approval)`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted, {
+      deliveryId: `hxa:${label}:bot-join:${msg.bot?.id || randomUUID()}`,
+    }).catch(err => console.error(`${lp} Bot join C4 queue error: ${err.message}`));
   });
 
   client.on('bot_status_changed', (msg) => {
@@ -592,7 +653,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botName = msg.name || msg.bot_id || 'unknown';
     console.log(`${lp} Bot status changed: ${botName} → ${status}`);
     const formatted = `[${dp}] Bot "${botName}" status changed to ${status}${msg.reason ? ` (reason: ${msg.reason})` : ''}`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted, {
+      deliveryId: `hxa:${label}:bot-status:${msg.bot_id || msg.name || randomUUID()}:${msg.join_status || 'unknown'}`,
+    }).catch(err => console.error(`${lp} Bot status C4 queue error: ${err.message}`));
   });
 
   // ─── Connection Lifecycle ──────────────────────────────
@@ -603,6 +666,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   client.on('reconnected', ({ attempts }) => {
     console.log(`${lp} Reconnected after ${attempts} attempt(s)`);
+    dmReconciler.pollOnce().catch(err => {
+      console.warn(`${lp} Immediate DM reconciliation after reconnect failed: ${err.message}`);
+    });
   });
 
   client.on('reconnect_failed', ({ attempts }) => {
@@ -625,14 +691,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     }
   });
 
-  connections.set(label, { client, threadCtx, config: org });
+  connections.set(label, { client, threadCtx, dmReconciler, config: org });
 }
 
 // ─── Start All Connections ─────────────────────────────────
 
 console.log(`[hxa-connect] Starting ${connections.size} org connection(s): ${orgLabels.join(', ')}`);
 
-async function connectOrg(label, { client, threadCtx, config: org }) {
+async function connectOrg(label, { client, threadCtx, dmReconciler, config: org }) {
   const lp = logPrefix(label);
   const INITIAL_DELAY = 3000;
   const MAX_DELAY = 60000;
@@ -647,6 +713,8 @@ async function connectOrg(label, { client, threadCtx, config: org }) {
       console.log(`${lp} WebSocket connected`);
       await threadCtx.start();
       console.log(`${lp} ThreadContext started (mention filter for @${org.agentName})`);
+      await dmReconciler.start();
+      console.log(`${lp} Durable DM inbox reconciliation started (interval=${DM_RECONCILE_INTERVAL_MS}ms)`);
       return;
     } catch (err) {
       try { client.disconnect(); } catch {}
@@ -676,14 +744,18 @@ if (connections.size === 0) {
 
 console.log(`[hxa-connect] ${connections.size} org(s) connected`);
 console.log(`[hxa-connect] Proxy: ${PROXY_URL || 'none'}`);
+console.log(`[hxa-connect] C4 durable spool: ${C4_SPOOL_DIR}`);
+console.log(`[hxa-connect] C4 assistant response stream: ${supportsAssistantResponseStream ? 'enabled' : 'legacy fallback'}`);
 
 // Graceful shutdown
 function shutdown() {
   console.log('[hxa-connect] Shutting down...');
-  for (const { client, threadCtx } of connections.values()) {
+  for (const { client, threadCtx, dmReconciler } of connections.values()) {
+    dmReconciler.stop();
     threadCtx.stop();
     client.disconnect();
   }
+  c4Queue.stop();
   process.exit(0);
 }
 process.once('SIGINT', shutdown);

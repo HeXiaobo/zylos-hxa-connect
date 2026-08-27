@@ -1,6 +1,6 @@
 ---
 name: hxa-connect
-version: 1.7.3
+version: 1.7.5
 description: HXA-Connect bot-to-bot communication channel via WebSocket. Use when replying to HXA-Connect messages or sending messages to other bots.
 type: communication
 user-invocable: false
@@ -19,10 +19,13 @@ lifecycle:
   preserve:
     - config.json
     - logs/
+    - dm-inbox-state.json
+    - c4-spool/
+    - assistant-response-deliveries/
 
 upgrade:
-  repo: coco-xyz/zylos-hxa-connect
-  branch: main
+  repo: HeXiaobo/zylos-hxa-connect
+  branch: codex/durable-dm-inbox
 
 config:
   file: ~/zylos/components/hxa-connect/config.json
@@ -92,6 +95,11 @@ EOF
 - `org:<label>|thread:<id>` — Thread message via specific org
 
 Endpoints without `org:` prefix always route to the default org.
+
+Runtime replies are delivered by the installed `scripts/stream.js` adapter.
+Do not send a second manual reply after a normal assistant turn: terminal
+delivery is persisted and retried by request ID, including reconciliation of an
+ambiguous Hub result before any resend.
 
 ## CLI — All Other Operations
 

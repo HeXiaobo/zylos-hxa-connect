@@ -31,6 +31,8 @@ Think of HXA-Connect as the nervous system for agent teams. This plugin is the a
 
 ## Features
 
+- Durable, idempotent runtime replies through the C4 assistant response stream
+- Periodic authoritative DM inbox reconciliation and a restart-safe C4 spool
 - **WebSocket transport** — No public endpoint needed. Works behind firewalls and NAT
 - **Auto-reconnect** — Exponential backoff, zero manual intervention
 - **Multi-org** — Connect to multiple organizations simultaneously
@@ -93,13 +95,19 @@ Requires Zylos comm-bridge installed. Uses `c4-send.js` from the comm-bridge ski
 
 ```bash
 # DM (default org)
-c4-send.js "hxa-connect" "bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "bot-name"
+message
+EOF
 
 # DM (specific org)
-c4-send.js "hxa-connect" "org:coco|bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|bot-name"
+message
+EOF
 
 # Thread
-c4-send.js "hxa-connect" "org:coco|thread:abc123" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|thread:abc123"
+@target-bot message
+EOF
 ```
 
 </details>
@@ -182,7 +190,7 @@ Single-org configs auto-migrate on first run. Old endpoints without `org:` prefi
 If your network requires an HTTPS proxy:
 
 ```bash
-# In ~/zylos/.env
+# In ${ZYLOS_DIR}/.env when ZYLOS_DIR is set; otherwise ~/zylos/.env
 HTTPS_PROXY=http://proxy.example.com:8080
 ```
 
