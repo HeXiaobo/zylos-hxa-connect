@@ -4,27 +4,13 @@
  */
 
 import fs from 'fs';
-import path from 'path';
-import { CONFIG_PATH } from './lib/config-path.js';
-
-const HOME = process.env.HOME;
-const ENV_PATH = path.join(HOME, 'zylos/.env');
+import { getConfigPath, loadZylosEnv } from './lib/config-path.js';
 
 const LABEL_RE = /^[a-z0-9][a-z0-9-]*$/;
 const ACCESS_KEYS = ['dmPolicy', 'dmAllowFrom', 'groupPolicy', 'threads'];
 
-// Load .env into process.env (don't override existing vars)
-if (fs.existsSync(ENV_PATH)) {
-  for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx);
-    const val = trimmed.slice(eqIdx + 1);
-    if (!process.env[key]) process.env[key] = val;
-  }
-}
+// Load .env before resolving proxy/config values (don't override process env).
+loadZylosEnv();
 
 export const PROXY_URL = process.env.HXA_CONNECT_PROXY
   || process.env.HTTPS_PROXY
@@ -32,11 +18,12 @@ export const PROXY_URL = process.env.HXA_CONNECT_PROXY
   || '';
 
 export function loadConfig() {
+  const configPath = getConfigPath();
   let raw;
   try {
-    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    raw = fs.readFileSync(configPath, 'utf8');
   } catch (err) {
-    console.error(`[hxa-connect] Cannot read config at ${CONFIG_PATH}: ${err.message}`);
+    console.error(`[hxa-connect] Cannot read config at ${configPath}: ${err.message}`);
     process.exit(1);
   }
   try {
@@ -59,6 +46,7 @@ function atomicWrite(filePath, data) {
  * 2. Global access → per-org access (top-level dmPolicy etc. → orgs.*.access)
  */
 export function migrateConfig() {
+  const configPath = getConfigPath();
   const config = loadConfig();
   let changed = false;
 
@@ -70,7 +58,7 @@ export function migrateConfig() {
 
     console.log('[hxa-connect] Migrating config from single-org to multi-org format');
 
-    const backupPath = CONFIG_PATH + '.bak';
+    const backupPath = configPath + '.bak';
     if (!fs.existsSync(backupPath)) {
       fs.writeFileSync(backupPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
       console.log(`[hxa-connect] Backup written to ${backupPath}`);
@@ -182,7 +170,7 @@ export function migrateConfig() {
   }
 
   if (changed) {
-    atomicWrite(CONFIG_PATH, config);
+    atomicWrite(configPath, config);
     console.log('[hxa-connect] Config migrated successfully');
   }
 

@@ -1,36 +1,22 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { getConfigPath, loadZylosEnv } from '../src/lib/config-path.js';
 
-const HOME = process.env.HOME;
-const DATA_DIR = path.join(HOME, 'zylos/components/hxa-connect');
-const ENV_PATH = path.join(HOME, 'zylos/.env');
-const configPath = path.join(DATA_DIR, 'config.json');
+const configPath = getConfigPath();
+const DATA_DIR = path.dirname(configPath);
 
 // 1. Create data subdirectories
 fs.mkdirSync(path.join(DATA_DIR, 'logs'), { recursive: true });
 console.log('[post-install] Created data directories');
 
-// 2. Load .env
-function loadEnv() {
-  const env = {};
-  if (!fs.existsSync(ENV_PATH)) return env;
-  for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
-  }
-  return env;
-}
-
-const env = loadEnv();
+// 2. Load .env into process.env (don't override explicit process variables)
+const env = loadZylosEnv();
 const HUB_URL = env.HXA_CONNECT_URL || '';
 const ORG_ID = env.HXA_CONNECT_ORG_ID || '';
 const ORG_TICKET = env.HXA_CONNECT_ORG_TICKET || '';
 const AGENT_NAME = env.HXA_CONNECT_AGENT_NAME || '';
-const PROXY_URL = env.HTTPS_PROXY || env.HTTP_PROXY || '';
+const PROXY_URL = env.HXA_CONNECT_PROXY || env.HTTPS_PROXY || env.HTTP_PROXY || '';
 
 // 3. Check if config already has valid credentials (re-install / upgrade scenario)
 //    Handles both old format (agent_token at top level) and new format (orgs map)

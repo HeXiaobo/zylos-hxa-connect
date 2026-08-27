@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONFIG_PATH } from '../src/lib/config-path.js';
+import { getConfigPath } from '../src/lib/config-path.js';
 
 function timestampSuffix() {
   return new Date().toISOString().replace(/[:.]/g, '-');
@@ -26,7 +26,7 @@ function atomicWriteJSON(filePath, obj) {
 }
 
 const LOG_PREFIX = '[hxa-connect post-upgrade]';
-const configPath = CONFIG_PATH;
+const configPath = getConfigPath();
 
 if (!fs.existsSync(configPath)) {
   console.log(`${LOG_PREFIX} No config file found, nothing to migrate.`);
