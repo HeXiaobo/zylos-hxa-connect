@@ -17,7 +17,6 @@ async function statePath() {
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map(dir => fs.promises.rm(dir, { recursive: true, force: true })));
 });
-
 function message(id, createdAt = 900) {
   return {
     id,
@@ -134,4 +133,3 @@ describe('DmInboxReconciler', () => {
     assert.ok(sinceCalls[1] <= 9_500, `expected unresolved message to remain in range, since=${sinceCalls[1]}`);
   });
 });
-
