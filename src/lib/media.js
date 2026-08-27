@@ -2,11 +2,16 @@
  * Shared media download utilities — used by both bot.js (runtime) and cli.js (CLI).
  */
 
-import path from 'path';
+import { getRuntimePaths } from './config-path.js';
 
-const HOME = process.env.HOME;
+/** Resolve the media root at call time so long-lived processes follow the selected Zylos directory. */
+export function getMediaBaseDir() {
+  return getRuntimePaths().mediaBaseDir;
+}
 
-export const MEDIA_BASE_DIR = path.join(HOME, 'zylos/media/hxa-connect');
+// Kept for callers that use the historical constant; runtime code should use
+// getMediaBaseDir() so changing ZYLOS_DIR never leaves an import-time path.
+export const MEDIA_BASE_DIR = getMediaBaseDir();
 
 export const MIME_TO_EXT = {
   'image/jpeg': '.jpg',

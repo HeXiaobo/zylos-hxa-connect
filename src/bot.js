@@ -17,13 +17,14 @@ import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
 import { C4DeliveryQueue } from './lib/c4-delivery-queue.js';
 import { DmInboxReconciler, DmInboxState } from './lib/dm-inbox-reconciler.js';
 import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
-import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
+import { getMediaBaseDir, generateFilename } from './lib/media.js';
+import { getRuntimePaths } from './lib/config-path.js';
 
-const HOME = process.env.HOME;
-const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-const DATA_DIR = path.join(HOME, 'zylos/components/hxa-connect');
-const C4_SPOOL_DIR = path.join(DATA_DIR, 'c4-spool');
-const DM_INBOX_STATE_PATH = path.join(DATA_DIR, 'dm-inbox-state.json');
+const {
+  c4ReceivePath: C4_RECEIVE,
+  c4SpoolDir: C4_SPOOL_DIR,
+  dmInboxStatePath: DM_INBOX_STATE_PATH,
+} = getRuntimePaths();
 const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
 const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
   && configuredDmReconcileInterval >= 5_000
@@ -166,7 +167,7 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
   if (!parts || !parts.length) return {};
 
   const localPaths = {};
-  const orgDir = path.join(MEDIA_BASE_DIR, orgLabel);
+  const orgDir = path.join(getMediaBaseDir(), orgLabel);
 
   try {
     await fs.promises.mkdir(orgDir, { recursive: true });

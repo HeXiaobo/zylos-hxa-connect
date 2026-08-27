@@ -18,9 +18,8 @@
  */
 
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
-import os from 'node:os';
-import path from 'node:path';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseSender,
@@ -73,6 +72,7 @@ const target = msgMatch ? rawTarget.slice(0, msgMatch.index) : rawTarget;
 
 const config = migrateConfig();
 const resolved = resolveOrgs(config);
+const { assistantResponseDir } = getRuntimePaths();
 const orgLabels = Object.keys(resolved.orgs);
 
 const effectiveLabel = orgOverride || endpointOrg || (resolved.orgs.default ? 'default' : orgLabels[0]);
@@ -98,9 +98,8 @@ const client = new HxaConnectClient({
 
 const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
 if (assistantRequestId) {
-  const home = process.env.HOME || os.homedir();
   const store = new AssistantResponseDeliveryStore({
-    directory: path.join(home, 'zylos/components/hxa-connect/assistant-response-deliveries'),
+    directory: assistantResponseDir,
   });
   const sender = createAssistantResponseSender({
     store,

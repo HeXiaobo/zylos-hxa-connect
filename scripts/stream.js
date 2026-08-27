@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 
-import os from 'node:os';
-import path from 'node:path';
-
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseDelivery,
@@ -24,6 +22,7 @@ async function main() {
   try {
     await setupFetchProxy();
     const resolved = resolveOrgs(migrateConfig());
+    const { assistantResponseDir } = getRuntimePaths();
     const labels = Object.keys(resolved.orgs);
     const defaultOrgLabel = resolved.orgs.default ? 'default' : labels[0];
     const clients = new Map();
@@ -44,9 +43,8 @@ async function main() {
         agentName: org.agentName,
       };
     };
-    const home = process.env.HOME || os.homedir();
     const store = new AssistantResponseDeliveryStore({
-      directory: path.join(home, 'zylos/components/hxa-connect/assistant-response-deliveries'),
+      directory: assistantResponseDir,
     });
     const delivery = createAssistantResponseDelivery({ store, resolveOrg, defaultOrgLabel });
     const result = await delivery.deliver(JSON.parse(await readStdin()));

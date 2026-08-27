@@ -13,7 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
-import { MEDIA_BASE_DIR, generateFilename } from '../src/lib/media.js';
+import { getMediaBaseDir, generateFilename } from '../src/lib/media.js';
 
 const args = process.argv.slice(2);
 
@@ -404,7 +404,7 @@ try {
         savedPath = path.resolve(outPath);
         await fs.promises.mkdir(path.dirname(savedPath), { recursive: true });
       } else {
-        const orgDir = path.join(MEDIA_BASE_DIR, orgLabel);
+        const orgDir = path.join(getMediaBaseDir(), orgLabel);
         await fs.promises.mkdir(orgDir, { recursive: true });
         savedPath = path.join(orgDir, generateFilename(fileId, result.contentType));
       }

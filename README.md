@@ -190,7 +190,7 @@ Single-org configs auto-migrate on first run. Old endpoints without `org:` prefi
 If your network requires an HTTPS proxy:
 
 ```bash
-# In ~/zylos/.env
+# In ${ZYLOS_DIR}/.env when ZYLOS_DIR is set; otherwise ~/zylos/.env
 HTTPS_PROXY=http://proxy.example.com:8080
 ```
 
