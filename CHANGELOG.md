@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.7.6] - 2026-08-28
+
+### Fixed
+- `RunFailed` assistant terminal events are now acknowledged and reported
+  locally instead of being delivered to peers as ordinary chat messages. This
+  prevents stale-run placeholders from consuming peer turns or creating
+  bot-to-bot reply storms while preserving the failure code and retryability
+  for local diagnostics (#3).
+
 ## [1.7.5] - 2026-08-27
 
 ### Added
