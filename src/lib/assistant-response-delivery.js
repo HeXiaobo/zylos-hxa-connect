@@ -139,13 +139,8 @@ function terminalFromDelivery(input) {
   return { requestId, route, terminal };
 }
 
-function publicTerminalContent(terminal) {
-  if (terminal.type === 'RunCompleted') {
-    return terminal.payload.output.trim().length > 0 ? terminal.payload.output : '处理完成。';
-  }
-  return terminal.payload.retryable
-    ? '本次处理未完成，可重试。'
-    : '本次处理未完成。';
+function publicCompletedContent(terminal) {
+  return terminal.payload.output.trim().length > 0 ? terminal.payload.output : '处理完成。';
 }
 
 function canonicalEndpointKey(parsed) {
@@ -428,17 +423,33 @@ export function createAssistantResponseSender({
 
 export function createAssistantResponseDelivery(options = {}) {
   const sender = createAssistantResponseSender(options);
+  const logger = options.logger || console;
   return Object.freeze({
     async deliver(input) {
       const { requestId, route, terminal } = terminalFromDelivery(input);
       if (!terminal) return { handled: true, terminal: false };
+      if (terminal.type === 'RunFailed') {
+        const code = typeof terminal.payload.code === 'string' ? terminal.payload.code : null;
+        const failure = Object.freeze({ code, retryable: terminal.payload.retryable });
+        logger.warn?.('[hxa-connect] Suppressed outbound RunFailed terminal', {
+          requestId,
+          ...failure,
+        });
+        return {
+          handled: true,
+          terminal: true,
+          status: 'suppressed',
+          eventType: 'RunFailed',
+          failure,
+        };
+      }
       const result = await sender.send({
         requestId,
         endpointId: route.endpointId,
-        content: publicTerminalContent(terminal),
+        content: publicCompletedContent(terminal),
         suppressSkip: parseHxaResponseEndpoint(route.endpointId, options.defaultOrgLabel).kind === 'thread',
       });
-      return { ...result, terminal: true };
+      return { ...result, terminal: true, eventType: 'RunCompleted' };
     },
   });
 }

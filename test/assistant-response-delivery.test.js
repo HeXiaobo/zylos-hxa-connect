@@ -276,9 +276,10 @@ describe('HXA assistant response delivery', () => {
     }]);
   });
 
-  it('turns a failed run into a content-safe visible failure', async () => {
+  it('suppresses a retryable failed run without sending an HXA message', async () => {
     const store = await createStore();
     const contents = [];
+    const warnings = [];
     const client = {
       async send(target, content) {
         contents.push(content);
@@ -290,11 +291,49 @@ describe('HXA assistant response delivery', () => {
       store,
       resolveOrg: async () => ({ client, agentId: 'self-1', agentName: 'agent' }),
       defaultOrgLabel: 'hxa',
+      logger: { warn(message, details) { warnings.push({ message, details }); } },
     });
-    await adapter.deliver(delivery({
+    const result = await adapter.deliver(delivery({
       type: 'RunFailed',
-      payload: { code: 'PRIVATE_INTERNAL_CODE', retryable: true },
+      payload: { code: 'RUN_STALE_AFTER_RESTART', retryable: true },
     }));
-    assert.deepEqual(contents, ['本次处理未完成，可重试。']);
+    assert.deepEqual(result, {
+      handled: true,
+      terminal: true,
+      status: 'suppressed',
+      eventType: 'RunFailed',
+      failure: { code: 'RUN_STALE_AFTER_RESTART', retryable: true },
+    });
+    assert.deepEqual(contents, []);
+    assert.deepEqual(warnings, [{
+      message: '[hxa-connect] Suppressed outbound RunFailed terminal',
+      details: {
+        requestId: 'hxa.dm.request-1',
+        code: 'RUN_STALE_AFTER_RESTART',
+        retryable: true,
+      },
+    }]);
+  });
+
+  it('keeps a non-retryable failed run locally distinguishable from silence', async () => {
+    const store = await createStore();
+    let resolved = 0;
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => { resolved += 1; },
+      logger: { warn() {} },
+    });
+    const result = await adapter.deliver(delivery({
+      type: 'RunFailed',
+      payload: { code: 'PERMANENT_FAILURE', retryable: false },
+    }));
+    assert.deepEqual(result, {
+      handled: true,
+      terminal: true,
+      status: 'suppressed',
+      eventType: 'RunFailed',
+      failure: { code: 'PERMANENT_FAILURE', retryable: false },
+    });
+    assert.equal(resolved, 0);
   });
 });

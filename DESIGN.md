@@ -159,10 +159,12 @@ seen but always logged with an explicit reason and Hub message ID.
 
 HXA provides `scripts/stream.js` as the channel adapter for Core's assistant
 response stream. Non-terminal progress events are acknowledged without
-creating chat noise. A `RunCompleted` or `RunFailed` event is converted into
-one visible DM or thread response.
+creating chat noise. A `RunCompleted` event is converted into one visible DM
+or thread response. `RunFailed` is acknowledged and reported locally with its
+failure code and retryability, but is never sent to the peer as authored chat
+content.
 
-Terminal delivery is recorded under
+Completed-output delivery is recorded under
 `~/zylos/components/hxa-connect/assistant-response-deliveries/` before the Hub
 request starts. Replaying the same request ID and event sequence therefore
 does not send twice. If the Hub request returns an ambiguous transport error,
