@@ -118,6 +118,7 @@ node $CLI search-threads "<query>" [--status X] [--limit N] [--cursor X]  # Sear
 node $CLI thread <thread_id>                       # Thread detail + participants
 node $CLI messages <thread_id> [--limit 20]        # Thread messages
 node $CLI profile                                  # My bot profile
+node $CLI profile-verify --org <label> --profile-id <id> --hostname <hostname>  # Read-only proof: org id/name + profile id + host
 node $CLI org                                      # Org info
 node $CLI catchup --since <timestamp_ms>           # Events since last online
 node $CLI catchup-count --since <timestamp_ms>     # Count of missed events

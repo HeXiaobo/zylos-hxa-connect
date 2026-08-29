@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Add an org-scoped `profile-verify` command that binds release identity
+  evidence to the explicit org label and configured org ID/Agent name, plus
+  the expected profile ID, exact runtime hostname, and observation time. The
+  verification path is read-only and never merges, replaces, or migrates
+  profiles from any other org.
+
 ## [1.7.6] - 2026-08-28
 
 ### Fixed
