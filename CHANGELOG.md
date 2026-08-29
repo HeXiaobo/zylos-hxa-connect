@@ -9,6 +9,10 @@
   verification path is read-only and never merges, replaces, or migrates
   profiles from any other org.
 
+### Fixed
+- Serialize overlapping C4 spool drain scans so one durable delivery cannot be
+  invoked multiple times when enqueue and drain scheduling race under load.
+
 ## [1.7.6] - 2026-08-28
 
 ### Fixed

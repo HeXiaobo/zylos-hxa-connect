@@ -95,6 +95,8 @@ export class C4DeliveryQueue {
     this.active = 0;
     this.processing = new Set();
     this.timer = null;
+    this.drainPromise = null;
+    this.drainRequested = false;
     this.started = false;
     this.stopping = false;
   }
@@ -173,7 +175,24 @@ export class C4DeliveryQueue {
     this.timer.unref?.();
   }
 
-  async #drain() {
+  #drain() {
+    if (this.drainPromise) {
+      this.drainRequested = true;
+      return this.drainPromise;
+    }
+    const run = async () => {
+      do {
+        this.drainRequested = false;
+        await this.#drainOnce();
+      } while (this.drainRequested && !this.stopping);
+    };
+    this.drainPromise = run().finally(() => {
+      this.drainPromise = null;
+    });
+    return this.drainPromise;
+  }
+
+  async #drainOnce() {
     if (this.stopping || this.active >= this.concurrency) return;
     const names = (await fs.promises.readdir(this.spoolDir))
       .filter(name => name.endsWith('.json'))
