@@ -10,10 +10,12 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
-import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { loadConfig, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import { getMediaBaseDir, generateFilename } from '../src/lib/media.js';
+import { verifyOrgScopedProfile } from '../src/lib/profile-verification.js';
 
 const args = process.argv.slice(2);
 
@@ -38,7 +40,9 @@ function fail(msg) {
 
 let config, resolved, orgLabels;
 try {
-  config = migrateConfig();
+  // Release identity probes are read-only. A legacy config must be migrated by
+  // an explicit setup action instead of being rewritten during verification.
+  config = args.includes('profile-verify') ? loadConfig() : migrateConfig();
   resolved = resolveOrgs(config);
   orgLabels = Object.keys(resolved.orgs);
 } catch (err) {
@@ -59,7 +63,7 @@ const client = new HxaConnectClient({
 });
 
 // Flags that take a value (skip next arg when encountered before command)
-const VALUE_FLAGS = new Set(['org']);
+const VALUE_FLAGS = new Set(['org', 'profile-id', 'hostname']);
 
 // Find command: first positional arg (skip --flags and their values)
 let command, commandIdx;
@@ -141,6 +145,31 @@ try {
     case 'profile': {
       const profile = await client.getProfile();
       out(profile);
+      break;
+    }
+
+    case 'profile-verify': {
+      if (!getFlag('org')) {
+        fail('Usage: cli.js profile-verify --org <label> --profile-id <id> --hostname <hostname>');
+      }
+      const expectedProfileId = getFlag('profile-id');
+      const expectedHostname = getFlag('hostname');
+      if (!expectedProfileId || !expectedHostname) {
+        fail('Usage: cli.js profile-verify --org <label> --profile-id <id> --hostname <hostname>');
+      }
+      const profile = await client.getProfile();
+      const report = verifyOrgScopedProfile({
+        orgLabel,
+        expectedOrgId: org.orgId,
+        expectedProfileId,
+        expectedProfileName: org.agentName,
+        expectedHostname,
+        actualHostname: os.hostname(),
+        observedAt: new Date().toISOString(),
+        profile,
+      });
+      out(report);
+      if (report.status !== 'PASS') process.exitCode = 2;
       break;
     }
 
@@ -445,6 +474,7 @@ try {
             thread: 'Thread detail <thread_id>',
             messages: 'Thread messages <thread_id> [--limit N] [--since TS] [--before TS]',
             profile: 'My profile',
+            'profile-verify': '--org <label> --profile-id <id> --hostname <hostname>',
             org: 'Org info',
             catchup: 'Offline events --since <timestamp_ms> [--cursor X] [--limit N]',
             'catchup-count': 'Count missed events --since <timestamp_ms>',
