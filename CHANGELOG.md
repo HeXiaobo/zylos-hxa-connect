@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.7.7] - 2026-08-29
+
 ### Added
 - Add an org-scoped `profile-verify` command that binds release identity
   evidence to the explicit org label and configured org ID/Agent name, plus
