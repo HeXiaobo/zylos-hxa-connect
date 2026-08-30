@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.7.8] - 2026-08-30
+
+### Fixed
+- Keep exact silent assistant responses side-effect free across every outbound
+  route, without transport or response-log writes.
+
 ## [1.7.7] - 2026-08-29
 
 ### Added
