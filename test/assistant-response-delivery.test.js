@@ -117,6 +117,42 @@ describe('HXA assistant response delivery', () => {
     assert.deepEqual(sends, [{ target: 'ss', content: 'exact response' }]);
   });
 
+  it('suppresses an exact DM [SKIP] terminal before resolving the Hub org', async () => {
+    const store = await createStore();
+    let resolved = 0;
+    let sends = 0;
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => {
+        resolved += 1;
+        return {
+          client: {
+            async send() {
+              sends += 1;
+              return { channel_id: 'channel-1', message: { id: 'unexpected' } };
+            },
+          },
+          agentId: 'self-1',
+          agentName: 'agent',
+        };
+      },
+      defaultOrgLabel: 'hxa',
+    });
+
+    const result = await adapter.deliver(delivery({
+      payload: { output: '  [SKIP]  ' },
+    }));
+    assert.deepEqual(result, {
+      handled: true,
+      replayed: false,
+      status: 'suppressed',
+      terminal: true,
+      eventType: 'RunCompleted',
+    });
+    assert.equal(resolved, 0);
+    assert.equal(sends, 0);
+  });
+
   it('deduplicates an explicit c4-send reply against the later terminal stream event', async () => {
     const store = await createStore();
     const sends = [];
