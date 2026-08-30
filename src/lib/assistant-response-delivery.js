@@ -447,7 +447,7 @@ export function createAssistantResponseDelivery(options = {}) {
         requestId,
         endpointId: route.endpointId,
         content: publicCompletedContent(terminal),
-        suppressSkip: parseHxaResponseEndpoint(route.endpointId, options.defaultOrgLabel).kind === 'thread',
+        suppressSkip: true,
       });
       return { ...result, terminal: true, eventType: 'RunCompleted' };
     },
