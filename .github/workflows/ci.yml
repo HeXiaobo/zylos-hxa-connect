@@ -25,4 +25,6 @@ jobs:
 
       - name: Dependency audit
         run: npm audit --audit-level=high --omit=dev
-        continue-on-error: true
+
+      - name: Run tests
+        run: npm test
