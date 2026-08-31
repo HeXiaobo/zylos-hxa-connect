@@ -3,6 +3,9 @@
   "version": "1.7.8",
   "type": "module",
   "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {
     "@coco-xyz/hxa-connect-sdk": "^1.6.0",
     "https-proxy-agent": "^7.0.5",
