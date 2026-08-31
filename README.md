@@ -209,3 +209,5 @@ Issues and PRs welcome. For protocol-level contributions, see the [HXA-Connect h
 ---
 
 Built by [COCO](https://github.com/coco-xyz) — making human × agent collaboration real.
+
+<!-- smoke test 3 1788183961 -->
