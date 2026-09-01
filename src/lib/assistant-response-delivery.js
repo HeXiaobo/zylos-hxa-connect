@@ -24,7 +24,7 @@ function requireText(value, field) {
   return value;
 }
 
-function normalizedReceipt(receipt) {
+export function normalizeHxaTransportReceipt(receipt) {
   const message = receipt?.message || receipt || {};
   return {
     hubMessageId: typeof message.id === 'string' ? message.id : null,
@@ -170,6 +170,15 @@ export class AssistantResponseDeliveryStore {
     return path.join(this.directory, `${sha256(deliveryId)}.json`);
   }
 
+  async read(deliveryId) {
+    try {
+      return JSON.parse(await fs.promises.readFile(this.filePath(deliveryId), 'utf8'));
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
   async withLock(deliveryId, callback, { timeoutMs = 5_000 } = {}) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
     const lockPath = `${this.filePath(deliveryId)}.lock`;
@@ -203,7 +212,7 @@ export class AssistantResponseDeliveryStore {
     }
 
     try {
-      return await callback();
+      return await callback(Object.freeze({ lockToken: token }));
     } finally {
       try {
         const owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'));
@@ -214,13 +223,15 @@ export class AssistantResponseDeliveryStore {
     }
   }
 
-  async begin(identity) {
+  async begin(identity, initial = {}) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
     const filePath = this.filePath(identity.deliveryId);
     try {
       const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
       if (existing.identityHash !== identity.identityHash) {
-        throw new Error('assistant response delivery identity collision');
+        const conflict = new Error('assistant response delivery identity collision');
+        conflict.code = 'IDEMPOTENCY_CONFLICT';
+        throw conflict;
       }
       return existing;
     } catch (error) {
@@ -238,6 +249,7 @@ export class AssistantResponseDeliveryStore {
       lastError: null,
       hubMessageId: null,
       channelId: null,
+      ...initial,
     };
     const tempPath = `${filePath}.new.${process.pid}.${randomUUID()}`;
     await fs.promises.writeFile(tempPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -248,7 +260,9 @@ export class AssistantResponseDeliveryStore {
       if (error.code !== 'EEXIST') throw error;
       const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
       if (existing.identityHash !== identity.identityHash) {
-        throw new Error('assistant response delivery identity collision');
+        const conflict = new Error('assistant response delivery identity collision');
+        conflict.code = 'IDEMPOTENCY_CONFLICT';
+        throw conflict;
       }
       return existing;
     } finally {
@@ -256,8 +270,24 @@ export class AssistantResponseDeliveryStore {
     }
   }
 
-  async update(record, changes) {
-    const next = { ...record, ...changes, updatedAt: this.clock() };
+  async update(record, changes, { expectedFence, expectedLeaseToken } = {}) {
+    const current = await this.read(record.deliveryId);
+    if (!current || current.identityHash !== record.identityHash) {
+      const error = new Error('assistant response delivery identity collision');
+      error.code = 'IDEMPOTENCY_CONFLICT';
+      throw error;
+    }
+    if (expectedFence !== undefined && (current.fence ?? 0) !== expectedFence) {
+      const error = new Error('assistant response delivery fence lost');
+      error.code = 'HXA_DELIVERY_FENCE_LOST';
+      throw error;
+    }
+    if (expectedLeaseToken !== undefined && current.activeLease?.token !== expectedLeaseToken) {
+      const error = new Error('assistant response delivery lease lost');
+      error.code = 'HXA_DELIVERY_LEASE_LOST';
+      throw error;
+    }
+    const next = { ...current, ...changes, updatedAt: this.clock() };
     await writeAtomic(this.filePath(record.deliveryId), next);
     return next;
   }
@@ -300,33 +330,56 @@ async function reconcileThread({ client, org, threadId, content, startedAt }) {
   )) || null;
 }
 
-async function reconcileAmbiguous({ parsed, client, org, content, startedAt }) {
-  if (parsed.kind === 'thread') {
-    return reconcileThread({ client, org, threadId: parsed.threadId, content, startedAt });
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function resolveCompatibleRoute(parsed, client) {
+  if (parsed.kind !== 'dm' || !UUID_RE.test(parsed.target) || typeof client.getThread !== 'function') {
+    return parsed;
+  }
+  try {
+    await client.getThread(parsed.target);
+    return {
+      kind: 'thread',
+      orgLabel: parsed.orgLabel,
+      threadId: parsed.target,
+      replyToId: parsed.sourceMessageId,
+      endpointId: parsed.endpointId,
+    };
+  } catch (error) {
+    if (error?.body?.code === 'NOT_FOUND' || error?.status === 404) return parsed;
+    throw error;
+  }
+}
+
+export async function reconcileHxaResponse({ parsed, client, org, content, startedAt }) {
+  const route = await resolveCompatibleRoute(parsed, client);
+  if (route.kind === 'thread') {
+    return reconcileThread({ client, org, threadId: route.threadId, content, startedAt });
   }
   return reconcileDm({
     client,
     org,
-    target: parsed.target,
-    sourceMessageId: parsed.sourceMessageId,
+    target: route.target,
+    sourceMessageId: route.sourceMessageId,
     content,
     startedAt,
   });
 }
 
-async function sendResponse({ parsed, client, content }) {
-  if (parsed.kind === 'thread') {
-    const options = parsed.replyToId ? { reply_to: parsed.replyToId } : undefined;
+export async function sendHxaResponse({ parsed, client, content }) {
+  const route = await resolveCompatibleRoute(parsed, client);
+  if (route.kind === 'thread') {
+    const options = route.replyToId ? { reply_to: route.replyToId } : undefined;
     try {
-      return await client.sendThreadMessage(parsed.threadId, content, options);
+      return await client.sendThreadMessage(route.threadId, content, options);
     } catch (error) {
-      if (parsed.replyToId && (error?.status === 400 || error?.body?.code === 'NOT_FOUND')) {
-        return client.sendThreadMessage(parsed.threadId, content);
+      if (route.replyToId && (error?.status === 400 || error?.body?.code === 'NOT_FOUND')) {
+        return client.sendThreadMessage(route.threadId, content);
       }
       throw error;
     }
   }
-  return client.send(parsed.target, content);
+  return client.send(route.target, content);
 }
 
 export function createAssistantResponseSender({
@@ -368,7 +421,7 @@ export function createAssistantResponseSender({
         const client = requireRecord(org.client, 'HXA response client');
 
         if (record.attempts > 0) {
-          const existing = await reconcileAmbiguous({
+          const existing = await reconcileHxaResponse({
             parsed,
             client,
             org,
@@ -376,7 +429,7 @@ export function createAssistantResponseSender({
             startedAt: record.startedAt,
           });
           if (existing) {
-            const receipt = normalizedReceipt(existing);
+            const receipt = normalizeHxaTransportReceipt(existing);
             record = await store.update(record, {
               status: 'delivered',
               lastError: null,
@@ -393,7 +446,7 @@ export function createAssistantResponseSender({
           lastError: null,
         });
         try {
-          const receipt = normalizedReceipt(await sendResponse({
+          const receipt = normalizeHxaTransportReceipt(await sendHxaResponse({
             parsed,
             client,
             content: safeContent,

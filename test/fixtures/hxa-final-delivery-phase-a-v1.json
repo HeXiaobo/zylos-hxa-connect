@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "zylos.hxa-final-delivery-phase-a/v1",
+  "scope": "adapter_private_phase_a",
+  "commonContract": "zylos.assistant-reply-contract/v1",
+  "upstreamControl": {
+    "repository": "openmaxai/zylos-hxa-connect",
+    "sha": "160dbaeac86f503b2d1889343354c5aee3b57785",
+    "relationship": "exact_merge_base_12_fork_commits_ahead",
+    "retained": [
+      "channel_name_fixed_to_hxa-connect",
+      "org_routing_inside_endpoint",
+      "explicit_dm_and_thread_routes",
+      "bare_uuid_thread_detection_with_dm_404_fallback",
+      "thread_reply_to_with_missing_message_fallback"
+    ]
+  },
+  "capability": {
+    "mode": "terminal_only",
+    "acceptedDispositions": [
+      "send",
+      "failure_notice"
+    ],
+    "unsupportedDispositions": [
+      "task_receipt"
+    ],
+    "unsupportedEvents": [
+      "ProgressUpdated",
+      "OutputDelta"
+    ]
+  },
+  "attemptContext": {
+    "attemptId": "attempt:delivery:hxa:phase-a:1",
+    "ownerId": "phase-a-worker-1"
+  },
+  "retryPolicy": {
+    "ambiguousResult": "unknown",
+    "unknownNextAction": "reconcile_before_retry",
+    "notFoundAfterReconcile": "retry_with_new_attempt_id",
+    "permanentPlatformFailure": "rejected_non_retryable"
+  },
+  "integrationSeam": {
+    "phase": "A",
+    "status": "TODO_WAIT_FOR_WT02_C_ACCEPTANCE",
+    "note": "The adapter-private attempt context is not a proposed Core API. Phase B must map the accepted WT02-C claim/receipt seam without changing the frozen v1 envelopes."
+  }
+}
