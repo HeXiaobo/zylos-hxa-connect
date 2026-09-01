@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import { isSenderAllowed, isThreadAllowed } from '../src/lib/auth.js';
 import {
@@ -31,6 +32,35 @@ async function createStore(clock = () => 1_788_220_800_000) {
   return new DmPolicyRejectionStore({ directory, clock });
 }
 
+function runLockWorker(directory, workerId) {
+  const moduleUrl = pathToFileURL(path.join(ROOT, 'src/lib/dm-policy-rejection.js')).href;
+  const script = `
+    import fs from 'node:fs';
+    import { DmPolicyRejectionStore } from ${JSON.stringify(moduleUrl)};
+    const [directory, workerId] = process.argv.slice(1);
+    const store = new DmPolicyRejectionStore({ directory });
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      await store.withLock('six-process-lock', async () => {
+        const criticalPath = directory + '/critical-section';
+        const handle = await fs.promises.open(criticalPath, 'wx', 0o600);
+        await new Promise(resolve => setTimeout(resolve, 2));
+        await handle.close();
+        await fs.promises.unlink(criticalPath);
+      }, { timeoutMs: 10_000 });
+    }
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', script, directory, workerId], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  return {
+    child,
+    completed: new Promise(resolve => child.on('close', code => resolve({ code, stderr }))),
+  };
+}
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map(directory => (
     fs.promises.rm(directory, { recursive: true, force: true })
@@ -51,6 +81,148 @@ function rejectedDm(overrides = {}) {
 }
 
 describe('DM policy rejection', () => {
+  it('publishes complete lock metadata atomically across six competing processes', async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-dm-policy-lock-'));
+    tempDirs.push(directory);
+    const workers = Array.from({ length: 6 }, (_, index) => runLockWorker(directory, String(index)));
+    const parseFailures = [];
+
+    while (workers.some(({ child }) => child.exitCode === null)) {
+      const lockNames = (await fs.promises.readdir(directory)).filter(name => name.endsWith('.lock'));
+      for (const name of lockNames) {
+        try {
+          const metadata = JSON.parse(await fs.promises.readFile(path.join(directory, name), 'utf8'));
+          assert.equal(Number.isSafeInteger(metadata.pid), true);
+          assert.match(metadata.token, /^[0-9a-f-]{36}$/);
+        } catch (error) {
+          if (error.code !== 'ENOENT') parseFailures.push(error);
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+
+    const results = await Promise.all(workers.map(worker => worker.completed));
+    assert.deepEqual(parseFailures, []);
+    assert.deepEqual(results.map(result => result.code), [0, 0, 0, 0, 0, 0],
+      results.map(result => result.stderr).join('\n'));
+    assert.deepEqual((await fs.promises.readdir(directory)).filter(name => name.endsWith('.lock')), []);
+  });
+
+  it('recovers damaged and stale lock records without leaving lock debris', async () => {
+    const store = await createStore();
+    const cases = [
+      { key: 'damaged-lock', content: '' },
+      { key: 'half-written-lock', content: '{"schemaVersion":1,"pid":' },
+      {
+        key: 'stale-lock',
+        content: `${JSON.stringify({
+          schemaVersion: 1,
+          pid: 2_147_483_647,
+          token: 'stale-owner-token',
+          createdAt: 1,
+        })}\n`,
+      },
+    ];
+
+    for (const lockCase of cases) {
+      const lockPath = `${store.filePath(lockCase.key)}.lock`;
+      await fs.promises.writeFile(lockPath, lockCase.content, { mode: 0o600 });
+      const old = new Date(Date.now() - 10_000);
+      await fs.promises.utimes(lockPath, old, old);
+      let entered = false;
+
+      await store.withLock(lockCase.key, async () => { entered = true; }, { timeoutMs: 2_000 });
+
+      assert.equal(entered, true, lockCase.key);
+      await assert.rejects(fs.promises.stat(lockPath), { code: 'ENOENT' });
+    }
+  });
+
+  it('recovers the lock after its owning process is killed', async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-dm-policy-killed-lock-'));
+    tempDirs.push(directory);
+    const readyPath = path.join(directory, 'owner-ready');
+    const moduleUrl = pathToFileURL(path.join(ROOT, 'src/lib/dm-policy-rejection.js')).href;
+    const script = `
+      import fs from 'node:fs';
+      import { DmPolicyRejectionStore } from ${JSON.stringify(moduleUrl)};
+      const [directory, readyPath] = process.argv.slice(1);
+      const store = new DmPolicyRejectionStore({ directory });
+      await store.withLock('killed-owner-lock', async () => {
+        await fs.promises.writeFile(readyPath, 'ready', { mode: 0o600 });
+        await new Promise(() => {});
+      });
+    `;
+    const owner = spawn(process.execPath, [
+      '--input-type=module', '--eval', script, directory, readyPath,
+    ], { stdio: 'ignore' });
+    const ownerClosed = new Promise(resolve => owner.on('close', resolve));
+    const deadline = Date.now() + 3_000;
+    while (!fs.existsSync(readyPath) && owner.exitCode === null && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(readyPath), true, 'owner never acquired the lock');
+    owner.kill('SIGKILL');
+    await ownerClosed;
+
+    const restarted = new DmPolicyRejectionStore({ directory });
+    let entered = false;
+    await restarted.withLock('killed-owner-lock', async () => { entered = true; }, { timeoutMs: 2_000 });
+
+    assert.equal(entered, true);
+    assert.deepEqual((await fs.promises.readdir(directory)).filter(name => name.endsWith('.lock')), []);
+  });
+
+  it('does not let a former owner release a replacement lock', async () => {
+    const store = await createStore();
+    const key = 'replacement-owner-lock';
+    const lockPath = `${store.filePath(key)}.lock`;
+    const replacement = {
+      schemaVersion: 1,
+      pid: process.pid,
+      token: 'replacement-owner-token',
+      createdAt: Date.now(),
+    };
+
+    await store.withLock(key, async () => {
+      const displacedPath = `${lockPath}.displaced`;
+      await fs.promises.rename(lockPath, displacedPath);
+      await fs.promises.writeFile(lockPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+      await fs.promises.unlink(displacedPath);
+    });
+
+    assert.deepEqual(JSON.parse(await fs.promises.readFile(lockPath, 'utf8')), replacement);
+    await fs.promises.unlink(lockPath);
+  });
+
+  it('enforces private directory and audit-file modes when the store starts', async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-dm-policy-modes-'));
+    tempDirs.push(directory);
+    await fs.promises.chmod(directory, 0o777);
+    let store = new DmPolicyRejectionStore({ directory });
+    assert.equal((await fs.promises.stat(directory)).mode & 0o777, 0o700);
+
+    const record = await store.begin({
+      idempotencyKey: 'mode-test',
+      label: 'hxa',
+      messageId: 'mode-message',
+      source: 'websocket',
+      sender: 'peer-agent',
+      senderId: 'peer-1',
+      senderKey: 'sender-key',
+      timestamp: 1_788_220_799_000,
+      reason: 'dm_policy',
+      policy: 'allowlist',
+      channelId: 'channel-1',
+    });
+    const auditPath = store.filePath(record.idempotencyKey);
+    await fs.promises.chmod(auditPath, 0o666);
+
+    store = new DmPolicyRejectionStore({ directory });
+    assert.equal((await fs.promises.stat(directory)).mode & 0o777, 0o700);
+    assert.equal((await fs.promises.stat(auditPath)).mode & 0o777, 0o600);
+  });
+
   it('keeps open and allowlisted DMs accepted while rejecting only a non-allowlisted sender', () => {
     assert.equal(decideDmPolicy({ dmPolicy: 'open' }, rejectedDm()), 'allow');
     assert.equal(decideDmPolicy({
@@ -390,6 +562,61 @@ describe('DM policy rejection', () => {
     assert.deepEqual(retried, { status: 'notified', replayed: false });
   });
 
+  it('rejects same-message replays with a different sender, channel, or policy before I/O or audit mutation', async () => {
+    const variants = [
+      { name: 'sender', message: { sender_id: 'attacker-1' }, policy: 'allowlist' },
+      { name: 'channel', message: { channel_id: 'attacker-channel' }, policy: 'allowlist' },
+      { name: 'policy', message: {}, policy: 'disabled' },
+    ];
+
+    for (const variant of variants) {
+      let now = 1_788_220_800_000;
+      const store = await createStore(() => now);
+      let sends = 0;
+      let reconciliations = 0;
+      const handler = createDmPolicyRejectionHandler({
+        label: 'hxa',
+        store,
+        agentId: 'receiver-1',
+        client: {
+          async send() {
+            sends += 1;
+            throw new Error('ambiguous delivery');
+          },
+          async getMessages() {
+            reconciliations += 1;
+            return [];
+          },
+        },
+      });
+      assert.equal((await handler.reject(rejectedDm({ id: `identity-${variant.name}` }), {
+        source: 'websocket',
+        policy: 'allowlist',
+      })).status, 'retry_wait');
+      const [audit] = await store.list({ label: 'hxa' });
+      const auditPath = store.filePath(audit.idempotencyKey);
+      const before = await fs.promises.readFile(auditPath, 'utf8');
+      now += 1_000;
+
+      const result = await handler.reject(rejectedDm({
+        id: `identity-${variant.name}`,
+        ...variant.message,
+      }), {
+        source: 'inbox',
+        policy: variant.policy,
+      });
+
+      assert.deepEqual(result, {
+        status: 'identity_conflict',
+        replayed: true,
+        errorCode: 'IDENTITY_CONFLICT',
+      }, variant.name);
+      assert.equal(sends, 1, variant.name);
+      assert.equal(reconciliations, 0, variant.name);
+      assert.equal(await fs.promises.readFile(auditPath, 'utf8'), before, variant.name);
+    }
+  });
+
   it('retries an unknown result only after reconciliation proves the notice absent', async () => {
     let now = 1_788_220_800_000;
     const store = await createStore(() => now);
@@ -426,6 +653,67 @@ describe('DM policy rejection', () => {
 
     assert.deepEqual(calls, ['send-1', 'reconcile', 'send-2']);
     assert.deepEqual(retried, { status: 'notified', replayed: false });
+  });
+
+  it('treats undefined or identity-free send receipts as unknown until strict reconciliation', async () => {
+    const receipts = [
+      { name: 'undefined', value: undefined },
+      { name: 'missing identity', value: { message: {} } },
+      { name: 'missing channel', value: { message: { id: 'notice-without-channel' } } },
+    ];
+
+    for (const receiptCase of receipts) {
+      let now = 1_788_220_800_000;
+      const store = await createStore(() => now);
+      let sends = 0;
+      let content;
+      const history = [];
+      const handler = createDmPolicyRejectionHandler({
+        label: 'hxa',
+        store,
+        agentId: 'receiver-1',
+        client: {
+          async send(target, sentContent) {
+            sends += 1;
+            content = sentContent;
+            return receiptCase.value;
+          },
+          async getMessages() { return history; },
+        },
+      });
+
+      assert.deepEqual(await handler.reject(rejectedDm({ id: `receipt-${receiptCase.name}` }), {
+        source: 'websocket',
+        policy: 'allowlist',
+      }), {
+        status: 'retry_wait',
+        replayed: false,
+        nextRetryAt: now + 1_000,
+      }, receiptCase.name);
+      const [unknown] = await store.list({ label: 'hxa' });
+      assert.equal(unknown.noticeMessageId, null, receiptCase.name);
+      assert.deepEqual(unknown.lastError, {
+        errorCode: 'DELIVERY_RECEIPT_MISSING',
+        errorClass: 'DeliveryReceiptError',
+        retryable: true,
+        summary: 'Hub did not return a verifiable notification receipt',
+      });
+
+      now += 1_000;
+      history.push({
+        id: `notice-${receiptCase.name}`,
+        channel_id: 'channel-1',
+        sender_id: 'receiver-1',
+        content,
+        content_type: 'system',
+        created_at: now,
+      });
+      assert.deepEqual(await handler.reject(rejectedDm({ id: `receipt-${receiptCase.name}` }), {
+        source: 'inbox',
+        policy: 'allowlist',
+      }), { status: 'notified', replayed: true, reconciled: true });
+      assert.equal(sends, 1, receiptCase.name);
+    }
   });
 
   it('keeps a reconciliation failure observable without blindly sending again', async () => {
@@ -736,6 +1024,122 @@ describe('DM policy rejection', () => {
       access: { dmPolicy: 'open' },
     }), { action: 'continue' });
     assert.equal(rejections, 0);
+  });
+
+  it('fails closed before any send or DM routing when the current notice secret is missing', async () => {
+    const store = await createStore();
+    let sends = 0;
+    let rejections = 0;
+    assert.throws(() => createBaseDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      agentId: 'receiver-1',
+      client: {
+        async send() { sends += 1; },
+      },
+    }), error => error?.code === 'HXA_DM_POLICY_NOTICE_SECRET_REQUIRED');
+    assert.throws(() => createDmPolicyGate({
+      agentId: 'receiver-1',
+      rejectionHandler: {
+        async reject() { rejections += 1; },
+      },
+    }), error => error?.code === 'HXA_DM_POLICY_NOTICE_SECRET_REQUIRED');
+
+    assert.equal(sends, 0);
+    assert.equal(rejections, 0);
+    assert.deepEqual(await store.list({ label: 'hxa' }), []);
+  });
+
+  it('verifies previous-key notices during rotation but signs new notices only with current', async () => {
+    const oldSecret = 'old-shared-notice-secret';
+    const newSecret = 'new-shared-notice-secret';
+    const oldStore = await createStore();
+    let oldNotice;
+    const oldHandler = createBaseDmPolicyRejectionHandler({
+      label: 'hxa',
+      store: oldStore,
+      agentId: 'receiver-1',
+      noticeSecret: oldSecret,
+      client: {
+        async send(target, content, options) {
+          oldNotice = {
+            content,
+            content_type: options.content_type,
+            sender_id: 'receiver-1',
+            channel_id: 'channel-1',
+          };
+          return { channel_id: 'channel-1', message: { id: 'old-notice' } };
+        },
+      },
+    });
+    await oldHandler.reject(rejectedDm({ id: 'old-source' }), {
+      source: 'websocket',
+      policy: 'allowlist',
+    });
+
+    const rotation = {
+      agentId: 'peer-1',
+      noticeSecrets: { current: newSecret, previous: [oldSecret] },
+    };
+    assert.equal(isDmPolicyRejectionNotice(oldNotice, rotation), true);
+    assert.equal(isDmPolicyRejectionNotice(oldNotice, {
+      agentId: 'peer-1',
+      noticeSecrets: { current: newSecret, previous: [] },
+    }), false);
+    let crossAgentReplies = 0;
+    const rotatingPeerGate = createDmPolicyGate({
+      agentId: 'peer-1',
+      noticeSecrets: { current: newSecret, previous: [oldSecret] },
+      rejectionHandler: {
+        async reject() {
+          crossAgentReplies += 1;
+          return { status: 'notified', replayed: false };
+        },
+      },
+    });
+    assert.deepEqual(await rotatingPeerGate.evaluate(oldNotice, {
+      source: 'websocket',
+      access: { dmPolicy: 'allowlist', dmAllowFrom: [] },
+    }), { action: 'discarded', reason: 'dm_policy_rejection_notice' });
+    assert.equal(crossAgentReplies, 0);
+
+    const newStore = await createStore();
+    let newNotice;
+    const newHandler = createBaseDmPolicyRejectionHandler({
+      label: 'hxa',
+      store: newStore,
+      agentId: 'receiver-1',
+      noticeSecrets: { current: newSecret, previous: [oldSecret] },
+      client: {
+        async send(target, content, options) {
+          newNotice = {
+            content,
+            content_type: options.content_type,
+            sender_id: 'receiver-1',
+            channel_id: 'channel-1',
+          };
+          return { channel_id: 'channel-1', message: { id: 'new-notice' } };
+        },
+      },
+    });
+    await newHandler.reject(rejectedDm({ id: 'new-source' }), {
+      source: 'websocket',
+      policy: 'allowlist',
+    });
+
+    assert.equal(isDmPolicyRejectionNotice(newNotice, {
+      agentId: 'peer-1',
+      noticeSecret: newSecret,
+    }), true);
+    assert.equal(isDmPolicyRejectionNotice(newNotice, {
+      agentId: 'peer-1',
+      noticeSecret: oldSecret,
+    }), false);
+    const persisted = await fs.promises.readFile(
+      newStore.filePath((await newStore.list({ label: 'hxa' }))[0].idempotencyKey),
+      'utf8',
+    );
+    assert.doesNotMatch(persisted, /old-shared-notice-secret|new-shared-notice-secret/);
   });
 
   it('keeps rejection notices out of the assistant path and never replies to them', async () => {

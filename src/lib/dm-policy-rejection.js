@@ -28,6 +28,37 @@ function requireText(value, field) {
   return value;
 }
 
+function requireCurrentNoticeSecret(value) {
+  try {
+    return requireText(value, 'HXA_DM_POLICY_NOTICE_SECRET');
+  } catch {
+    const error = new Error('HXA_DM_POLICY_NOTICE_SECRET is required for safe DM rejection handling');
+    error.code = 'HXA_DM_POLICY_NOTICE_SECRET_REQUIRED';
+    throw error;
+  }
+}
+
+function normalizeNoticeSecrets({ noticeSecret, noticeSecrets } = {}, { required = false } = {}) {
+  const current = noticeSecrets?.current ?? noticeSecret;
+  if (required) requireCurrentNoticeSecret(current);
+  if (typeof current !== 'string' || current.trim() === '') return null;
+  const configuredPrevious = noticeSecrets?.previous ?? [];
+  const previous = typeof configuredPrevious === 'string'
+    ? [configuredPrevious]
+    : configuredPrevious;
+  if (!Array.isArray(previous)
+    || previous.some(secret => typeof secret !== 'string' || secret.trim() === '')) {
+    if (!required) return null;
+    const error = new TypeError('DM policy rejection previous notice secrets must be non-empty strings');
+    error.code = 'HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET_INVALID';
+    throw error;
+  }
+  return {
+    current,
+    verification: [current, ...previous.filter(secret => secret !== current)],
+  };
+}
+
 function processAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
@@ -40,6 +71,61 @@ function processAlive(pid) {
 
 function sleep(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function publishCompleteLock(lockPath, owner) {
+  const candidatePath = `${lockPath}.candidate.${process.pid}.${owner.token}`;
+  try {
+    const handle = await fs.promises.open(candidatePath, 'wx', 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(owner)}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.promises.link(candidatePath, lockPath);
+    return await fs.promises.stat(lockPath);
+  } finally {
+    await fs.promises.unlink(candidatePath).catch(() => {});
+  }
+}
+
+async function observeLock(lockPath) {
+  try {
+    const [raw, stat] = await Promise.all([
+      fs.promises.readFile(lockPath, 'utf8'),
+      fs.promises.stat(lockPath),
+    ]);
+    let owner = null;
+    try {
+      const candidate = JSON.parse(raw);
+      if (Number.isSafeInteger(candidate?.pid)
+        && candidate.pid > 0
+        && typeof candidate?.token === 'string'
+        && candidate.token !== '') owner = candidate;
+    } catch {
+      // A legacy or damaged lock is recoverable after a short publication grace period.
+    }
+    return { raw, stat, owner };
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function unlinkObservedLock(lockPath, observed) {
+  const current = await observeLock(lockPath);
+  if (!current
+    || current.stat.dev !== observed.stat.dev
+    || current.stat.ino !== observed.stat.ino
+    || current.raw !== observed.raw) return false;
+  try {
+    await fs.promises.unlink(lockPath);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function safeDeliveryError(error) {
@@ -73,6 +159,15 @@ function safeReconciliationError() {
   };
 }
 
+function safeMissingReceiptError() {
+  return {
+    errorCode: 'DELIVERY_RECEIPT_MISSING',
+    errorClass: 'DeliveryReceiptError',
+    retryable: true,
+    summary: 'Hub did not return a verifiable notification receipt',
+  };
+}
+
 export function publicDmPolicyRejectionError(error) {
   if (!error || typeof error !== 'object') return null;
   if (/^HTTP_[1-5][0-9]{2}$/.test(error.errorCode)) {
@@ -85,6 +180,7 @@ export function publicDmPolicyRejectionError(error) {
     };
   }
   if (error.errorCode === 'RECONCILIATION_ERROR') return safeReconciliationError();
+  if (error.errorCode === 'DELIVERY_RECEIPT_MISSING') return safeMissingReceiptError();
   if (SAFE_NETWORK_CODES.has(error.errorCode)) {
     return {
       errorCode: error.errorCode,
@@ -106,6 +202,7 @@ export function publicDmPolicyRejectionError(error) {
 
 async function writeAtomic(filePath, value) {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  await fs.promises.chmod(path.dirname(filePath), 0o700);
   const temporaryPath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
   try {
     await fs.promises.writeFile(temporaryPath, `${JSON.stringify(value)}\n`, { mode: 0o600 });
@@ -116,7 +213,6 @@ async function writeAtomic(filePath, value) {
 }
 
 function signedRejectionContent({ noticeSecret, rejectorAgentId, targetAgentId, channelId, messageId, policy }) {
-  if (!noticeSecret) return REJECTION_TEXT;
   const payload = {
     rejectorAgentId,
     targetAgentId,
@@ -130,13 +226,14 @@ function signedRejectionContent({ noticeSecret, rejectorAgentId, targetAgentId, 
   return `${REJECTION_TEXT}\n\n[zylos:dm-policy-rejection:v2:${encoded}:${signature}]`;
 }
 
-export function isDmPolicyRejectionNotice(message, { agentId, noticeSecret } = {}) {
+export function isDmPolicyRejectionNotice(message, options = {}) {
+  const { agentId } = options;
+  const secrets = normalizeNoticeSecrets(options);
   if (message?.content_type !== 'system'
     || typeof message?.content !== 'string'
     || typeof agentId !== 'string'
     || agentId === ''
-    || typeof noticeSecret !== 'string'
-    || noticeSecret === '') return false;
+    || !secrets) return false;
   const prefix = `${REJECTION_TEXT}\n\n`;
   if (!message.content.startsWith(prefix)) return false;
   const match = message.content.slice(prefix.length).match(REJECTION_MARKER_PATTERN);
@@ -162,23 +259,32 @@ export function isDmPolicyRejectionNotice(message, { agentId, noticeSecret } = {
     || canonical.rejectorAgentId !== message.sender_id
     || canonical.targetAgentId !== agentId
     || canonical.channelId !== message.channel_id) return false;
-  const expectedSignature = createHmac('sha256', noticeSecret).update(encoded).digest();
   const actualSignature = Buffer.from(providedSignature, 'hex');
-  return actualSignature.length === expectedSignature.length
-    && timingSafeEqual(actualSignature, expectedSignature);
+  return secrets.verification.some(secret => {
+    const expectedSignature = createHmac('sha256', secret).update(encoded).digest();
+    return actualSignature.length === expectedSignature.length
+      && timingSafeEqual(actualSignature, expectedSignature);
+  });
 }
 
 export function decideDmPolicy(access, message) {
   return isDmAllowed(access, message?.sender_name || message?.sender_id) ? 'allow' : 'reject';
 }
 
-export function createDmPolicyGate({ rejectionHandler, agentId, noticeSecret } = {}) {
+export function createDmPolicyGate({ rejectionHandler, agentId, noticeSecret, noticeSecrets } = {}) {
   if (!rejectionHandler || typeof rejectionHandler.reject !== 'function') {
     throw new TypeError('DM policy rejection handler is required');
   }
+  const normalizedSecrets = normalizeNoticeSecrets({ noticeSecret, noticeSecrets }, { required: true });
   return Object.freeze({
     async evaluate(message, { source, access } = {}) {
-      if (isDmPolicyRejectionNotice(message, { agentId, noticeSecret })) {
+      if (isDmPolicyRejectionNotice(message, {
+        agentId,
+        noticeSecrets: {
+          current: normalizedSecrets.current,
+          previous: normalizedSecrets.verification.slice(1),
+        },
+      })) {
         return { action: 'discarded', reason: 'dm_policy_rejection_notice' };
       }
       const decision = decideDmPolicy(access, message);
@@ -201,34 +307,45 @@ export class DmPolicyRejectionStore {
   constructor({ directory, clock = () => Date.now() } = {}) {
     this.directory = requireText(directory, 'DM policy rejection directory');
     this.clock = clock;
+    fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(this.directory, 0o700);
+    for (const entry of fs.readdirSync(this.directory, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      try {
+        fs.chmodSync(path.join(this.directory, entry.name), 0o600);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
   }
 
   filePath(idempotencyKey) {
     return path.join(this.directory, `${sha256(idempotencyKey)}.json`);
   }
 
-  async withLock(idempotencyKey, callback, { timeoutMs = 5_000 } = {}) {
+  async withLock(idempotencyKey, callback, {
+    timeoutMs = 5_000,
+    damagedLockGraceMs = 100,
+  } = {}) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await fs.promises.chmod(this.directory, 0o700);
     const lockPath = `${this.filePath(idempotencyKey)}.lock`;
     const token = randomUUID();
+    const owner = { schemaVersion: 1, pid: process.pid, token, createdAt: Date.now() };
     const deadline = Date.now() + timeoutMs;
+    let acquiredStat;
     while (true) {
       try {
-        const handle = await fs.promises.open(lockPath, 'wx', 0o600);
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, token })}\n`);
-        await handle.close();
+        acquiredStat = await publishCompleteLock(lockPath, owner);
         break;
       } catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        try {
-          const owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'));
-          if (!processAlive(owner.pid)) {
-            await fs.promises.unlink(lockPath);
-            continue;
-          }
-        } catch (readError) {
-          if (readError.code === 'ENOENT') continue;
-          throw readError;
+        const observed = await observeLock(lockPath);
+        if (!observed) continue;
+        const damagedAndSettled = !observed.owner
+          && Date.now() - observed.stat.mtimeMs >= damagedLockGraceMs;
+        if ((observed.owner && !processAlive(observed.owner.pid)) || damagedAndSettled) {
+          if (await unlinkObservedLock(lockPath, observed)) continue;
         }
         if (Date.now() >= deadline) {
           const busy = new Error('DM policy rejection delivery is busy');
@@ -242,8 +359,12 @@ export class DmPolicyRejectionStore {
       return await callback();
     } finally {
       try {
-        const owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'));
-        if (owner.token === token) await fs.promises.unlink(lockPath);
+        const observed = await observeLock(lockPath);
+        if (observed?.owner?.token === token
+          && observed.stat.dev === acquiredStat.dev
+          && observed.stat.ino === acquiredStat.ino) {
+          await unlinkObservedLock(lockPath, observed);
+        }
       } catch {
         // The durable audit remains canonical even if a lock disappeared.
       }
@@ -252,6 +373,7 @@ export class DmPolicyRejectionStore {
 
   async begin(record) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await fs.promises.chmod(this.directory, 0o700);
     const filePath = this.filePath(record.idempotencyKey);
     try {
       return JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
@@ -301,12 +423,14 @@ export function createDmPolicyRejectionHandler({
   client,
   agentId,
   noticeSecret,
+  noticeSecrets,
   noticeIntervalMs = 60_000,
   maxAttempts = 3,
   retryBaseMs = 1_000,
   maxRetryMs = 60_000,
 } = {}) {
   const safeLabel = requireText(label, 'HXA org label');
+  const normalizedSecrets = normalizeNoticeSecrets({ noticeSecret, noticeSecrets }, { required: true });
   if (!(store instanceof DmPolicyRejectionStore)) {
     throw new TypeError('DM policy rejection store is required');
   }
@@ -327,8 +451,10 @@ export function createDmPolicyRejectionHandler({
     async reject(message, { source, policy } = {}) {
       const messageId = requireText(message?.id, 'rejected DM message id');
       const sender = requireText(message?.sender_name || message?.sender_id, 'rejected DM sender');
+      const senderId = requireText(message?.sender_id, 'rejected DM sender id');
+      const channelId = requireText(message?.channel_id, 'rejected DM channel id');
       const safePolicy = requireText(policy, 'DM policy');
-      const senderIdentity = message.sender_id || sender;
+      const senderIdentity = senderId;
       const idempotencyKey = `hxa.dm-policy-rejection.v1.${sha256(`${safeLabel}\0${messageId}\0dm_policy`)}`;
       const senderPolicyKey = `hxa.dm-policy-rejection-rate.v1.${sha256(`${safeLabel}\0${senderIdentity}\0${safePolicy}`)}`;
       return store.withLock(senderPolicyKey, () => store.withLock(idempotencyKey, async () => {
@@ -338,12 +464,27 @@ export function createDmPolicyRejectionHandler({
           messageId,
           source: requireText(source, 'rejected DM source'),
           sender,
+          senderId,
           senderKey: sha256(senderIdentity),
           timestamp: Number.isFinite(message.created_at) ? message.created_at : store.clock(),
           reason: 'dm_policy',
           policy: safePolicy,
-          channelId: message.channel_id || null,
+          channelId,
         });
+        const sameSender = record.senderId
+          ? record.senderId === senderId
+          : record.senderKey === sha256(senderId);
+        if (record.label !== safeLabel
+          || record.messageId !== messageId
+          || !sameSender
+          || record.channelId !== channelId
+          || record.policy !== safePolicy) {
+          return {
+            status: 'identity_conflict',
+            replayed: true,
+            errorCode: 'IDENTITY_CONFLICT',
+          };
+        }
         if (record.status === 'notified' || record.status === 'rate_limited' || record.status === 'dead_letter') {
           return { status: record.status, replayed: true };
         }
@@ -355,10 +496,10 @@ export function createDmPolicyRejectionHandler({
           };
         }
         const content = signedRejectionContent({
-          noticeSecret,
+          noticeSecret: normalizedSecrets.current,
           rejectorAgentId: requireText(agentId, 'HXA agent id'),
-          targetAgentId: requireText(message.sender_id, 'rejected DM sender id'),
-          channelId: requireText(message.channel_id, 'rejected DM channel id'),
+          targetAgentId: senderId,
+          channelId,
           messageId,
           policy: safePolicy,
         });
@@ -432,7 +573,7 @@ export function createDmPolicyRejectionHandler({
         let receipt;
         try {
           receipt = await client.send(
-            message.sender_id || sender,
+            senderId,
             content,
             { content_type: 'system' },
           );
@@ -451,10 +592,29 @@ export function createDmPolicyRejectionHandler({
             ? { status: record.status, replayed: false }
             : { status: record.status, replayed: false, nextRetryAt };
         }
+        const noticeMessageId = typeof receipt?.message?.id === 'string'
+          && receipt.message.id !== ''
+          ? receipt.message.id
+          : null;
+        const receiptChannelId = receipt?.channel_id || receipt?.message?.channel_id || null;
+        if (!noticeMessageId || receiptChannelId !== record.channelId) {
+          const exhausted = record.attempts >= maxAttempts;
+          const nextRetryAt = exhausted
+            ? null
+            : store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (record.attempts - 1)));
+          record = await store.update(record, {
+            status: exhausted ? 'dead_letter' : 'retry_wait',
+            nextRetryAt,
+            lastError: safeMissingReceiptError(),
+          });
+          return exhausted
+            ? { status: record.status, replayed: false }
+            : { status: record.status, replayed: false, nextRetryAt };
+        }
         record = await store.update(record, {
           status: 'notified',
-          noticeMessageId: receipt?.message?.id || null,
-          channelId: receipt?.channel_id || receipt?.message?.channel_id || record.channelId,
+          noticeMessageId,
+          channelId: receiptChannelId,
           nextRetryAt: null,
           lastError: null,
         });

@@ -196,13 +196,19 @@ HTTPS_PROXY=http://proxy.example.com:8080
 
 The plugin reads `HTTPS_PROXY` from the environment automatically. No config file changes needed.
 
-To authenticate automatic DM-policy rejection notices, configure the same high-entropy secret on every agent that exchanges DMs:
+To authenticate automatic DM-policy rejection notices, configure the same high-entropy current secret on every agent that exchanges DMs:
 
 ```bash
 HXA_DM_POLICY_NOTICE_SECRET=replace-with-a-shared-random-secret
 ```
 
-Without this variable, rejection messages are still delivered and audited, but they are not marked for automatic loop suppression. The secret is never written to the rejection audit.
+The adapter fails closed at startup when this variable is missing, so an unauthenticated rejection notice cannot be sent or routed as an ordinary DM. During a key rotation, temporarily configure the immediately previous secret as well:
+
+```bash
+HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET=replace-with-the-previous-shared-secret
+```
+
+New notices are signed only with the current secret. The previous secret is accepted only for verification and should be removed after the rotation window. Neither secret is written to rejection audits or logs.
 
 </details>
 

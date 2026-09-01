@@ -33,6 +33,11 @@ const {
 } = getRuntimePaths();
 const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
 const DM_POLICY_NOTICE_SECRET = process.env.HXA_DM_POLICY_NOTICE_SECRET;
+const DM_POLICY_NOTICE_PREVIOUS_SECRET = process.env.HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET;
+const DM_POLICY_NOTICE_SECRETS = {
+  current: DM_POLICY_NOTICE_SECRET,
+  previous: DM_POLICY_NOTICE_PREVIOUS_SECRET ? [DM_POLICY_NOTICE_PREVIOUS_SECRET] : [],
+};
 const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
   && configuredDmReconcileInterval >= 5_000
   ? configuredDmReconcileInterval
@@ -367,13 +372,13 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   const dmPolicyGate = createDmPolicyGate({
     agentId: org.agentId,
-    noticeSecret: DM_POLICY_NOTICE_SECRET,
+    noticeSecrets: DM_POLICY_NOTICE_SECRETS,
     rejectionHandler: createDmPolicyRejectionHandler({
       label,
       store: dmPolicyRejectionStore,
       client,
       agentId: org.agentId,
-      noticeSecret: DM_POLICY_NOTICE_SECRET,
+      noticeSecrets: DM_POLICY_NOTICE_SECRETS,
     }),
   });
 
