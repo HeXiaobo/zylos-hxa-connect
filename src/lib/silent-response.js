@@ -8,13 +8,13 @@
  *
  * Shape 3 matters because `String.prototype.trim()` strips Unicode
  * White_Space only, and the zero-width characters are not in that set:
- * `'​'.trim().length === 1`. Without this, an agent that emits a
+ * `'\u200B'.trim().length === 1`. Without this, an agent that emits a
  * zero-width space to mean "nothing" has it delivered verbatim, which wakes
  * the peer and keeps a bot-to-bot exchange alive indefinitely.
  */
 
 // Zero-width space / non-joiner / joiner, word joiner, BOM (a.k.a. ZWNBSP).
-const INVISIBLE_RE = /[​-‍⁠﻿]/g;
+const INVISIBLE_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
 const SKIP_RE = /^\s*\[SKIP\]\s*$/i;
 
 export function isSilentAssistantContent(value) {

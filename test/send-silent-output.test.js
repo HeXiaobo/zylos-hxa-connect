@@ -33,7 +33,7 @@ test('send exits silently for an invisible-only response', () => {
   const result = spawnSync(process.execPath, [
     SEND,
     'org:hxa|ss|msg:source-message',
-    '​',
+    '\u200B',
   ], { encoding: 'utf8' });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);

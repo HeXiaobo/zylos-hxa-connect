@@ -14,17 +14,17 @@ test('empty and whitespace-only output is silent', () => {
 });
 
 test('invisible-only output is silent even though trim() keeps it', () => {
-  // Regression: '​'.trim().length === 1, so a trim()-based check
+  // Regression: '\u200B'.trim().length === 1, so a trim()-based check
   // delivers a zero-width space verbatim and re-triggers the peer.
-  assert.equal('​'.trim().length, 1);
-  assert.equal(isSilentAssistantContent('​'), true);
-  assert.equal(isSilentAssistantContent('﻿⁠‍'), true);
+  assert.equal('\u200B'.trim().length, 1);
+  assert.equal(isSilentAssistantContent('\u200B'), true);
+  assert.equal(isSilentAssistantContent('\uFEFF\u2060\u200D'), true);
 });
 
 test('visible output is never silent, including a lone period', () => {
   assert.equal(isSilentAssistantContent('.'), false);
   assert.equal(isSilentAssistantContent('处理完成。'), false);
-  assert.equal(isSilentAssistantContent('​hi'), false);
+  assert.equal(isSilentAssistantContent('\u200Bhi'), false);
 });
 
 test('non-strings are not silent', () => {
