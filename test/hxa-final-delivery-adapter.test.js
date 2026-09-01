@@ -73,6 +73,17 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
         'thread_reply_to_with_missing_message_fallback',
       ],
     });
+    assert.deepEqual(phaseA.externalReview, {
+      issue: 'HeXiaobo/zylos-hxa-connect#20',
+      pullRequest: 'HeXiaobo/zylos-hxa-connect#21',
+      reviewedHead: '359e3b6c4e619f2104cce7257226f74eaf72c77b',
+      phaseADecision: 'adopt_invisible_content_detection_as_missing_output',
+      excludedLegacyFiles: [
+        'CHANGELOG.md',
+        'scripts/send.js',
+        'src/lib/silent-response.js',
+      ],
+    });
     assert.deepEqual(phaseA.capability.acceptedDispositions, ['send', 'failure_notice']);
     assert.equal(phaseA.integrationSeam.status, 'TODO_WAIT_FOR_WT02_C_ACCEPTANCE');
   });
@@ -170,9 +181,17 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     skip.payload.text = '  [SKIP]  ';
     skip.contentHash = contentHash(skip.payload.text);
 
-    assert.equal((await adapter.deliver(silent)).status, 'suppressed');
-    assert.equal((await adapter.deliver(suppress)).status, 'suppressed');
-    assert.equal((await adapter.deliver(skip)).status, 'suppressed');
+    for (const result of [
+      await adapter.deliver(silent),
+      await adapter.deliver(suppress),
+      await adapter.deliver(skip),
+    ]) {
+      assert.equal(result.status, 'suppressed');
+      assert.equal(result.normalizedAction, 'suppress');
+      assert.equal(result.deliveryRequired, false);
+      assert.equal(result.receipt, null);
+      assert.notEqual(result.outcome, 'platform_accepted');
+    }
     assert.equal(resolved, 0);
     const records = (await fs.promises.readdir(store.directory).catch(() => []))
       .filter(name => name.endsWith('.json'));
@@ -189,16 +208,60 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
         throw new Error('transport must not be resolved');
       },
     });
-    const intent = answerIntent();
-    intent.payload.text = ' \n\t ';
-    intent.contentHash = contentHash(intent.payload.text);
-
-    await assert.rejects(
-      adapter.deliver(intent, attempt()),
-      error => error.code === 'MISSING_OUTPUT',
-    );
+    const invisibleOnlyInputs = [
+      ' \n\t ',
+      '\u200B',
+      '\u200C',
+      '\u200D',
+      '\u2060',
+      '\uFEFF',
+      ' \t\u200B\u200C\u200D\u2060\uFEFF\n',
+    ];
+    for (const text of invisibleOnlyInputs) {
+      const intent = answerIntent();
+      intent.payload.text = text;
+      intent.contentHash = contentHash(text);
+      await assert.rejects(
+        adapter.deliver(intent, attempt()),
+        error => error.code === 'MISSING_OUTPUT',
+      );
+    }
     assert.equal(resolved, 0);
     assert.deepEqual(await fs.promises.readdir(store.directory).catch(() => []), []);
+  });
+
+  it('does not emit a second bot-to-bot message for a closing turn followed by invisible output', async () => {
+    const store = await createStore();
+    const sent = [];
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send(target, text) {
+          sent.push({ target, text });
+          return { message: { id: `hub-loop-${sent.length}` } };
+        },
+      },
+    });
+    const closing = answerIntent();
+    closing.payload.text = phaseA.botLoopRegression.closingTurnText;
+    closing.contentHash = contentHash(closing.payload.text);
+    const empty = answerIntent();
+    empty.intentId = 'reply:req:hxa:dm:message-loop-empty:hxa-route-001';
+    empty.idempotencyKey = empty.intentId;
+    empty.requestId = 'req:hxa:dm:message-loop-empty';
+    empty.traceId = 'trace:hxa:dm:message-loop-empty';
+    empty.payload.text = phaseA.botLoopRegression.emptyTurnText;
+    empty.contentHash = contentHash(empty.payload.text);
+
+    const first = await adapter.deliver(closing, attempt('attempt:loop:1'));
+    await assert.rejects(
+      adapter.deliver(empty, attempt('attempt:loop:2')),
+      error => error.code === phaseA.botLoopRegression.emptyTurnExpectedError,
+    );
+
+    assert.equal(first.outcome, 'platform_accepted');
+    assert.equal(sent.length, phaseA.botLoopRegression.expectedHubMessages);
+    assert.equal(sent.some(item => item.text === phaseA.botLoopRegression.forbiddenReplacement), false);
   });
 
   it('returns explicit unsupported results for progress, output deltas, task receipts, media, and foreign routes', async () => {

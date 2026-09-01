@@ -15,6 +15,17 @@
       "thread_reply_to_with_missing_message_fallback"
     ]
   },
+  "externalReview": {
+    "issue": "HeXiaobo/zylos-hxa-connect#20",
+    "pullRequest": "HeXiaobo/zylos-hxa-connect#21",
+    "reviewedHead": "359e3b6c4e619f2104cce7257226f74eaf72c77b",
+    "phaseADecision": "adopt_invisible_content_detection_as_missing_output",
+    "excludedLegacyFiles": [
+      "CHANGELOG.md",
+      "scripts/send.js",
+      "src/lib/silent-response.js"
+    ]
+  },
   "capability": {
     "mode": "terminal_only",
     "acceptedDispositions": [
@@ -38,6 +49,13 @@
     "unknownNextAction": "reconcile_before_retry",
     "notFoundAfterReconcile": "retry_with_new_attempt_id",
     "permanentPlatformFailure": "rejected_non_retryable"
+  },
+  "botLoopRegression": {
+    "closingTurnText": "We can stop here.",
+    "emptyTurnText": "\u200B\u200C\u200D\u2060\uFEFF",
+    "expectedHubMessages": 1,
+    "emptyTurnExpectedError": "MISSING_OUTPUT",
+    "forbiddenReplacement": "处理完成。"
   },
   "integrationSeam": {
     "phase": "A",
