@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "characterization": "zylos.hxa.reply-current-behavior/v1",
+  "repository": "HeXiaobo/zylos-hxa-connect",
+  "baselineSha": "c99baa9215bad3136d62c4688ba115b927b404a2",
+  "packageVersion": "1.7.8",
+  "officialPeer": {
+    "verified": false,
+    "repository": null,
+    "claim": "No verifiable zylos-ai HXA peer exists; this fixture makes no upstream-parity claim."
+  },
+  "assets": [
+    {
+      "name": "AssistantResponseDeliveryStore",
+      "status": "implemented",
+      "evidence": [
+        "stable request-derived delivery record",
+        "content and route identity collision detection",
+        "exclusive file lock",
+        "DM and thread route preservation",
+        "ambiguous-send reconciliation before retry",
+        "restart-safe replay"
+      ]
+    },
+    {
+      "name": "C4DeliveryQueue",
+      "status": "implemented",
+      "evidence": [
+        "bounded durable intake spool",
+        "duplicate enqueue suppression",
+        "retry with bounded exponential backoff",
+        "restart recovery",
+        "issue-9 drain scheduling serialization"
+      ]
+    },
+    {
+      "name": "DmInboxReconciler",
+      "status": "implemented",
+      "evidence": [
+        "WebSocket and inbox overlap deduplication",
+        "missed-message recovery",
+        "unresolved message overlap retention",
+        "persistent restart state"
+      ]
+    },
+    {
+      "name": "silent suppression",
+      "status": "implemented_compatibility",
+      "evidence": [
+        "exact [SKIP] is suppressed for DM and thread routes",
+        "transport and durable delivery log are not initialized by scripts/send.js"
+      ]
+    }
+  ],
+  "currentSemantics": {
+    "inputContract": "legacy C4 assistant response event batch",
+    "progressBehavior": "ProgressUpdated and OutputDelta batches are acknowledged without a Hub send",
+    "completedBehavior": "non-empty RunCompleted output is sent once",
+    "failedBehavior": "RunFailed is locally logged and suppressed",
+    "emptyOutputBehavior": "empty RunCompleted output is replaced with 处理完成。",
+    "ambiguousStatusName": "uncertain",
+    "successfulStatusName": "delivered",
+    "silentBehavior": "exact [SKIP] output is suppressed without a Hub send"
+  },
+  "targetGaps": [
+    {
+      "id": "HXA_REPLY_INTENT_V1",
+      "todo": "Accept the common ReplyIntent v1 envelope directly instead of the legacy event batch."
+    },
+    {
+      "id": "HXA_MISSING_OUTPUT",
+      "todo": "Reject an empty visible answer with MISSING_OUTPUT instead of manufacturing fallback success text."
+    },
+    {
+      "id": "HXA_IDEMPOTENCY_CONFLICT",
+      "todo": "Map request identity reuse with a different route or payload hash to the common IDEMPOTENCY_CONFLICT error."
+    },
+    {
+      "id": "HXA_FAILURE_NOTICE",
+      "todo": "Deliver an explicit failure_notice intent while keeping RunFailed independent from delivery state."
+    },
+    {
+      "id": "HXA_EXPLICIT_SILENT",
+      "todo": "Consume explicit silent semantics; retain [SKIP] only as compatibility normalization."
+    },
+    {
+      "id": "HXA_RECEIPT_V1",
+      "todo": "Persist common DeliveryReceipt observations platform_accepted, unknown, reconciled and rejected, plus an independent DeliverySettlement including unpresentable after retry exhaustion."
+    },
+    {
+      "id": "HXA_DLQ_REDRIVE",
+      "todo": "Add isolated delivery DLQ and redrive that preserve intentId and deliveryId without rewriting RunCompleted."
+    }
+  ]
+}

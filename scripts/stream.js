@@ -7,6 +7,11 @@ import {
   AssistantResponseDeliveryStore,
   createAssistantResponseDelivery,
 } from '../src/lib/assistant-response-delivery.js';
+import { createHxaFinalDeliveryAdapter } from '../src/lib/hxa-final-delivery-adapter.js';
+import {
+  createHxaFinalDeliveryComposition,
+  isCanonicalHxaDelivery,
+} from '../src/lib/hxa-final-delivery-composition.js';
 
 function readStdin() {
   return new Promise((resolve, reject) => {
@@ -46,8 +51,14 @@ async function main() {
     const store = new AssistantResponseDeliveryStore({
       directory: assistantResponseDir,
     });
-    const delivery = createAssistantResponseDelivery({ store, resolveOrg, defaultOrgLabel });
-    const result = await delivery.deliver(JSON.parse(await readStdin()));
+    const legacyDelivery = createAssistantResponseDelivery({ store, resolveOrg, defaultOrgLabel });
+    const adapter = createHxaFinalDeliveryAdapter({ store, resolveOrg, defaultOrgLabel });
+    const mode = process.env.HXA_FINAL_DELIVERY_MODE === 'legacy' ? 'legacy' : 'canonical';
+    const delivery = createHxaFinalDeliveryComposition({ adapter, legacyDelivery, mode });
+    const input = JSON.parse(await readStdin());
+    const result = mode === 'legacy' || !isCanonicalHxaDelivery(input)
+      ? await legacyDelivery.deliver(input)
+      : await delivery.deliver(input);
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
   } catch (error) {
     process.stderr.write(`[hxa-connect] Assistant response stream delivery failed: ${error.message}\n`);

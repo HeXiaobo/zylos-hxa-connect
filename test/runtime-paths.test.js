@@ -160,6 +160,7 @@ test('derives every runtime path from the selected Zylos directory', () => {
       dataDir: path.join(zylosDir, 'components', 'hxa-connect'),
       c4SpoolDir: path.join(zylosDir, 'components', 'hxa-connect', 'c4-spool'),
       dmInboxStatePath: path.join(zylosDir, 'components', 'hxa-connect', 'dm-inbox-state.json'),
+      dmPolicyRejectionDir: path.join(zylosDir, 'components', 'hxa-connect', 'dm-policy-rejections'),
       mediaBaseDir: path.join(zylosDir, 'media', 'hxa-connect'),
       assistantResponseDir: path.join(zylosDir, 'components', 'hxa-connect', 'assistant-response-deliveries'),
       logsDir: path.join(zylosDir, 'components', 'hxa-connect', 'logs'),

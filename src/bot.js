@@ -13,9 +13,14 @@ import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js';
-import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
+import { isThreadAllowed, isSenderAllowed } from './lib/auth.js';
 import { C4DeliveryQueue } from './lib/c4-delivery-queue.js';
 import { DmInboxReconciler, DmInboxState } from './lib/dm-inbox-reconciler.js';
+import {
+  DmPolicyRejectionStore,
+  createDmPolicyGate,
+  createDmPolicyRejectionHandler,
+} from './lib/dm-policy-rejection.js';
 import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
 import { getMediaBaseDir, generateFilename } from './lib/media.js';
 import { getRuntimePaths } from './lib/config-path.js';
@@ -24,8 +29,15 @@ const {
   c4ReceivePath: C4_RECEIVE,
   c4SpoolDir: C4_SPOOL_DIR,
   dmInboxStatePath: DM_INBOX_STATE_PATH,
+  dmPolicyRejectionDir: DM_POLICY_REJECTION_DIR,
 } = getRuntimePaths();
 const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
+const DM_POLICY_NOTICE_SECRET = process.env.HXA_DM_POLICY_NOTICE_SECRET;
+const DM_POLICY_NOTICE_PREVIOUS_SECRET = process.env.HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET;
+const DM_POLICY_NOTICE_SECRETS = {
+  current: DM_POLICY_NOTICE_SECRET,
+  previous: DM_POLICY_NOTICE_PREVIOUS_SECRET ? [DM_POLICY_NOTICE_PREVIOUS_SECRET] : [],
+};
 const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
   && configuredDmReconcileInterval >= 5_000
   ? configuredDmReconcileInterval
@@ -221,6 +233,9 @@ const c4Queue = new C4DeliveryQueue({
   c4ReceivePath: C4_RECEIVE,
 });
 const dmInboxState = new DmInboxState({ filePath: DM_INBOX_STATE_PATH });
+const dmPolicyRejectionStore = new DmPolicyRejectionStore({
+  directory: DM_POLICY_REJECTION_DIR,
+});
 await c4Queue.start();
 await dmInboxState.load();
 
@@ -355,15 +370,29 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     return true;
   };
 
+  const dmPolicyGate = createDmPolicyGate({
+    agentId: org.agentId,
+    noticeSecrets: DM_POLICY_NOTICE_SECRETS,
+    rejectionHandler: createDmPolicyRejectionHandler({
+      label,
+      store: dmPolicyRejectionStore,
+      client,
+      agentId: org.agentId,
+      noticeSecrets: DM_POLICY_NOTICE_SECRETS,
+    }),
+  });
+
   const dmInFlight = new Map();
 
   function normalizeDm(raw) {
     const message = raw?.message || raw || {};
     return {
       id: message.id || raw?.id || null,
+      channel_id: message.channel_id || raw?.channel_id || null,
       sender_id: message.sender_id || raw?.sender_id || null,
       sender_name: message.sender_name || raw?.sender_name || 'unknown',
       content: message.content || raw?.content || '',
+      content_type: message.content_type || raw?.content_type || 'text',
       parts: message.parts || raw?.parts || [],
       metadata: message.metadata || raw?.metadata || null,
       created_at: message.created_at || raw?.created_at || Date.now(),
@@ -383,9 +412,13 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         console.log(`${lp} DM discarded id=${message.id} source=${source} reason=self_message`);
         return { action: 'discarded', reason: 'self_message' };
       }
-      if (!isDmAllowed(org.access, sender)) {
-        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=dm_policy`);
-        return { action: 'discarded', reason: 'dm_policy' };
+      const policyResult = await dmPolicyGate.evaluate(message, {
+        source,
+        access: org.access,
+      });
+      if (policyResult.action !== 'continue') {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=${policyResult.reason}${policyResult.notificationStatus ? ` notification=${policyResult.notificationStatus}` : ''}`);
+        return policyResult;
       }
 
       const rlKey = `${label}:dm:${message.sender_id || sender}`;

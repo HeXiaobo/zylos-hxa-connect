@@ -138,6 +138,7 @@ function buildRuntimePaths(zylosDir) {
     dataDir,
     c4SpoolDir: path.join(dataDir, 'c4-spool'),
     dmInboxStatePath: path.join(dataDir, 'dm-inbox-state.json'),
+    dmPolicyRejectionDir: path.join(dataDir, 'dm-policy-rejections'),
     mediaBaseDir: path.join(zylosDir, 'media', 'hxa-connect'),
     assistantResponseDir: path.join(dataDir, 'assistant-response-deliveries'),
     logsDir,
