@@ -85,7 +85,7 @@
     },
     {
       "id": "HXA_RECEIPT_V1",
-      "todo": "Persist common attempt and DeliveryReceipt outcomes platform_accepted, unknown, reconciled, retrying, rejected and dead_letter."
+      "todo": "Persist common DeliveryReceipt observations platform_accepted, unknown, reconciled and rejected, plus an independent DeliverySettlement including unpresentable after retry exhaustion."
     },
     {
       "id": "HXA_DLQ_REDRIVE",
