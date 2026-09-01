@@ -5,6 +5,7 @@ import { isDmAllowed } from './auth.js';
 
 const REJECTION_TEXT = "Sorry, I'm not available for private messages. Please ask my owner to grant you access.";
 const REJECTION_MARKER_PATTERN = /^\[zylos:dm-policy-rejection:v2:([A-Za-z0-9_-]+):([a-f0-9]{64})\]$/;
+const LOCK_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RETRYABLE_HTTP_STATUSES = new Set([408, 409, 425, 429]);
 const SAFE_NETWORK_CODES = new Set([
   'ABORT_ERR',
@@ -99,12 +100,15 @@ async function observeLock(lockPath) {
     let owner = null;
     try {
       const candidate = JSON.parse(raw);
-      if (Number.isSafeInteger(candidate?.pid)
+      if (candidate?.schemaVersion === 1
+        && Number.isSafeInteger(candidate?.pid)
         && candidate.pid > 0
         && typeof candidate?.token === 'string'
-        && candidate.token !== '') owner = candidate;
+        && LOCK_TOKEN_PATTERN.test(candidate.token)
+        && Number.isSafeInteger(candidate?.createdAt)
+        && candidate.createdAt > 0) owner = candidate;
     } catch {
-      // A legacy or damaged lock is recoverable after a short publication grace period.
+      // Invalid owner metadata remains fail-closed because liveness cannot be proven.
     }
     return { raw, stat, owner };
   } catch (error) {
@@ -325,7 +329,6 @@ export class DmPolicyRejectionStore {
 
   async withLock(idempotencyKey, callback, {
     timeoutMs = 5_000,
-    damagedLockGraceMs = 100,
   } = {}) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
     await fs.promises.chmod(this.directory, 0o700);
@@ -342,9 +345,7 @@ export class DmPolicyRejectionStore {
         if (error.code !== 'EEXIST') throw error;
         const observed = await observeLock(lockPath);
         if (!observed) continue;
-        const damagedAndSettled = !observed.owner
-          && Date.now() - observed.stat.mtimeMs >= damagedLockGraceMs;
-        if ((observed.owner && !processAlive(observed.owner.pid)) || damagedAndSettled) {
+        if (observed.owner && !processAlive(observed.owner.pid)) {
           if (await unlinkObservedLock(lockPath, observed)) continue;
         }
         if (Date.now() >= deadline) {
@@ -495,9 +496,20 @@ export function createDmPolicyRejectionHandler({
             nextRetryAt: record.nextRetryAt,
           };
         }
+        const rejectorAgentId = requireText(agentId, 'HXA agent id');
+        const reconciliationContents = new Set(normalizedSecrets.verification.map(secret => (
+          signedRejectionContent({
+            noticeSecret: secret,
+            rejectorAgentId,
+            targetAgentId: senderId,
+            channelId,
+            messageId,
+            policy: safePolicy,
+          })
+        )));
         const content = signedRejectionContent({
           noticeSecret: normalizedSecrets.current,
-          rejectorAgentId: requireText(agentId, 'HXA agent id'),
+          rejectorAgentId,
           targetAgentId: senderId,
           channelId,
           messageId,
@@ -516,40 +528,58 @@ export function createDmPolicyRejectionHandler({
             }
             const reconcileStart = Math.max(0, record.startedAt - 5_000);
             const reconcileEnd = store.clock() + 5_000;
-            const existing = messages.find(candidate => (
+            const matchingMessages = messages.filter(candidate => (
               candidate?.channel_id === record.channelId
               && candidate?.sender_id === agentId
-              && candidate?.content === content
+              && reconciliationContents.has(candidate?.content)
               && candidate?.content_type === 'system'
               && Number.isFinite(candidate?.created_at)
               && candidate.created_at >= reconcileStart
               && candidate.created_at <= reconcileEnd
             ));
+            const existing = matchingMessages.find(candidate => (
+              typeof candidate.id === 'string' && candidate.id.trim() !== ''
+            ));
             if (existing) {
               record = await store.update(record, {
                 status: 'notified',
-                noticeMessageId: existing.id || null,
+                noticeMessageId: existing.id,
                 channelId: existing.channel_id || record.channelId,
                 nextRetryAt: null,
                 lastError: null,
               });
               return { status: record.status, replayed: true, reconciled: true };
             }
+            if (matchingMessages.length > 0) {
+              const attempts = Math.min(maxAttempts, record.attempts + 1);
+              const nextRetryAt = store.clock()
+                + Math.min(maxRetryMs, retryBaseMs * (2 ** (attempts - 1)));
+              record = await store.update(record, {
+                status: 'retry_wait',
+                attempts,
+                nextRetryAt,
+                lastError: safeMissingReceiptError(),
+              });
+              return { status: record.status, replayed: true, nextRetryAt };
+            }
           } catch (error) {
-            const attempts = record.attempts + 1;
-            const exhausted = attempts >= maxAttempts;
-            const nextRetryAt = exhausted
-              ? null
-              : store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (attempts - 1)));
+            const attempts = Math.min(maxAttempts, record.attempts + 1);
+            const nextRetryAt = store.clock()
+              + Math.min(maxRetryMs, retryBaseMs * (2 ** (attempts - 1)));
             record = await store.update(record, {
-              status: exhausted ? 'dead_letter' : 'retry_wait',
+              status: 'retry_wait',
               attempts,
               nextRetryAt,
               lastError: safeReconciliationError(),
             });
-            return exhausted
-              ? { status: record.status, replayed: true }
-              : { status: record.status, replayed: true, nextRetryAt };
+            return { status: record.status, replayed: true, nextRetryAt };
+          }
+          if (record.attempts >= maxAttempts) {
+            record = await store.update(record, {
+              status: 'dead_letter',
+              nextRetryAt: null,
+            });
+            return { status: record.status, replayed: true };
           }
         }
         const recentForSenderAndPolicy = (await store.list({ label: safeLabel })).some(candidate => (
@@ -579,8 +609,7 @@ export function createDmPolicyRejectionHandler({
           );
         } catch (error) {
           const failure = safeDeliveryError(error);
-          const exhausted = record.attempts >= maxAttempts;
-          const nextRetryAt = failure.retryable && !exhausted
+          const nextRetryAt = failure.retryable
             ? store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (record.attempts - 1)))
             : null;
           record = await store.update(record, {
@@ -593,23 +622,19 @@ export function createDmPolicyRejectionHandler({
             : { status: record.status, replayed: false, nextRetryAt };
         }
         const noticeMessageId = typeof receipt?.message?.id === 'string'
-          && receipt.message.id !== ''
+          && receipt.message.id.trim() !== ''
           ? receipt.message.id
           : null;
         const receiptChannelId = receipt?.channel_id || receipt?.message?.channel_id || null;
         if (!noticeMessageId || receiptChannelId !== record.channelId) {
-          const exhausted = record.attempts >= maxAttempts;
-          const nextRetryAt = exhausted
-            ? null
-            : store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (record.attempts - 1)));
+          const nextRetryAt = store.clock()
+            + Math.min(maxRetryMs, retryBaseMs * (2 ** (record.attempts - 1)));
           record = await store.update(record, {
-            status: exhausted ? 'dead_letter' : 'retry_wait',
+            status: 'retry_wait',
             nextRetryAt,
             lastError: safeMissingReceiptError(),
           });
-          return exhausted
-            ? { status: record.status, replayed: false }
-            : { status: record.status, replayed: false, nextRetryAt };
+          return { status: record.status, replayed: false, nextRetryAt };
         }
         record = await store.update(record, {
           status: 'notified',

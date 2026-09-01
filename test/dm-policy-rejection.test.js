@@ -108,34 +108,49 @@ describe('DM policy rejection', () => {
     assert.deepEqual((await fs.promises.readdir(directory)).filter(name => name.endsWith('.lock')), []);
   });
 
-  it('recovers damaged and stale lock records without leaving lock debris', async () => {
+  it('fails closed on damaged lock metadata and recovers only a verifiably stale owner', async () => {
     const store = await createStore();
-    const cases = [
+    const damagedCases = [
       { key: 'damaged-lock', content: '' },
       { key: 'half-written-lock', content: '{"schemaVersion":1,"pid":' },
       {
-        key: 'stale-lock',
+        key: 'parseable-incomplete-lock',
         content: `${JSON.stringify({
           schemaVersion: 1,
           pid: 2_147_483_647,
-          token: 'stale-owner-token',
-          createdAt: 1,
+          token: 'truncated-token',
         })}\n`,
       },
     ];
 
-    for (const lockCase of cases) {
+    for (const lockCase of damagedCases) {
       const lockPath = `${store.filePath(lockCase.key)}.lock`;
       await fs.promises.writeFile(lockPath, lockCase.content, { mode: 0o600 });
       const old = new Date(Date.now() - 10_000);
       await fs.promises.utimes(lockPath, old, old);
-      let entered = false;
-
-      await store.withLock(lockCase.key, async () => { entered = true; }, { timeoutMs: 2_000 });
-
-      assert.equal(entered, true, lockCase.key);
-      await assert.rejects(fs.promises.stat(lockPath), { code: 'ENOENT' });
+      await assert.rejects(
+        store.withLock(lockCase.key, async () => {
+          assert.fail('damaged owner metadata must never be stolen');
+        }, { timeoutMs: 150 }),
+        error => error?.code === 'HXA_DM_POLICY_REJECTION_BUSY',
+        lockCase.key,
+      );
+      assert.equal(await fs.promises.readFile(lockPath, 'utf8'), lockCase.content);
+      await fs.promises.unlink(lockPath);
     }
+
+    const staleKey = 'stale-lock';
+    const stalePath = `${store.filePath(staleKey)}.lock`;
+    await fs.promises.writeFile(stalePath, `${JSON.stringify({
+      schemaVersion: 1,
+      pid: 2_147_483_647,
+      token: '10000000-0000-4000-8000-000000000001',
+      createdAt: 1,
+    })}\n`, { mode: 0o600 });
+    let entered = false;
+    await store.withLock(staleKey, async () => { entered = true; }, { timeoutMs: 2_000 });
+    assert.equal(entered, true);
+    await assert.rejects(fs.promises.stat(stalePath), { code: 'ENOENT' });
   });
 
   it('recovers the lock after its owning process is killed', async () => {
@@ -496,6 +511,59 @@ describe('DM policy rejection', () => {
     assert.equal(reconciliations, 1);
   });
 
+  it('reconciles an ambiguous notice signed by the previous key after rotation', async () => {
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
+    const history = [];
+    let sends = 0;
+    const client = {
+      async send(target, content, options) {
+        sends += 1;
+        if (sends === 1) {
+          history.push({
+            id: 'old-key-notice',
+            channel_id: 'channel-1',
+            sender_id: 'receiver-1',
+            content,
+            content_type: options.content_type,
+            created_at: now + 10,
+          });
+          throw new Error('ambiguous old-key delivery');
+        }
+        return { channel_id: 'channel-1', message: { id: 'duplicate-new-key-notice' } };
+      },
+      async getMessages() { return history; },
+    };
+    const oldHandler = createBaseDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      client,
+      agentId: 'receiver-1',
+      noticeSecret: 'old-rotation-secret',
+    });
+    assert.equal((await oldHandler.reject(rejectedDm({ id: 'rotation-ambiguous' }), {
+      source: 'websocket',
+      policy: 'allowlist',
+    })).status, 'retry_wait');
+    now += 1_000;
+
+    const restarted = createBaseDmPolicyRejectionHandler({
+      label: 'hxa',
+      store: new DmPolicyRejectionStore({ directory: store.directory, clock: store.clock }),
+      client,
+      agentId: 'receiver-1',
+      noticeSecrets: {
+        current: 'new-rotation-secret',
+        previous: ['old-rotation-secret'],
+      },
+    });
+    assert.deepEqual(await restarted.reject(rejectedDm({ id: 'rotation-ambiguous' }), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), { status: 'notified', replayed: true, reconciled: true });
+    assert.equal(sends, 1);
+  });
+
   it('does not reconcile the wrong route, a sender-name spoof, or an out-of-window notice', async () => {
     let now = 1_788_220_800_000;
     const store = await createStore(() => now);
@@ -560,6 +628,58 @@ describe('DM policy rejection', () => {
 
     assert.equal(sends, 2);
     assert.deepEqual(retried, { status: 'notified', replayed: false });
+  });
+
+  it('keeps an exact reconciliation candidate unknown when its external message id is empty', async () => {
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
+    let sends = 0;
+    let noticeContent;
+    const handler = createDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      agentId: 'receiver-1',
+      client: {
+        async send(target, content) {
+          sends += 1;
+          noticeContent = content;
+          throw new Error('ambiguous delivery');
+        },
+        async getMessages() {
+          return [{
+            id: '   ',
+            channel_id: 'channel-1',
+            sender_id: 'receiver-1',
+            content: noticeContent,
+            content_type: 'system',
+            created_at: now,
+          }];
+        },
+      },
+    });
+    assert.equal((await handler.reject(rejectedDm({ id: 'missing-external-id' }), {
+      source: 'websocket',
+      policy: 'allowlist',
+    })).status, 'retry_wait');
+    now += 1_000;
+
+    assert.deepEqual(await handler.reject(rejectedDm({ id: 'missing-external-id' }), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), {
+      status: 'retry_wait',
+      replayed: true,
+      nextRetryAt: now + 2_000,
+    });
+    assert.equal(sends, 1);
+    const [audit] = await store.list({ label: 'hxa' });
+    assert.equal(audit.noticeMessageId, null);
+    assert.deepEqual(audit.lastError, {
+      errorCode: 'DELIVERY_RECEIPT_MISSING',
+      errorClass: 'DeliveryReceiptError',
+      retryable: true,
+      summary: 'Hub did not return a verifiable notification receipt',
+    });
   });
 
   it('rejects same-message replays with a different sender, channel, or policy before I/O or audit mutation', async () => {
@@ -808,6 +928,55 @@ describe('DM policy rejection', () => {
     assert.doesNotMatch(persisted, /hub\.invalid/);
   });
 
+  it('performs a final reconciliation after the last ambiguous send attempt', async () => {
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
+    const history = [];
+    let sends = 0;
+    let reconciliations = 0;
+    const handler = createDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      agentId: 'receiver-1',
+      maxAttempts: 1,
+      retryBaseMs: 100,
+      client: {
+        async send(target, content, options) {
+          sends += 1;
+          history.push({
+            id: 'final-attempt-notice',
+            channel_id: 'channel-1',
+            sender_id: 'receiver-1',
+            content,
+            content_type: options.content_type,
+            created_at: now + 1,
+          });
+          throw new Error('ambiguous final attempt');
+        },
+        async getMessages() {
+          reconciliations += 1;
+          return history;
+        },
+      },
+    });
+
+    assert.deepEqual(await handler.reject(rejectedDm({ id: 'final-ambiguous' }), {
+      source: 'websocket',
+      policy: 'allowlist',
+    }), {
+      status: 'retry_wait',
+      replayed: false,
+      nextRetryAt: now + 100,
+    });
+    now += 100;
+    assert.deepEqual(await handler.reject(rejectedDm({ id: 'final-ambiguous' }), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), { status: 'notified', replayed: true, reconciled: true });
+    assert.equal(sends, 1);
+    assert.equal(reconciliations, 1);
+  });
+
   it('backs off retryable failures and dead-letters after bounded attempts', async () => {
     let now = 1_788_220_800_000;
     const store = await createStore(() => now);
@@ -857,16 +1026,21 @@ describe('DM policy rejection', () => {
     assert.deepEqual(await handler.reject(rejectedDm(), {
       source: 'inbox',
       policy: 'allowlist',
-    }), { status: 'dead_letter', replayed: false });
+    }), {
+      status: 'retry_wait',
+      replayed: false,
+      nextRetryAt: now + 200,
+    });
     assert.equal(sends, 2);
     assert.equal(reconciliations, 1);
 
-    now += 10_000;
+    now += 200;
     assert.deepEqual(await handler.reject(rejectedDm(), {
       source: 'inbox',
       policy: 'allowlist',
     }), { status: 'dead_letter', replayed: true });
     assert.equal(sends, 2);
+    assert.equal(reconciliations, 2);
     const audit = (await store.list({ label: 'hxa' }))[0];
     assert.equal(audit.attempts, 2);
     assert.equal(audit.nextRetryAt, null);
