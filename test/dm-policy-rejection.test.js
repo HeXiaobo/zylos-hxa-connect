@@ -121,6 +121,15 @@ describe('DM policy rejection', () => {
           token: 'truncated-token',
         })}\n`,
       },
+      {
+        key: 'unconfirmable-owner-lock',
+        content: `${JSON.stringify({
+          schemaVersion: 1,
+          pid: Number.MAX_SAFE_INTEGER,
+          token: '10000000-0000-4000-8000-000000000002',
+          createdAt: 1,
+        })}\n`,
+      },
     ];
 
     for (const lockCase of damagedCases) {
@@ -528,7 +537,9 @@ describe('DM policy rejection', () => {
             content_type: options.content_type,
             created_at: now + 10,
           });
-          throw new Error('ambiguous old-key delivery');
+          const error = new Error('ambiguous old-key delivery');
+          error.code = 'ECONNRESET';
+          throw error;
         }
         return { channel_id: 'channel-1', message: { id: 'duplicate-new-key-notice' } };
       },
@@ -630,7 +641,7 @@ describe('DM policy rejection', () => {
     assert.deepEqual(retried, { status: 'notified', replayed: false });
   });
 
-  it('keeps an exact reconciliation candidate unknown when its external message id is empty', async () => {
+  it('keeps an exact reconciliation candidate unknown when its external message id is missing', async () => {
     let now = 1_788_220_800_000;
     const store = await createStore(() => now);
     let sends = 0;
@@ -647,7 +658,6 @@ describe('DM policy rejection', () => {
         },
         async getMessages() {
           return [{
-            id: '   ',
             channel_id: 'channel-1',
             sender_id: 'receiver-1',
             content: noticeContent,
@@ -928,7 +938,7 @@ describe('DM policy rejection', () => {
     assert.doesNotMatch(persisted, /hub\.invalid/);
   });
 
-  it('performs a final reconciliation after the last ambiguous send attempt', async () => {
+  it('performs a final reconciliation after the last undefined send result', async () => {
     let now = 1_788_220_800_000;
     const store = await createStore(() => now);
     const history = [];
@@ -951,7 +961,7 @@ describe('DM policy rejection', () => {
             content_type: options.content_type,
             created_at: now + 1,
           });
-          throw new Error('ambiguous final attempt');
+          return undefined;
         },
         async getMessages() {
           reconciliations += 1;

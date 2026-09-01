@@ -60,13 +60,13 @@ function normalizeNoticeSecrets({ noticeSecret, noticeSecrets } = {}, { required
   };
 }
 
-function processAlive(pid) {
+function ownerDeathConfirmed(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
     process.kill(pid, 0);
-    return true;
+    return false;
   } catch (error) {
-    return error.code === 'EPERM';
+    return error.code === 'ESRCH';
   }
 }
 
@@ -345,7 +345,7 @@ export class DmPolicyRejectionStore {
         if (error.code !== 'EEXIST') throw error;
         const observed = await observeLock(lockPath);
         if (!observed) continue;
-        if (observed.owner && !processAlive(observed.owner.pid)) {
+        if (observed.owner && ownerDeathConfirmed(observed.owner.pid)) {
           if (await unlinkObservedLock(lockPath, observed)) continue;
         }
         if (Date.now() >= deadline) {
