@@ -10,6 +10,8 @@
  */
 
 import { loadConfig, saveConfig } from './lib/config.js';
+import { getRuntimePaths } from './lib/config-path.js';
+import { DmPolicyRejectionStore } from './lib/dm-policy-rejection.js';
 
 // ─── Arg parsing ─────────────────────────────────────────
 
@@ -137,6 +139,28 @@ const commands = {
     } else {
       console.log(`[${label}] ${value} not found in dmAllowFrom`);
     }
+  },
+
+  'list-dm-rejections': async (config, label, rawLimit = '50') => {
+    const limit = Number.parseInt(rawLimit, 10);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      console.error('Usage: admin.js list-dm-rejections [limit: 1-1000]');
+      process.exit(1);
+    }
+    const store = new DmPolicyRejectionStore({
+      directory: getRuntimePaths().dmPolicyRejectionDir,
+    });
+    const records = (await store.list({ label })).slice(0, limit).map(record => ({
+      messageId: record.messageId,
+      source: record.source,
+      sender: record.sender,
+      timestamp: record.timestamp,
+      reason: record.reason,
+      policy: record.policy,
+      status: record.status,
+      lastError: record.lastError,
+    }));
+    console.log(JSON.stringify(records, null, 2));
   },
 
   // ─── Group Policy (Thread Access) ──────────────────────
@@ -302,6 +326,7 @@ Commands:
   list-dm-allow                                    Show DM policy and allowFrom list
   add-dm-allow <sender_name>                       Add sender to dmAllowFrom
   remove-dm-allow <sender_name>                    Remove sender from dmAllowFrom
+  list-dm-rejections [limit]                       Query durable DM rejection audits
 
   Thread (Group) Access Control (per-org):
   set-group-policy <open|allowlist|disabled>        Set thread access policy
@@ -340,5 +365,5 @@ if (command === 'help' || !commands[command]) {
 } else {
   const config = loadConfig();
   const label = resolveOrgLabel(config, flags.org);
-  commands[command](config, label, ...positional.slice(1));
+  await commands[command](config, label, ...positional.slice(1));
 }
