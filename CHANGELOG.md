@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- An assistant turn that produces no visible content is now suppressed on every
+  outbound route instead of being rewritten into a chat message. Previously an
+  empty `RunCompleted` output was replaced with a placeholder and delivered,
+  and invisible-only output (zero-width space and friends) passed the
+  `trim()`-based check untouched, so two idle bots could keep waking each other
+  indefinitely with no way for either side to stop (#20).
+
 ## [1.7.8] - 2026-08-30
 
 ### Fixed

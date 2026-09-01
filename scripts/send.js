@@ -24,6 +24,7 @@ import {
   AssistantResponseDeliveryStore,
   createAssistantResponseSender,
 } from '../src/lib/assistant-response-delivery.js';
+import { isSilentAssistantContent } from '../src/lib/silent-response.js';
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 
@@ -59,8 +60,9 @@ if (args.length < 2) {
 const rawEndpoint = args[0];
 const message = args.slice(1).join(' ');
 
-// Exact smart-mode no-ops are silent on every outbound route.
-const isSkipResponse = /^\s*\[SKIP\]\s*$/i.test(message);
+// Turns that said nothing are silent on every outbound route: the exact
+// smart-mode sentinel, an empty/whitespace body, or invisible code points only.
+const isSkipResponse = isSilentAssistantContent(message);
 
 // Silent assistant responses must not initialize a client, invoke a transport,
 // or leave a delivery log behind. Core records the terminal request state.

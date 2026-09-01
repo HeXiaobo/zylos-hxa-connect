@@ -16,3 +16,27 @@ test('send exits silently before initializing transport for an exact [SKIP] resp
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, '');
 });
+
+test('send exits silently before initializing transport for an empty response', () => {
+  const result = spawnSync(process.execPath, [
+    SEND,
+    'org:hxa|ss|msg:source-message',
+    '   ',
+  ], { encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+});
+
+test('send exits silently for an invisible-only response', () => {
+  const result = spawnSync(process.execPath, [
+    SEND,
+    'org:hxa|ss|msg:source-message',
+    '​',
+  ], { encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+});

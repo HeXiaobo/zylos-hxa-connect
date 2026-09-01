@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { isSilentAssistantContent } from './silent-response.js';
+
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 const MSG_SUFFIX_RE = /\|msg:([A-Za-z0-9-]+)$/;
 const TERMINAL_EVENTS = new Set(['RunCompleted', 'RunFailed']);
@@ -140,7 +142,8 @@ function terminalFromDelivery(input) {
 }
 
 function publicCompletedContent(terminal) {
-  return terminal.payload.output.trim().length > 0 ? terminal.payload.output : '处理完成。';
+  // No placeholder substitution: a silent turn is suppressed in send() below.
+  return terminal.payload.output;
 }
 
 function canonicalEndpointKey(parsed) {
@@ -346,7 +349,11 @@ export function createAssistantResponseSender({
     async send({ requestId, endpointId, content, suppressSkip = false } = {}) {
       const safeRequestId = requireText(requestId, 'HXA assistant response requestId');
       const safeEndpointId = requireText(endpointId, 'HXA assistant response endpointId');
-      const safeContent = requireText(content, 'HXA assistant response content');
+      // Silence is checked before requireText: an empty or invisible-only turn
+      // is a legitimate "say nothing", not a malformed payload.
+      const safeContent = typeof content === 'string' && suppressSkip && isSilentAssistantContent(content)
+        ? content
+        : requireText(content, 'HXA assistant response content');
       const parsed = parseHxaResponseEndpoint(safeEndpointId, defaultOrgLabel);
       const identity = responseIdentity({
         requestId: safeRequestId,
@@ -359,7 +366,7 @@ export function createAssistantResponseSender({
           return { handled: true, replayed: true, status: record.status };
         }
 
-        if (suppressSkip && /^\s*\[SKIP\]\s*$/i.test(safeContent)) {
+        if (suppressSkip && isSilentAssistantContent(safeContent)) {
           record = await store.update(record, { status: 'suppressed', lastError: null });
           return { handled: true, replayed: false, status: record.status };
         }
