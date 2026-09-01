@@ -1,0 +1,374 @@
+{
+  "schemaVersion": 1,
+  "contractId": "zylos.assistant-reply-contract/v1",
+  "commonFixture": {
+    "file": "common-contract-vectors.json",
+    "sha256": "581475d80e85cd156c4f6629d0e8e8ee82c2689e89de214c1bb24b404cd10195"
+  },
+  "adapterId": "hxa-connect",
+  "capabilities": {
+    "deliveryMode": "terminal_only",
+    "progressSubscription": false,
+    "cardKit": false,
+    "replyPresence": false,
+    "physicalStoreOwner": "hxa-connect",
+    "sharesPhysicalStoreWithFeishu": false
+  },
+  "vectors": {
+    "RunCompleted": {
+      "schemaVersion": 1,
+      "type": "RunCompleted",
+      "eventId": "event:req:hxa:dm:message-001:6",
+      "requestId": "req:hxa:dm:message-001",
+      "turnId": "turn:req:hxa:dm:message-001:1",
+      "generation": 1,
+      "sequence": 6,
+      "traceId": "trace:hxa:dm:message-001",
+      "causationId": "event:req:hxa:dm:message-001:5",
+      "producer": "runtime:shared",
+      "idempotencyKey": "event:req:hxa:dm:message-001:6",
+      "payload": {
+        "outcomeId": "outcome:req:hxa:dm:message-001"
+      }
+    },
+    "RunFailed": {
+      "schemaVersion": 1,
+      "type": "RunFailed",
+      "eventId": "event:req:hxa:dm:message-002:4",
+      "requestId": "req:hxa:dm:message-002",
+      "turnId": "turn:req:hxa:dm:message-002:1",
+      "generation": 1,
+      "sequence": 4,
+      "traceId": "trace:hxa:dm:message-002",
+      "causationId": "event:req:hxa:dm:message-002:3",
+      "producer": "runtime:shared",
+      "idempotencyKey": "event:req:hxa:dm:message-002:4",
+      "payload": {
+        "outcomeId": "outcome:req:hxa:dm:message-002",
+        "code": "RUNTIME_FAILURE",
+        "retryable": true
+      }
+    },
+    "RunCancelled": {
+      "schemaVersion": 1,
+      "type": "RunCancelled",
+      "eventId": "event:req:hxa:dm:message-003:3",
+      "requestId": "req:hxa:dm:message-003",
+      "turnId": "turn:req:hxa:dm:message-003:1",
+      "generation": 1,
+      "sequence": 3,
+      "traceId": "trace:hxa:dm:message-003",
+      "causationId": "cancel:req:hxa:dm:message-003:user-01",
+      "producer": "runtime:shared",
+      "idempotencyKey": "event:req:hxa:dm:message-003:3",
+      "payload": {
+        "mode": "queued"
+      }
+    },
+    "ReplyOutcome": {
+      "answer": {
+        "schemaVersion": 1,
+        "type": "ReplyOutcome",
+        "outcomeId": "outcome:req:hxa:dm:message-001",
+        "requestId": "req:hxa:dm:message-001",
+        "turnId": "turn:req:hxa:dm:message-001:1",
+        "traceId": "trace:hxa:dm:message-001",
+        "kind": "answer",
+        "content": {
+          "format": "text",
+          "text": "Exact terminal answer."
+        }
+      },
+      "failure": {
+        "schemaVersion": 1,
+        "type": "ReplyOutcome",
+        "outcomeId": "outcome:req:hxa:dm:message-002",
+        "requestId": "req:hxa:dm:message-002",
+        "turnId": "turn:req:hxa:dm:message-002:1",
+        "traceId": "trace:hxa:dm:message-002",
+        "kind": "failure",
+        "code": "RUNTIME_FAILURE",
+        "retryable": true
+      },
+      "silent": {
+        "schemaVersion": 1,
+        "type": "ReplyOutcome",
+        "outcomeId": "outcome:req:hxa:dm:message-004",
+        "requestId": "req:hxa:dm:message-004",
+        "turnId": "turn:req:hxa:dm:message-004:1",
+        "traceId": "trace:hxa:dm:message-004",
+        "kind": "silent",
+        "explicit": true,
+        "reason": "response_not_needed"
+      }
+    },
+    "ReplyIntent": {
+      "answer": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "requestId": "req:hxa:dm:message-001",
+        "traceId": "trace:hxa:dm:message-001",
+        "cause": {
+          "kind": "run_terminal",
+          "eventId": "event:req:hxa:dm:message-001:6"
+        },
+        "route": {
+          "adapterId": "hxa-connect",
+          "targetRef": "org:hxa|peer-agent|msg:source-message-001"
+        },
+        "disposition": "send",
+        "payload": {
+          "format": "text",
+          "text": "Exact terminal answer."
+        },
+        "contentHash": "sha256:445710a3a5ae1704c2ea9e65fd69c5379d52b4bb891ebe39d634df1fa159845b",
+        "idempotencyKey": "reply:req:hxa:dm:message-001:hxa-route-001"
+      },
+      "failure_notice": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "reply:req:hxa:dm:message-002:hxa-route-002",
+        "requestId": "req:hxa:dm:message-002",
+        "traceId": "trace:hxa:dm:message-002",
+        "cause": {
+          "kind": "run_terminal",
+          "eventId": "event:req:hxa:dm:message-002:4"
+        },
+        "route": {
+          "adapterId": "hxa-connect",
+          "targetRef": "thread:thread-002|msg:source-message-002"
+        },
+        "disposition": "failure_notice",
+        "payload": {
+          "format": "text",
+          "text": "The assistant could not complete this request."
+        },
+        "contentHash": "sha256:cd4b8a8bb6f6aba69eaeacc3da679e237f203fb5cba64de84188c1d3fdebc1ef",
+        "idempotencyKey": "reply:req:hxa:dm:message-002:hxa-route-002"
+      }
+    },
+    "DeliveryReceipt": {
+      "platformAccepted": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery:hxa:message-001:attempt-1",
+        "deliveryId": "delivery:hxa:message-001",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "requestId": "req:hxa:dm:message-001",
+        "attemptId": "attempt:delivery:hxa:message-001:1",
+        "traceId": "trace:hxa:dm:message-001",
+        "adapterId": "hxa-connect",
+        "outcome": "platform_accepted",
+        "externalRef": "opaque:hub-message-001",
+        "observedAt": "2026-09-01T00:00:00.000Z"
+      },
+      "unknown": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery:hxa:message-001:attempt-2",
+        "deliveryId": "delivery:hxa:message-001",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "requestId": "req:hxa:dm:message-001",
+        "attemptId": "attempt:delivery:hxa:message-001:2",
+        "traceId": "trace:hxa:dm:message-001",
+        "adapterId": "hxa-connect",
+        "outcome": "unknown",
+        "externalRef": null,
+        "observedAt": "2026-09-01T00:01:00.000Z",
+        "nextAction": "reconcile_before_retry"
+      },
+      "reconciled": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery:hxa:message-001:reconcile-1",
+        "deliveryId": "delivery:hxa:message-001",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "requestId": "req:hxa:dm:message-001",
+        "attemptId": "attempt:delivery:hxa:message-001:2",
+        "traceId": "trace:hxa:dm:message-001",
+        "adapterId": "hxa-connect",
+        "outcome": "reconciled",
+        "externalRef": "opaque:hub-message-001",
+        "observedAt": "2026-09-01T00:02:00.000Z"
+      },
+      "rejected": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery:hxa:message-002:attempt-1",
+        "deliveryId": "delivery:hxa:message-002",
+        "intentId": "reply:req:hxa:dm:message-002:hxa-route-002",
+        "requestId": "req:hxa:dm:message-002",
+        "attemptId": "attempt:delivery:hxa:message-002:1",
+        "traceId": "trace:hxa:dm:message-002",
+        "adapterId": "hxa-connect",
+        "outcome": "rejected",
+        "externalRef": null,
+        "observedAt": "2026-09-01T00:03:00.000Z",
+        "errorCode": "PLATFORM_REJECTED",
+        "retryable": true
+      }
+    },
+    "DeliverySettlement": {
+      "accepted": {
+        "schemaVersion": 1,
+        "type": "DeliverySettlement",
+        "settlementId": "settlement:delivery:hxa:message-001:accepted",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "deliveryId": "delivery:hxa:message-001",
+        "requestId": "req:hxa:dm:message-001",
+        "traceId": "trace:hxa:dm:message-001",
+        "adapterId": "hxa-connect",
+        "state": "accepted",
+        "basis": "platform_accepted",
+        "presented": true
+      },
+      "reconciled": {
+        "schemaVersion": 1,
+        "type": "DeliverySettlement",
+        "settlementId": "settlement:delivery:hxa:message-001:reconciled",
+        "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+        "deliveryId": "delivery:hxa:message-001",
+        "requestId": "req:hxa:dm:message-001",
+        "traceId": "trace:hxa:dm:message-001",
+        "adapterId": "hxa-connect",
+        "state": "accepted",
+        "basis": "reconciled",
+        "presented": true
+      },
+      "unpresentable": {
+        "schemaVersion": 1,
+        "type": "DeliverySettlement",
+        "settlementId": "settlement:delivery:hxa:message-002:unpresentable",
+        "intentId": "reply:req:hxa:dm:message-002:hxa-route-002",
+        "deliveryId": "delivery:hxa:message-002",
+        "requestId": "req:hxa:dm:message-002",
+        "traceId": "trace:hxa:dm:message-002",
+        "adapterId": "hxa-connect",
+        "state": "unpresentable",
+        "basis": "retry_exhausted",
+        "presented": false
+      }
+    },
+    "silent": {
+      "runEvent": {
+        "schemaVersion": 1,
+        "type": "RunCompleted",
+        "eventId": "event:req:hxa:dm:message-004:4",
+        "requestId": "req:hxa:dm:message-004",
+        "turnId": "turn:req:hxa:dm:message-004:1",
+        "generation": 1,
+        "sequence": 4,
+        "traceId": "trace:hxa:dm:message-004",
+        "causationId": "event:req:hxa:dm:message-004:3",
+        "producer": "runtime:shared",
+        "idempotencyKey": "event:req:hxa:dm:message-004:4",
+        "payload": {
+          "outcomeId": "outcome:req:hxa:dm:message-004"
+        }
+      },
+      "outcome": {
+        "schemaVersion": 1,
+        "type": "ReplyOutcome",
+        "outcomeId": "outcome:req:hxa:dm:message-004",
+        "requestId": "req:hxa:dm:message-004",
+        "turnId": "turn:req:hxa:dm:message-004:1",
+        "traceId": "trace:hxa:dm:message-004",
+        "kind": "silent",
+        "explicit": true,
+        "reason": "response_not_needed"
+      },
+      "replyIntent": null,
+      "settlement": null,
+      "deliveryRequired": false
+    },
+    "cancelled": {
+      "replyOutcome": null,
+      "replyIntent": null,
+      "presence": "not_applicable_hxa_terminal_only"
+    }
+  },
+  "terminalOnlyInputs": [
+    {
+      "type": "ProgressUpdated",
+      "expectedHubMessages": 0
+    },
+    {
+      "type": "OutputDelta",
+      "expectedHubMessages": 0
+    }
+  ],
+  "normalization": {
+    "emptyVisibleAnswer": {
+      "input": "",
+      "expectedError": "MISSING_OUTPUT"
+    },
+    "skipCompatibilityInput": {
+      "input": "[SKIP]",
+      "normalizedOutcome": {
+        "kind": "silent",
+        "reason": "legacy_skip_marker"
+      },
+      "expectedHubMessages": 0
+    }
+  },
+  "deliveryScenarios": {
+    "duplicate": {
+      "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "deliveryId": "delivery:hxa:message-001",
+      "contentHash": "sha256:445710a3a5ae1704c2ea9e65fd69c5379d52b4bb891ebe39d634df1fa159845b",
+      "expectedHubMessages": 1
+    },
+    "payload_conflict": {
+      "intentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "deliveryId": "delivery:hxa:message-001",
+      "originalContentHash": "sha256:445710a3a5ae1704c2ea9e65fd69c5379d52b4bb891ebe39d634df1fa159845b",
+      "replayedContentHash": "sha256:24e987f91fc162df5b92dc4edde4fba313e5e1a23dceccab91e32b4909568505",
+      "expectedError": "IDEMPOTENCY_CONFLICT"
+    },
+    "unknown_then_reconcile": {
+      "transitions": [
+        "sending",
+        "unknown",
+        "reconcile",
+        "reconciled"
+      ],
+      "retryBeforeReconcile": false,
+      "expectedHubMessages": 1
+    },
+    "unknown_then_retry": {
+      "transitions": [
+        "sending",
+        "unknown",
+        "reconcile",
+        "retrying",
+        "sending",
+        "platform_accepted"
+      ],
+      "reconcileBeforeRetry": true,
+      "expectedHubMessages": 2
+    },
+    "dead_letter_isolation": {
+      "failedDeliveryId": "delivery:hxa:message-002",
+      "siblingDeliveryId": "delivery:hxa:message-004",
+      "failedReceiptOutcome": "rejected",
+      "failedSettlementState": "unpresentable",
+      "deadLettered": true,
+      "siblingDeliveryOutcome": "platform_accepted",
+      "batchContinues": true,
+      "runOutcomeAfterDeliveryFailure": "completed"
+    },
+    "redrive": {
+      "originalIntentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "redriveIntentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "originalDeliveryId": "delivery:hxa:message-001",
+      "redriveDeliveryId": "delivery:hxa:message-001"
+    },
+    "restart_recovery": {
+      "beforeRestartIntentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "afterRestartIntentId": "reply:req:hxa:dm:message-001:hxa-route-001",
+      "beforeRestartDeliveryId": "delivery:hxa:message-001",
+      "afterRestartDeliveryId": "delivery:hxa:message-001"
+    }
+  }
+}
