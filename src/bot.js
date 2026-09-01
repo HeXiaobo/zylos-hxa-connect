@@ -32,6 +32,7 @@ const {
   dmPolicyRejectionDir: DM_POLICY_REJECTION_DIR,
 } = getRuntimePaths();
 const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
+const DM_POLICY_NOTICE_SECRET = process.env.HXA_DM_POLICY_NOTICE_SECRET;
 const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
   && configuredDmReconcileInterval >= 5_000
   ? configuredDmReconcileInterval
@@ -365,12 +366,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   };
 
   const dmPolicyGate = createDmPolicyGate({
+    agentId: org.agentId,
+    noticeSecret: DM_POLICY_NOTICE_SECRET,
     rejectionHandler: createDmPolicyRejectionHandler({
       label,
       store: dmPolicyRejectionStore,
       client,
       agentId: org.agentId,
-      agentName: org.agentName,
+      noticeSecret: DM_POLICY_NOTICE_SECRET,
     }),
   });
 

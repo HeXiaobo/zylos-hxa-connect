@@ -1,9 +1,21 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDmAllowed } from './auth.js';
 
-const REJECTION_MARKER = '[zylos:dm-policy-rejection:v1:';
+const REJECTION_TEXT = "Sorry, I'm not available for private messages. Please ask my owner to grant you access.";
+const REJECTION_MARKER_PATTERN = /^\[zylos:dm-policy-rejection:v2:([A-Za-z0-9_-]+):([a-f0-9]{64})\]$/;
+const RETRYABLE_HTTP_STATUSES = new Set([408, 409, 425, 429]);
+const SAFE_NETWORK_CODES = new Set([
+  'ABORT_ERR',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -30,6 +42,68 @@ function sleep(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+function safeDeliveryError(error) {
+  const status = Number.isInteger(error?.status) ? error.status : null;
+  if (status !== null) {
+    const retryable = status >= 500 || RETRYABLE_HTTP_STATUSES.has(status);
+    return {
+      errorCode: `HTTP_${status}`,
+      errorClass: 'HttpError',
+      retryable,
+      summary: `HTTP request rejected with status ${status}`,
+    };
+  }
+  const networkCode = SAFE_NETWORK_CODES.has(error?.code) ? error.code : null;
+  return {
+    errorCode: networkCode || 'TRANSPORT_ERROR',
+    errorClass: networkCode ? 'NetworkError' : 'TransportError',
+    retryable: true,
+    summary: networkCode
+      ? `Transport request failed (${networkCode})`
+      : 'Transport request failed',
+  };
+}
+
+function safeReconciliationError() {
+  return {
+    errorCode: 'RECONCILIATION_ERROR',
+    errorClass: 'ReconciliationError',
+    retryable: true,
+    summary: 'Unable to verify the previous notification delivery',
+  };
+}
+
+export function publicDmPolicyRejectionError(error) {
+  if (!error || typeof error !== 'object') return null;
+  if (/^HTTP_[1-5][0-9]{2}$/.test(error.errorCode)) {
+    const status = Number.parseInt(error.errorCode.slice(5), 10);
+    return {
+      errorCode: error.errorCode,
+      errorClass: 'HttpError',
+      retryable: status >= 500 || RETRYABLE_HTTP_STATUSES.has(status),
+      summary: `HTTP request rejected with status ${status}`,
+    };
+  }
+  if (error.errorCode === 'RECONCILIATION_ERROR') return safeReconciliationError();
+  if (SAFE_NETWORK_CODES.has(error.errorCode)) {
+    return {
+      errorCode: error.errorCode,
+      errorClass: 'NetworkError',
+      retryable: true,
+      summary: `Transport request failed (${error.errorCode})`,
+    };
+  }
+  if (error.errorCode === 'TRANSPORT_ERROR') {
+    return {
+      errorCode: 'TRANSPORT_ERROR',
+      errorClass: 'TransportError',
+      retryable: true,
+      summary: 'Transport request failed',
+    };
+  }
+  return null;
+}
+
 async function writeAtomic(filePath, value) {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
@@ -41,40 +115,80 @@ async function writeAtomic(filePath, value) {
   }
 }
 
-function rejectionContent(idempotencyKey) {
-  const digest = idempotencyKey.slice(idempotencyKey.lastIndexOf('.') + 1);
-  return "Sorry, I'm not available for private messages. Please ask my owner to grant you access.\n\n"
-    + `${REJECTION_MARKER}${digest}]`;
+function signedRejectionContent({ noticeSecret, rejectorAgentId, targetAgentId, channelId, messageId, policy }) {
+  if (!noticeSecret) return REJECTION_TEXT;
+  const payload = {
+    rejectorAgentId,
+    targetAgentId,
+    channelId,
+    messageId,
+    policy,
+    reason: 'dm_policy',
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = createHmac('sha256', noticeSecret).update(encoded).digest('hex');
+  return `${REJECTION_TEXT}\n\n[zylos:dm-policy-rejection:v2:${encoded}:${signature}]`;
 }
 
-export function isDmPolicyRejectionNotice(message) {
-  return message?.content_type === 'system'
-    && typeof message?.content === 'string'
-    && /\[zylos:dm-policy-rejection:v1:[a-f0-9]{64}\]$/.test(message.content);
+export function isDmPolicyRejectionNotice(message, { agentId, noticeSecret } = {}) {
+  if (message?.content_type !== 'system'
+    || typeof message?.content !== 'string'
+    || typeof agentId !== 'string'
+    || agentId === ''
+    || typeof noticeSecret !== 'string'
+    || noticeSecret === '') return false;
+  const prefix = `${REJECTION_TEXT}\n\n`;
+  if (!message.content.startsWith(prefix)) return false;
+  const match = message.content.slice(prefix.length).match(REJECTION_MARKER_PATTERN);
+  if (!match) return false;
+  const [, encoded, providedSignature] = match;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+  } catch {
+    return false;
+  }
+  const canonical = {
+    rejectorAgentId: payload?.rejectorAgentId,
+    targetAgentId: payload?.targetAgentId,
+    channelId: payload?.channelId,
+    messageId: payload?.messageId,
+    policy: payload?.policy,
+    reason: payload?.reason,
+  };
+  if (Object.values(canonical).some(value => typeof value !== 'string' || value === '')
+    || canonical.reason !== 'dm_policy'
+    || Buffer.from(JSON.stringify(canonical)).toString('base64url') !== encoded
+    || canonical.rejectorAgentId !== message.sender_id
+    || canonical.targetAgentId !== agentId
+    || canonical.channelId !== message.channel_id) return false;
+  const expectedSignature = createHmac('sha256', noticeSecret).update(encoded).digest();
+  const actualSignature = Buffer.from(providedSignature, 'hex');
+  return actualSignature.length === expectedSignature.length
+    && timingSafeEqual(actualSignature, expectedSignature);
 }
 
 export function decideDmPolicy(access, message) {
-  if (isDmPolicyRejectionNotice(message)) return 'notice';
   return isDmAllowed(access, message?.sender_name || message?.sender_id) ? 'allow' : 'reject';
 }
 
-export function createDmPolicyGate({ rejectionHandler } = {}) {
+export function createDmPolicyGate({ rejectionHandler, agentId, noticeSecret } = {}) {
   if (!rejectionHandler || typeof rejectionHandler.reject !== 'function') {
     throw new TypeError('DM policy rejection handler is required');
   }
   return Object.freeze({
     async evaluate(message, { source, access } = {}) {
-      const decision = decideDmPolicy(access, message);
-      if (decision === 'allow') return { action: 'continue' };
-      if (decision === 'notice') {
+      if (isDmPolicyRejectionNotice(message, { agentId, noticeSecret })) {
         return { action: 'discarded', reason: 'dm_policy_rejection_notice' };
       }
+      const decision = decideDmPolicy(access, message);
+      if (decision === 'allow') return { action: 'continue' };
       const notification = await rejectionHandler.reject(message, {
         source,
         policy: access?.dmPolicy || 'open',
       });
       return {
-        action: 'discarded',
+        action: notification.status === 'retry_wait' ? 'retry' : 'discarded',
         reason: 'dm_policy',
         notificationStatus: notification.status,
         notificationReplayed: notification.replayed,
@@ -154,6 +268,7 @@ export class DmPolicyRejectionStore {
       updatedAt: now,
       noticeMessageId: null,
       channelId: record.channelId || null,
+      nextRetryAt: null,
       lastError: null,
     };
     await writeAtomic(filePath, prepared);
@@ -185,8 +300,11 @@ export function createDmPolicyRejectionHandler({
   store,
   client,
   agentId,
-  agentName,
+  noticeSecret,
   noticeIntervalMs = 60_000,
+  maxAttempts = 3,
+  retryBaseMs = 1_000,
+  maxRetryMs = 60_000,
 } = {}) {
   const safeLabel = requireText(label, 'HXA org label');
   if (!(store instanceof DmPolicyRejectionStore)) {
@@ -194,6 +312,15 @@ export function createDmPolicyRejectionHandler({
   }
   if (!client || typeof client.send !== 'function') {
     throw new TypeError('HXA client with send() is required');
+  }
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new TypeError('DM policy rejection maxAttempts must be a positive integer');
+  }
+  if (!Number.isSafeInteger(retryBaseMs) || retryBaseMs < 1) {
+    throw new TypeError('DM policy rejection retryBaseMs must be a positive integer');
+  }
+  if (!Number.isSafeInteger(maxRetryMs) || maxRetryMs < retryBaseMs) {
+    throw new TypeError('DM policy rejection maxRetryMs must be an integer at least retryBaseMs');
   }
 
   return Object.freeze({
@@ -217,10 +344,24 @@ export function createDmPolicyRejectionHandler({
           policy: safePolicy,
           channelId: message.channel_id || null,
         });
-        if (record.status === 'notified' || record.status === 'rate_limited') {
+        if (record.status === 'notified' || record.status === 'rate_limited' || record.status === 'dead_letter') {
           return { status: record.status, replayed: true };
         }
-        const content = rejectionContent(idempotencyKey);
+        if (record.status === 'retry_wait' && record.nextRetryAt > store.clock()) {
+          return {
+            status: record.status,
+            replayed: true,
+            nextRetryAt: record.nextRetryAt,
+          };
+        }
+        const content = signedRejectionContent({
+          noticeSecret,
+          rejectorAgentId: requireText(agentId, 'HXA agent id'),
+          targetAgentId: requireText(message.sender_id, 'rejected DM sender id'),
+          channelId: requireText(message.channel_id, 'rejected DM channel id'),
+          messageId,
+          policy: safePolicy,
+        });
         if (record.attempts > 0) {
           try {
             if (!record.channelId || typeof client.getMessages !== 'function') {
@@ -232,33 +373,49 @@ export function createDmPolicyRejectionHandler({
             if (!Array.isArray(messages)) {
               throw new TypeError('Hub channel messages response must be an array');
             }
+            const reconcileStart = Math.max(0, record.startedAt - 5_000);
+            const reconcileEnd = store.clock() + 5_000;
             const existing = messages.find(candidate => (
-              candidate?.content === content
+              candidate?.channel_id === record.channelId
+              && candidate?.sender_id === agentId
+              && candidate?.content === content
               && candidate?.content_type === 'system'
-              && (candidate?.sender_id === agentId || candidate?.sender_name === agentName)
+              && Number.isFinite(candidate?.created_at)
+              && candidate.created_at >= reconcileStart
+              && candidate.created_at <= reconcileEnd
             ));
             if (existing) {
               record = await store.update(record, {
                 status: 'notified',
                 noticeMessageId: existing.id || null,
                 channelId: existing.channel_id || record.channelId,
+                nextRetryAt: null,
                 lastError: null,
               });
               return { status: record.status, replayed: true, reconciled: true };
             }
           } catch (error) {
-            await store.update(record, {
-              status: 'uncertain',
-              lastError: String(error?.message || error).slice(0, 500),
+            const attempts = record.attempts + 1;
+            const exhausted = attempts >= maxAttempts;
+            const nextRetryAt = exhausted
+              ? null
+              : store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (attempts - 1)));
+            record = await store.update(record, {
+              status: exhausted ? 'dead_letter' : 'retry_wait',
+              attempts,
+              nextRetryAt,
+              lastError: safeReconciliationError(),
             });
-            throw error;
+            return exhausted
+              ? { status: record.status, replayed: true }
+              : { status: record.status, replayed: true, nextRetryAt };
           }
         }
         const recentForSenderAndPolicy = (await store.list({ label: safeLabel })).some(candidate => (
           candidate.idempotencyKey !== record.idempotencyKey
           && candidate.senderKey === record.senderKey
           && candidate.policy === record.policy
-          && ['prepared', 'sending', 'uncertain', 'notified'].includes(candidate.status)
+          && ['prepared', 'sending', 'retry_wait', 'notified'].includes(candidate.status)
           && candidate.startedAt >= record.startedAt - noticeIntervalMs
         ));
         if (recentForSenderAndPolicy) {
@@ -280,16 +437,25 @@ export function createDmPolicyRejectionHandler({
             { content_type: 'system' },
           );
         } catch (error) {
-          await store.update(record, {
-            status: 'uncertain',
-            lastError: String(error?.message || error).slice(0, 500),
+          const failure = safeDeliveryError(error);
+          const exhausted = record.attempts >= maxAttempts;
+          const nextRetryAt = failure.retryable && !exhausted
+            ? store.clock() + Math.min(maxRetryMs, retryBaseMs * (2 ** (record.attempts - 1)))
+            : null;
+          record = await store.update(record, {
+            status: nextRetryAt === null ? 'dead_letter' : 'retry_wait',
+            nextRetryAt,
+            lastError: failure,
           });
-          throw error;
+          return nextRetryAt === null
+            ? { status: record.status, replayed: false }
+            : { status: record.status, replayed: false, nextRetryAt };
         }
         record = await store.update(record, {
           status: 'notified',
           noticeMessageId: receipt?.message?.id || null,
           channelId: receipt?.channel_id || receipt?.message?.channel_id || record.channelId,
+          nextRetryAt: null,
           lastError: null,
         });
         return { status: record.status, replayed: false };

@@ -8,7 +8,7 @@ import { afterEach, describe, it } from 'node:test';
 import { isSenderAllowed, isThreadAllowed } from '../src/lib/auth.js';
 import {
   DmPolicyRejectionStore,
-  createDmPolicyRejectionHandler,
+  createDmPolicyRejectionHandler as createBaseDmPolicyRejectionHandler,
   createDmPolicyGate,
   decideDmPolicy,
   isDmPolicyRejectionNotice,
@@ -16,6 +16,14 @@ import {
 
 const tempDirs = [];
 const ROOT = path.resolve(import.meta.dirname, '..');
+const NOTICE_SECRET = 'test-only-shared-dm-policy-notice-secret';
+
+function createDmPolicyRejectionHandler(options) {
+  return createBaseDmPolicyRejectionHandler({
+    ...options,
+    noticeSecret: NOTICE_SECRET,
+  });
+}
 
 async function createStore(clock = () => 1_788_220_800_000) {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-dm-policy-rejection-'));
@@ -84,7 +92,7 @@ describe('DM policy rejection', () => {
     assert.equal(sends.length, 1);
     assert.equal(sends[0].target, 'peer-1');
     assert.match(sends[0].content, /Sorry, I'm not available for private messages/);
-    assert.match(sends[0].content, /\[zylos:dm-policy-rejection:v1:[a-f0-9]{64}\]$/);
+    assert.match(sends[0].content, /\[zylos:dm-policy-rejection:v2:[A-Za-z0-9_-]+:[a-f0-9]{64}\]$/);
     assert.deepEqual(sends[0].options, { content_type: 'system' });
 
     const audits = await store.list({ label: 'hxa' });
@@ -106,6 +114,10 @@ describe('DM policy rejection', () => {
     });
     assert.equal(Object.hasOwn(audits[0], 'body'), false);
     assert.equal(Object.hasOwn(audits[0], 'content'), false);
+    assert.doesNotMatch(await fs.promises.readFile(
+      store.filePath(audits[0].idempotencyKey),
+      'utf8',
+    ), new RegExp(NOTICE_SECRET));
   });
 
   it('lets the receiver query durable rejection audits after a process restart', async () => {
@@ -132,7 +144,19 @@ describe('DM policy rejection', () => {
       policy: 'allowlist',
       channelId: 'channel-1',
     });
-    await store.update(record, { status: 'notified', noticeMessageId: 'notice-query' });
+    await store.update(record, {
+      status: 'dead_letter',
+      noticeMessageId: null,
+      lastError: {
+        errorCode: 'HTTP_403',
+        errorClass: 'HttpError',
+        retryable: false,
+        summary: 'HTTP request rejected with status 403',
+        body: 'private request body',
+        token: 'Bearer secret-token',
+        request: { url: 'https://hub.invalid/messages?token=secret-token' },
+      },
+    });
 
     const child = spawnSync(process.execPath, [
       'src/admin.js',
@@ -155,10 +179,17 @@ describe('DM policy rejection', () => {
       timestamp: 1_788_220_799_000,
       reason: 'dm_policy',
       policy: 'allowlist',
-      status: 'notified',
-      lastError: null,
+      status: 'dead_letter',
+      lastError: {
+        errorCode: 'HTTP_403',
+        errorClass: 'HttpError',
+        retryable: false,
+        summary: 'HTTP request rejected with status 403',
+      },
     });
     assert.doesNotMatch(child.stdout, /private request body/);
+    assert.doesNotMatch(child.stdout, /secret-token/);
+    assert.doesNotMatch(child.stdout, /hub\.invalid/);
   });
 
   it('does not repeat the audit or notice for duplicate delivery after restart', async () => {
@@ -226,7 +257,7 @@ describe('DM policy rejection', () => {
   });
 
   it('reconciles an unknown send result after restart before attempting another send', async () => {
-    const now = 1_788_220_800_000;
+    let now = 1_788_220_800_000;
     const store = await createStore(() => now);
     const history = [];
     let sends = 0;
@@ -260,16 +291,24 @@ describe('DM policy rejection', () => {
       agentName: 'receiver-agent',
     };
 
-    await assert.rejects(
-      createDmPolicyRejectionHandler(options).reject(rejectedDm(), {
-        source: 'websocket',
-        policy: 'allowlist',
-      }),
-      /response socket closed/,
-    );
+    const initial = await createDmPolicyRejectionHandler(options).reject(rejectedDm(), {
+      source: 'websocket',
+      policy: 'allowlist',
+    });
+    assert.deepEqual(initial, {
+      status: 'retry_wait',
+      replayed: false,
+      nextRetryAt: now + 1_000,
+    });
     const uncertain = (await store.list({ label: 'hxa' }))[0];
-    assert.equal(uncertain.status, 'uncertain');
-    assert.equal(uncertain.lastError, 'response socket closed');
+    assert.equal(uncertain.status, 'retry_wait');
+    assert.deepEqual(uncertain.lastError, {
+      errorCode: 'TRANSPORT_ERROR',
+      errorClass: 'TransportError',
+      retryable: true,
+      summary: 'Transport request failed',
+    });
+    now += 1_000;
 
     const restarted = createDmPolicyRejectionHandler({
       ...options,
@@ -285,8 +324,75 @@ describe('DM policy rejection', () => {
     assert.equal(reconciliations, 1);
   });
 
+  it('does not reconcile the wrong route, a sender-name spoof, or an out-of-window notice', async () => {
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
+    let sends = 0;
+    let noticeContent;
+    const client = {
+      async send(target, content) {
+        sends += 1;
+        noticeContent = content;
+        if (sends === 1) throw new Error('response socket closed');
+        return { channel_id: 'channel-1', message: { id: 'notice-retry' } };
+      },
+      async getMessages() {
+        return [
+          {
+            id: 'wrong-channel',
+            channel_id: 'channel-attacker',
+            sender_id: 'receiver-1',
+            sender_name: 'receiver-agent',
+            content: noticeContent,
+            content_type: 'system',
+            created_at: now + 10,
+          },
+          {
+            id: 'wrong-sender',
+            channel_id: 'channel-1',
+            sender_id: 'attacker-1',
+            sender_name: 'receiver-agent',
+            content: noticeContent,
+            content_type: 'system',
+            created_at: now + 10,
+          },
+          {
+            id: 'too-old',
+            channel_id: 'channel-1',
+            sender_id: 'receiver-1',
+            sender_name: 'receiver-agent',
+            content: noticeContent,
+            content_type: 'system',
+            created_at: now - 60_000,
+          },
+        ];
+      },
+    };
+    const handler = createDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      client,
+      agentId: 'receiver-1',
+      agentName: 'receiver-agent',
+    });
+
+    assert.equal((await handler.reject(rejectedDm(), {
+      source: 'websocket',
+      policy: 'allowlist',
+    })).status, 'retry_wait');
+    now += 1_000;
+    const retried = await handler.reject(rejectedDm(), {
+      source: 'inbox',
+      policy: 'allowlist',
+    });
+
+    assert.equal(sends, 2);
+    assert.deepEqual(retried, { status: 'notified', replayed: false });
+  });
+
   it('retries an unknown result only after reconciliation proves the notice absent', async () => {
-    const store = await createStore();
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
     const calls = [];
     let sends = 0;
     const handler = createDmPolicyRejectionHandler({
@@ -308,10 +414,11 @@ describe('DM policy rejection', () => {
       },
     });
 
-    await assert.rejects(handler.reject(rejectedDm(), {
+    assert.equal((await handler.reject(rejectedDm(), {
       source: 'websocket',
       policy: 'allowlist',
-    }), /connect failed/);
+    })).status, 'retry_wait');
+    now += 1_000;
     const retried = await handler.reject(rejectedDm(), {
       source: 'inbox',
       policy: 'allowlist',
@@ -322,7 +429,8 @@ describe('DM policy rejection', () => {
   });
 
   it('keeps a reconciliation failure observable without blindly sending again', async () => {
-    const store = await createStore();
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
     let sends = 0;
     const handler = createDmPolicyRejectionHandler({
       label: 'hxa',
@@ -340,19 +448,142 @@ describe('DM policy rejection', () => {
       },
     });
 
-    await assert.rejects(handler.reject(rejectedDm(), {
+    assert.equal((await handler.reject(rejectedDm(), {
       source: 'websocket',
       policy: 'allowlist',
-    }), /response timeout/);
-    await assert.rejects(handler.reject(rejectedDm(), {
+    })).status, 'retry_wait');
+    now += 1_000;
+    assert.deepEqual(await handler.reject(rejectedDm(), {
       source: 'inbox',
       policy: 'allowlist',
-    }), /history unavailable/);
+    }), {
+      status: 'retry_wait',
+      replayed: true,
+      nextRetryAt: now + 2_000,
+    });
 
     assert.equal(sends, 1);
     const audit = (await store.list({ label: 'hxa' }))[0];
-    assert.equal(audit.status, 'uncertain');
-    assert.equal(audit.lastError, 'history unavailable');
+    assert.equal(audit.status, 'retry_wait');
+    assert.deepEqual(audit.lastError, {
+      errorCode: 'RECONCILIATION_ERROR',
+      errorClass: 'ReconciliationError',
+      retryable: true,
+      summary: 'Unable to verify the previous notification delivery',
+    });
+  });
+
+  it('dead-letters a permanent 403 once and never resends it on inbox replay', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const forbidden = new Error('forbidden: Bearer secret-token');
+    forbidden.status = 403;
+    forbidden.body = { code: 'FORBIDDEN', content: 'private request body' };
+    forbidden.request = { url: 'https://hub.invalid/messages?token=secret-token' };
+    const handler = createDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      agentId: 'receiver-1',
+      agentName: 'receiver-agent',
+      client: {
+        async send() {
+          sends += 1;
+          throw forbidden;
+        },
+        async getMessages() { throw new Error('must not reconcile a definitive 403'); },
+      },
+    });
+
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'websocket',
+      policy: 'allowlist',
+    }), { status: 'dead_letter', replayed: false });
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), { status: 'dead_letter', replayed: true });
+
+    assert.equal(sends, 1);
+    const audit = (await store.list({ label: 'hxa' }))[0];
+    assert.equal(audit.status, 'dead_letter');
+    assert.equal(audit.attempts, 1);
+    assert.equal(audit.nextRetryAt, null);
+    assert.deepEqual(audit.lastError, {
+      errorCode: 'HTTP_403',
+      errorClass: 'HttpError',
+      retryable: false,
+      summary: 'HTTP request rejected with status 403',
+    });
+    const persisted = await fs.promises.readFile(store.filePath(audit.idempotencyKey), 'utf8');
+    assert.doesNotMatch(persisted, /private request body/);
+    assert.doesNotMatch(persisted, /secret-token/);
+    assert.doesNotMatch(persisted, /hub\.invalid/);
+  });
+
+  it('backs off retryable failures and dead-letters after bounded attempts', async () => {
+    let now = 1_788_220_800_000;
+    const store = await createStore(() => now);
+    let sends = 0;
+    let reconciliations = 0;
+    const timeout = new Error('request included secret content');
+    timeout.code = 'ETIMEDOUT';
+    const handler = createDmPolicyRejectionHandler({
+      label: 'hxa',
+      store,
+      agentId: 'receiver-1',
+      agentName: 'receiver-agent',
+      maxAttempts: 2,
+      retryBaseMs: 100,
+      client: {
+        async send() {
+          sends += 1;
+          throw timeout;
+        },
+        async getMessages() {
+          reconciliations += 1;
+          return [];
+        },
+      },
+    });
+
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'websocket',
+      policy: 'allowlist',
+    }), {
+      status: 'retry_wait',
+      replayed: false,
+      nextRetryAt: now + 100,
+    });
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), {
+      status: 'retry_wait',
+      replayed: true,
+      nextRetryAt: now + 100,
+    });
+    assert.equal(sends, 1);
+    assert.equal(reconciliations, 0);
+
+    now += 100;
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), { status: 'dead_letter', replayed: false });
+    assert.equal(sends, 2);
+    assert.equal(reconciliations, 1);
+
+    now += 10_000;
+    assert.deepEqual(await handler.reject(rejectedDm(), {
+      source: 'inbox',
+      policy: 'allowlist',
+    }), { status: 'dead_letter', replayed: true });
+    assert.equal(sends, 2);
+    const audit = (await store.list({ label: 'hxa' }))[0];
+    assert.equal(audit.attempts, 2);
+    assert.equal(audit.nextRetryAt, null);
+    assert.equal(audit.lastError.errorCode, 'ETIMEDOUT');
+    assert.equal(audit.lastError.retryable, true);
   });
 
   it('rate-limits notices durably per sender and policy while auditing every rejected DM', async () => {
@@ -449,12 +680,62 @@ describe('DM policy rejection', () => {
     });
     await handler.reject(rejectedDm(), { source: 'websocket', policy: 'allowlist' });
 
-    assert.equal(isDmPolicyRejectionNotice(sentNotice), true);
-    assert.equal(isDmPolicyRejectionNotice({ ...sentNotice, content_type: 'text' }), false);
+    const receivedNotice = {
+      ...sentNotice,
+      sender_id: 'receiver-1',
+      channel_id: 'channel-1',
+    };
+    const verify = { agentId: 'peer-1', noticeSecret: NOTICE_SECRET };
+    assert.equal(isDmPolicyRejectionNotice(receivedNotice, verify), true);
+    assert.equal(isDmPolicyRejectionNotice({ ...receivedNotice, content_type: 'text' }, verify), false);
     assert.equal(isDmPolicyRejectionNotice({
       content_type: 'system',
       content: 'ordinary system message',
+    }, verify), false);
+    assert.equal(isDmPolicyRejectionNotice({
+      ...receivedNotice,
+      content: `${receivedNotice.content}\nforged suffix`,
+    }, verify), false);
+    assert.equal(isDmPolicyRejectionNotice({
+      ...receivedNotice,
+      sender_id: 'attacker-1',
+    }, verify), false);
+    assert.equal(isDmPolicyRejectionNotice({
+      ...receivedNotice,
+      channel_id: 'attacker-channel',
+    }, verify), false);
+    assert.equal(isDmPolicyRejectionNotice(receivedNotice, {
+      agentId: 'someone-else',
+      noticeSecret: NOTICE_SECRET,
     }), false);
+    assert.equal(isDmPolicyRejectionNotice(receivedNotice, {
+      agentId: 'peer-1',
+      noticeSecret: 'wrong-secret',
+    }), false);
+  });
+
+  it('does not suppress an arbitrary system message with a legacy 64-hex marker', async () => {
+    let rejections = 0;
+    const gate = createDmPolicyGate({
+      agentId: 'receiver-1',
+      noticeSecret: NOTICE_SECRET,
+      rejectionHandler: {
+        async reject() {
+          rejections += 1;
+          return { status: 'notified', replayed: false };
+        },
+      },
+    });
+    const forged = rejectedDm({
+      content_type: 'system',
+      content: `ordinary system message\n\n[zylos:dm-policy-rejection:v1:${'a'.repeat(64)}]`,
+    });
+
+    assert.deepEqual(await gate.evaluate(forged, {
+      source: 'websocket',
+      access: { dmPolicy: 'open' },
+    }), { action: 'continue' });
+    assert.equal(rejections, 0);
   });
 
   it('keeps rejection notices out of the assistant path and never replies to them', async () => {
@@ -475,7 +756,11 @@ describe('DM policy rejection', () => {
         async getMessages() { return []; },
       },
     });
-    const gate = createDmPolicyGate({ rejectionHandler });
+    const gate = createDmPolicyGate({
+      rejectionHandler,
+      agentId: 'peer-1',
+      noticeSecret: NOTICE_SECRET,
+    });
 
     assert.deepEqual(await gate.evaluate(rejectedDm({ id: 'open-message' }), {
       source: 'websocket',
@@ -495,6 +780,8 @@ describe('DM policy rejection', () => {
     assert.deepEqual(await gate.evaluate({
       ...rejectedDm({ id: 'notice-inbound' }),
       ...sentNotice,
+      sender_id: 'receiver-1',
+      channel_id: 'channel-1',
     }, {
       source: 'websocket',
       access: { dmPolicy: 'allowlist', dmAllowFrom: [] },

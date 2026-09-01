@@ -11,7 +11,10 @@
 
 import { loadConfig, saveConfig } from './lib/config.js';
 import { getRuntimePaths } from './lib/config-path.js';
-import { DmPolicyRejectionStore } from './lib/dm-policy-rejection.js';
+import {
+  DmPolicyRejectionStore,
+  publicDmPolicyRejectionError,
+} from './lib/dm-policy-rejection.js';
 
 // ─── Arg parsing ─────────────────────────────────────────
 
@@ -158,7 +161,7 @@ const commands = {
       reason: record.reason,
       policy: record.policy,
       status: record.status,
-      lastError: record.lastError,
+      lastError: publicDmPolicyRejectionError(record.lastError),
     }));
     console.log(JSON.stringify(records, null, 2));
   },
