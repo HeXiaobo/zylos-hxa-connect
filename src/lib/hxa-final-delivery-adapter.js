@@ -14,6 +14,23 @@ const PROGRESS_EVENTS = new Set(['ProgressUpdated', 'OutputDelta']);
 const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 409, 410, 422]);
 const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
 const INVISIBLE_FORMAT_CHARACTERS = /[\u200B-\u200D\u2060\uFEFF]/g;
+const REPLY_INTENT_FIELDS = Object.freeze([
+  'schemaVersion',
+  'type',
+  'intentId',
+  'requestId',
+  'traceId',
+  'cause',
+  'route',
+  'disposition',
+  'payload',
+  'contentHash',
+  'idempotencyKey',
+]);
+const REPLY_CAUSE_FIELDS = Object.freeze(['kind', 'eventId']);
+const REPLY_ROUTE_FIELDS = Object.freeze(['adapterId', 'targetRef']);
+const REPLY_PAYLOAD_FIELDS = Object.freeze(['format', 'text']);
+const REPLY_CAUSE_KINDS = new Set(['run_terminal', 'task_effect']);
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -28,6 +45,18 @@ function fail(code, message, Type = Error) {
 function requireText(value, field) {
   if (typeof value !== 'string' || value.trim() === '') {
     fail('INVALID_DELIVERY_INPUT', `${field} must be a non-empty string`, TypeError);
+  }
+  return value;
+}
+
+function requireExactObject(value, field, expectedFields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail('INVALID_DELIVERY_INPUT', `${field} must be an object`, TypeError);
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedFields].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    fail('INVALID_DELIVERY_INPUT', `${field} must match the frozen v1 shape`, TypeError);
   }
   return value;
 }
@@ -83,6 +112,13 @@ function normalizeIntent(input, defaultOrgLabel) {
   if (input.type !== 'ReplyIntent' || input.schemaVersion !== 1) {
     return { result: unsupported('UNSUPPORTED_DELIVERY_INPUT', input.type || 'unknown') };
   }
+  requireExactObject(input, 'ReplyIntent', REPLY_INTENT_FIELDS);
+  const cause = requireExactObject(input.cause, 'ReplyIntent.cause', REPLY_CAUSE_FIELDS);
+  if (!REPLY_CAUSE_KINDS.has(cause.kind)) {
+    fail('INVALID_DELIVERY_INPUT', 'ReplyIntent.cause.kind is not supported by frozen v1', TypeError);
+  }
+  requireText(cause.eventId, 'ReplyIntent.cause.eventId');
+  requireExactObject(input.route, 'ReplyIntent.route', REPLY_ROUTE_FIELDS);
   if (input.route?.adapterId !== ADAPTER_ID) {
     return { result: unsupported('UNSUPPORTED_ROUTE_ADAPTER', input.route?.adapterId || 'missing') };
   }
@@ -92,6 +128,7 @@ function normalizeIntent(input, defaultOrgLabel) {
   if (input.payload?.format !== 'text') {
     return { result: unsupported('UNSUPPORTED_PAYLOAD_FORMAT', input.payload?.format || 'missing') };
   }
+  requireExactObject(input.payload, 'ReplyIntent.payload', REPLY_PAYLOAD_FIELDS);
 
   const text = typeof input.payload.text === 'string' ? input.payload.text : '';
   // A frozen-v1 send is already an explicit delivery decision. Invisible-only

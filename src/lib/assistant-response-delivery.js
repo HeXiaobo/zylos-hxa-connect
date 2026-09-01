@@ -160,6 +160,56 @@ function responseIdentity({ requestId, parsed, content }) {
   return { ...identity, identityHash: sha256(JSON.stringify(identity)) };
 }
 
+const RESPONSE_IDENTITY_FIELDS = Object.freeze([
+  'deliveryId',
+  'requestId',
+  'endpointKey',
+  'contentHash',
+]);
+const FINAL_DELIVERY_IDENTITY_FIELDS = Object.freeze([
+  'deliveryId',
+  'intentId',
+  'requestId',
+  'traceId',
+  'idempotencyKey',
+  'disposition',
+  'contentHash',
+  'endpointKey',
+  'targetRef',
+]);
+
+function identityConflict() {
+  const error = new Error('assistant response delivery identity collision');
+  error.code = 'IDEMPOTENCY_CONFLICT';
+  return error;
+}
+
+function canonicalIdentity(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw identityConflict();
+  const fields = Object.hasOwn(record, 'intentId')
+    ? FINAL_DELIVERY_IDENTITY_FIELDS
+    : RESPONSE_IDENTITY_FIELDS;
+  const identity = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(record, field)) throw identityConflict();
+    identity[field] = record[field];
+  }
+  return identity;
+}
+
+function validateIdentity(record, expectedDeliveryId = record?.deliveryId) {
+  const identity = canonicalIdentity(record);
+  if (identity.deliveryId !== expectedDeliveryId) throw identityConflict();
+  if (record.identityHash !== sha256(JSON.stringify(identity))) throw identityConflict();
+  return identity;
+}
+
+function assertSameIdentity(left, right) {
+  if (JSON.stringify(canonicalIdentity(left)) !== JSON.stringify(canonicalIdentity(right))) {
+    throw identityConflict();
+  }
+}
+
 export class AssistantResponseDeliveryStore {
   constructor({ directory, clock = () => Date.now() }) {
     this.directory = requireText(directory, 'assistant response delivery directory');
@@ -172,7 +222,9 @@ export class AssistantResponseDeliveryStore {
 
   async read(deliveryId) {
     try {
-      return JSON.parse(await fs.promises.readFile(this.filePath(deliveryId), 'utf8'));
+      const record = JSON.parse(await fs.promises.readFile(this.filePath(deliveryId), 'utf8'));
+      validateIdentity(record, deliveryId);
+      return record;
     } catch (error) {
       if (error.code === 'ENOENT') return null;
       throw error;
@@ -225,14 +277,12 @@ export class AssistantResponseDeliveryStore {
 
   async begin(identity, initial = {}) {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    validateIdentity(identity);
     const filePath = this.filePath(identity.deliveryId);
     try {
       const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
-      if (existing.identityHash !== identity.identityHash) {
-        const conflict = new Error('assistant response delivery identity collision');
-        conflict.code = 'IDEMPOTENCY_CONFLICT';
-        throw conflict;
-      }
+      validateIdentity(existing, identity.deliveryId);
+      assertSameIdentity(existing, identity);
       return existing;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
@@ -251,6 +301,8 @@ export class AssistantResponseDeliveryStore {
       channelId: null,
       ...initial,
     };
+    validateIdentity(record, identity.deliveryId);
+    assertSameIdentity(record, identity);
     const tempPath = `${filePath}.new.${process.pid}.${randomUUID()}`;
     await fs.promises.writeFile(tempPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     try {
@@ -259,11 +311,8 @@ export class AssistantResponseDeliveryStore {
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
-      if (existing.identityHash !== identity.identityHash) {
-        const conflict = new Error('assistant response delivery identity collision');
-        conflict.code = 'IDEMPOTENCY_CONFLICT';
-        throw conflict;
-      }
+      validateIdentity(existing, identity.deliveryId);
+      assertSameIdentity(existing, identity);
       return existing;
     } finally {
       await fs.promises.unlink(tempPath).catch(() => {});
@@ -271,12 +320,10 @@ export class AssistantResponseDeliveryStore {
   }
 
   async update(record, changes, { expectedFence, expectedLeaseToken } = {}) {
+    validateIdentity(record);
     const current = await this.read(record.deliveryId);
-    if (!current || current.identityHash !== record.identityHash) {
-      const error = new Error('assistant response delivery identity collision');
-      error.code = 'IDEMPOTENCY_CONFLICT';
-      throw error;
-    }
+    if (!current) throw identityConflict();
+    assertSameIdentity(current, record);
     if (expectedFence !== undefined && (current.fence ?? 0) !== expectedFence) {
       const error = new Error('assistant response delivery fence lost');
       error.code = 'HXA_DELIVERY_FENCE_LOST';
@@ -288,6 +335,8 @@ export class AssistantResponseDeliveryStore {
       throw error;
     }
     const next = { ...current, ...changes, updatedAt: this.clock() };
+    validateIdentity(next, current.deliveryId);
+    assertSameIdentity(current, next);
     await writeAtomic(this.filePath(record.deliveryId), next);
     return next;
   }
@@ -309,6 +358,11 @@ async function reconcileDm({ client, org, target, sourceMessageId, content, star
     if (!sourceMessageId && message?.sender_name === target && message.channel_id) {
       expectedChannels.add(message.channel_id);
     }
+  }
+  if (sourceMessageId && expectedChannels.size === 0) {
+    const error = new Error('HXA source-scoped DM channel could not be resolved');
+    error.code = 'HXA_RECONCILE_ROUTE_UNKNOWN';
+    throw error;
   }
   return messages.find(message => (
     isSelfMessage(message, org)

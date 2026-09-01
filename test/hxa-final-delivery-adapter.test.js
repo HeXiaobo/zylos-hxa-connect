@@ -112,6 +112,42 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     }]);
   });
 
+  it('fails closed on missing, invalid, or extended frozen ReplyIntent fields before transport', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          return { message: { id: `hub-invalid-contract-${sends}` } };
+        },
+      },
+    });
+    const invalid = [
+      answerIntent(),
+      answerIntent(),
+      answerIntent(),
+    ];
+    delete invalid[0].cause;
+    invalid[1].cause.kind = 'bogus';
+    invalid[2].extra = 'not-in-frozen-v1';
+    invalid.forEach((intent, index) => {
+      intent.intentId = `${intent.intentId}:invalid-${index}`;
+      intent.idempotencyKey = intent.intentId;
+      intent.requestId = `${intent.requestId}:invalid-${index}`;
+      intent.traceId = `${intent.traceId}:invalid-${index}`;
+    });
+
+    for (const intent of invalid) {
+      await assert.rejects(
+        adapter.deliver(intent, attempt(`attempt:invalid-contract:${sends + 1}`)),
+        error => error.code === 'INVALID_DELIVERY_INPUT',
+      );
+    }
+    assert.equal(sends, 0);
+  });
+
   it('delivers an explicit failure_notice inside the exact thread and reply target', async () => {
     const store = await createStore();
     const sends = [];
@@ -399,6 +435,50 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     assert.equal(sends, 1);
   });
 
+  it('keeps reconciliation unknown when a source-scoped DM channel cannot be resolved', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          const error = new Error('socket result unknown');
+          error.code = 'ECONNRESET';
+          throw error;
+        },
+        async inbox() {
+          return [{
+            id: 'wrong-source-channel',
+            channel_id: 'unrelated-dm-channel',
+            sender_id: 'self-agent-id',
+            sender_name: 'self-agent',
+            content: 'Exact terminal answer.',
+            created_at: NOW + 10,
+          }];
+        },
+      },
+    });
+
+    const unknown = await adapter.deliver(answerIntent(), attempt('attempt:unresolved-route:1'));
+    const reconciled = await adapter.reconcile(
+      answerIntent(),
+      attempt('attempt:unresolved-route:1'),
+    );
+    const blockedRetry = await adapter.deliver(
+      answerIntent(),
+      attempt('attempt:unresolved-route:2'),
+    );
+
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(reconciled.outcome, 'unknown');
+    assert.equal(reconciled.externalRef, null);
+    assert.equal(reconciled.errorCode, 'HXA_RECONCILE_RESULT_UNKNOWN');
+    assert.equal(reconciled.nextAction, 'reconcile_before_retry');
+    assert.deepEqual(blockedRetry, reconciled);
+    assert.equal(sends, 1);
+  });
+
   it('recovers a crash-left sending record after restart by reconciling before any resend', async () => {
     const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-final-crash-'));
     tempDirs.push(directory);
@@ -568,6 +648,43 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
       store.update(record, { status: 'corrupted' }, { expectedFence: 0 }),
       error => error.code === 'HXA_DELIVERY_FENCE_LOST',
     );
+  });
+
+  it('rejects immutable identity updates and fail-closes on a tampered durable record', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          return { message: { id: `hub-store-integrity-${sends}` } };
+        },
+      },
+    });
+    const accepted = await adapter.deliver(answerIntent(), attempt('attempt:integrity:1'));
+    const record = await store.read(accepted.deliveryId);
+
+    await assert.rejects(
+      store.update(record, { intentId: 'evil-intent' }, { expectedFence: record.fence }),
+      error => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+
+    const tampered = {
+      ...record,
+      intentId: 'evil-intent',
+      requestId: 'evil-request',
+      traceId: 'evil-trace',
+      status: 'prepared',
+      receipts: [],
+    };
+    await fs.promises.writeFile(store.filePath(accepted.deliveryId), `${JSON.stringify(tampered)}\n`);
+
+    await assert.rejects(
+      adapter.deliver(answerIntent(), attempt('attempt:integrity:2')),
+      error => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    assert.equal(sends, 1);
   });
 
   it('preserves the official bare UUID endpoint compatibility while keeping route parsing inside HXA', async () => {
