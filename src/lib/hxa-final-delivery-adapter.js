@@ -36,6 +36,16 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function fail(code, message, Type = Error) {
   const error = new Type(message);
   error.code = code;
@@ -86,8 +96,8 @@ function hasVisibleContent(text) {
   return text.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim().length > 0;
 }
 
-function contentHash(text) {
-  return `sha256:${sha256(text)}`;
+function contentHash(payload) {
+  return `sha256:${sha256(canonicalJson(payload))}`;
 }
 
 function endpointKey(parsed) {
@@ -122,6 +132,16 @@ function normalizeIntent(input, defaultOrgLabel) {
   if (input.route?.adapterId !== ADAPTER_ID) {
     return { result: unsupported('UNSUPPORTED_ROUTE_ADAPTER', input.route?.adapterId || 'missing') };
   }
+  if (
+    (cause.kind === 'run_terminal' && !TERMINAL_DISPOSITIONS.has(input.disposition))
+    || (cause.kind === 'task_effect' && input.disposition !== 'task_receipt')
+  ) {
+    fail(
+      'INVALID_DELIVERY_INPUT',
+      `ReplyIntent cause ${cause.kind} cannot use disposition ${input.disposition || 'missing'}`,
+      TypeError,
+    );
+  }
   if (!TERMINAL_DISPOSITIONS.has(input.disposition)) {
     return { result: unsupported('UNSUPPORTED_DISPOSITION', input.disposition || 'missing') };
   }
@@ -144,9 +164,16 @@ function normalizeIntent(input, defaultOrgLabel) {
   if (idempotencyKey !== intentId) {
     fail('IDEMPOTENCY_CONFLICT', 'ReplyIntent idempotencyKey must equal intentId');
   }
-  const actualHash = contentHash(text);
+  const actualHash = contentHash(input.payload);
   if (input.contentHash !== actualHash) {
-    fail('IDEMPOTENCY_CONFLICT', 'ReplyIntent contentHash does not match its text payload');
+    fail('IDEMPOTENCY_CONFLICT', 'ReplyIntent contentHash does not match canonical payload bytes');
+  }
+  const routeHash = sha256(canonicalJson(input.route));
+  const expectedIntentId = cause.kind === 'run_terminal'
+    ? `reply:${requestId}:${routeHash}`
+    : `reply:${cause.eventId}:${routeHash}`;
+  if (intentId !== expectedIntentId) {
+    fail('IDEMPOTENCY_CONFLICT', 'ReplyIntent intentId does not match canonical route identity');
   }
 
   let parsed;
@@ -182,17 +209,56 @@ function normalizeIntent(input, defaultOrgLabel) {
   };
 }
 
-function normalizeAttemptContext(context) {
+function normalizeAttemptContext(context, expectedAction, expectedDeliveryId) {
   if (!context || typeof context !== 'object' || Array.isArray(context)) {
     fail('INVALID_ATTEMPT_CONTEXT', 'attemptContext must be an object', TypeError);
   }
+  const hasCoreFence = [
+    'action',
+    'deliveryId',
+    'claimEpoch',
+    'leaseOwner',
+    'leaseToken',
+    'leaseExpiresAt',
+  ].some(field => Object.hasOwn(context, field));
+  if (hasCoreFence) {
+    if (context.action !== expectedAction) {
+      fail('INVALID_ATTEMPT_CONTEXT', `attemptContext.action must be ${expectedAction}`, TypeError);
+    }
+    if (context.deliveryId !== expectedDeliveryId) {
+      fail('INVALID_ATTEMPT_CONTEXT', 'attemptContext.deliveryId does not match ReplyIntent', TypeError);
+    }
+    if (!Number.isSafeInteger(context.claimEpoch) || context.claimEpoch < 1) {
+      fail('INVALID_ATTEMPT_CONTEXT', 'attemptContext.claimEpoch must be a positive safe integer', TypeError);
+    }
+    if (!Number.isSafeInteger(context.leaseExpiresAt) || context.leaseExpiresAt < 1) {
+      fail('INVALID_ATTEMPT_CONTEXT', 'attemptContext.leaseExpiresAt must be a positive safe integer', TypeError);
+    }
+  }
   return Object.freeze({
     attemptId: requireText(context.attemptId, 'attemptContext.attemptId'),
-    ownerId: requireText(context.ownerId, 'attemptContext.ownerId'),
+    ownerId: requireText(
+      hasCoreFence ? context.leaseOwner : context.ownerId,
+      hasCoreFence ? 'attemptContext.leaseOwner' : 'attemptContext.ownerId',
+    ),
+    coreFenced: hasCoreFence,
+    action: hasCoreFence ? context.action : expectedAction,
+    deliveryId: hasCoreFence ? context.deliveryId : expectedDeliveryId,
+    claimEpoch: hasCoreFence ? context.claimEpoch : null,
+    leaseToken: hasCoreFence
+      ? requireText(context.leaseToken, 'attemptContext.leaseToken')
+      : null,
+    leaseExpiresAt: hasCoreFence ? context.leaseExpiresAt : null,
     lockTimeoutMs: Number.isFinite(context.lockTimeoutMs) && context.lockTimeoutMs > 0
       ? context.lockTimeoutMs
       : 5_000,
   });
+}
+
+function assertClaimActive(context, clock) {
+  if (context.coreFenced && context.leaseExpiresAt <= Math.floor(clock() / 1_000)) {
+    fail('HXA_DELIVERY_LEASE_EXPIRED', 'Core delivery claim lease has expired');
+  }
 }
 
 function observedAt(clock) {
@@ -279,10 +345,59 @@ function initialRecord() {
   return {
     recordKind: 'hxa_final_delivery',
     fence: 0,
+    highestClaimEpoch: 0,
+    claimHistory: [],
     receipts: [],
     activeLease: null,
     currentAttemptId: null,
   };
+}
+
+function matchingClaim(record, context, kind) {
+  if (!context.coreFenced) return null;
+  const history = Array.isArray(record.claimHistory) ? record.claimHistory : [];
+  return history.find(entry => (
+    entry.kind === kind
+    && entry.attemptId === context.attemptId
+    && entry.claimEpoch === context.claimEpoch
+    && entry.leaseOwner === context.ownerId
+    && entry.leaseToken === context.leaseToken
+  )) || null;
+}
+
+function receiptForClaim(record, context, kind) {
+  const claimEntry = matchingClaim(record, context, kind);
+  if (!claimEntry?.receiptId) return null;
+  return (Array.isArray(record.receipts) ? record.receipts : [])
+    .find(receipt => receipt.receiptId === claimEntry.receiptId) || null;
+}
+
+function assertClaimAvailable(record, context, kind) {
+  if (!context.coreFenced) return;
+  const exact = matchingClaim(record, context, kind);
+  if (exact) return;
+  if (context.claimEpoch <= (record.highestClaimEpoch ?? 0)) {
+    fail('HXA_DELIVERY_LEASE_FENCED', 'Core delivery claim has been superseded');
+  }
+}
+
+function attachReceiptToActiveClaim(record, receipt) {
+  if (!record.activeLease?.coreFenced) return record.claimHistory;
+  return (record.claimHistory || []).map(entry => (
+    entry.kind === record.activeLease.kind
+      && entry.attemptId === record.activeLease.attemptId
+      && entry.claimEpoch === record.activeLease.claimEpoch
+      && entry.leaseToken === record.activeLease.leaseToken
+      ? { ...entry, receiptId: receipt.receiptId }
+      : entry
+  ));
+}
+
+function attemptStartedAt(record, attemptId) {
+  const history = Array.isArray(record.claimHistory) ? record.claimHistory : [];
+  return history.findLast(entry => (
+    entry.kind === 'send' && entry.attemptId === attemptId
+  ))?.startedAt ?? record.startedAt;
 }
 
 async function ensureRecord(store, normalized) {
@@ -297,21 +412,41 @@ async function ensureRecord(store, normalized) {
   }
 }
 
-async function claim(store, record, context, lockToken, kind) {
+async function claim(store, record, context, lockToken, kind, clock) {
   const previousFence = record.fence ?? 0;
   const fence = previousFence + 1;
+  const startedAt = clock();
+  assertClaimAvailable(record, context, kind);
+  const claimHistory = context.coreFenced
+    ? [...(record.claimHistory || []), {
+      kind,
+      attemptId: context.attemptId,
+      claimEpoch: context.claimEpoch,
+      leaseOwner: context.ownerId,
+      leaseToken: context.leaseToken,
+      startedAt,
+      receiptId: null,
+    }]
+    : record.claimHistory;
   return store.update(record, {
     status: kind === 'send' ? 'sending' : 'reconciling',
     attempts: kind === 'send' ? record.attempts + 1 : record.attempts,
     currentAttemptId: context.attemptId,
     fence,
+    highestClaimEpoch: context.coreFenced
+      ? context.claimEpoch
+      : (record.highestClaimEpoch ?? 0),
+    claimHistory,
     activeLease: {
       kind,
       ownerId: context.ownerId,
       attemptId: context.attemptId,
       token: lockToken,
+      coreFenced: context.coreFenced,
+      claimEpoch: context.claimEpoch,
+      leaseToken: context.leaseToken,
       fence,
-      acquiredAt: record.updatedAt,
+      acquiredAt: startedAt,
     },
     lastError: null,
   }, { expectedFence: previousFence });
@@ -321,6 +456,7 @@ async function settle(store, record, receipt, status, leaseToken, lastError = nu
   return store.update(record, {
     status,
     receipts: appendReceipt(record, receipt),
+    claimHistory: attachReceiptToActiveClaim(record, receipt),
     activeLease: null,
     lastError,
     hubMessageId: receipt.externalRef?.replace(/^opaque:/, '') || record.hubMessageId,
@@ -357,6 +493,7 @@ async function recoverInterruptedAttempt(store, record, clock) {
   const next = await store.update(record, {
     status: 'unknown',
     receipts: appendReceipt(record, receipt),
+    claimHistory: attachReceiptToActiveClaim(record, receipt),
     activeLease: null,
     lastError: 'interrupted owner left an ambiguous external result',
   }, { expectedFence: record.fence ?? 0 });
@@ -370,9 +507,10 @@ function buildHxaFinalDeliveryAdapter({
   clock = () => Date.now(),
   logger = console,
 } = {}) {
-  // Phase B TODO: map the accepted WT02-C claim/receipt seam onto this
-  // adapter-private attempt context. Do not promote ownerId or lockTimeoutMs
-  // into the cross-repository v1 contract from this Phase A module.
+  // Phase B consumes the accepted WT02-C claim fence when it is present.
+  // The ownerId-only form remains an isolated legacy compatibility seam;
+  // WT07-H must pass the Core action/claimEpoch/lease fields when it wires
+  // this adapter into the production composition root.
   if (!(store instanceof AssistantResponseDeliveryStore)) {
     throw new TypeError('HXA final delivery requires AssistantResponseDeliveryStore');
   }
@@ -395,16 +533,25 @@ function buildHxaFinalDeliveryAdapter({
         return suppressed(normalized.suppressedReason);
       });
     }
-    const context = normalizeAttemptContext(attemptContext);
+    const context = normalizeAttemptContext(
+      attemptContext,
+      'send',
+      normalized.identity.deliveryId,
+    );
 
     return store.withLock(normalized.identity.deliveryId, async ({ lockToken }) => {
       let record = await ensureRecord(store, normalized);
+      const historical = receiptForClaim(record, context, 'send');
+      if (historical) return historical;
+      assertClaimAvailable(record, context, 'send');
       const terminal = latestReceipt(record, receipt => (
         receipt.outcome === 'platform_accepted'
         || receipt.outcome === 'reconciled'
-        || (receipt.outcome === 'rejected' && receipt.retryable === false)
+        || (!context.coreFenced && receipt.outcome === 'rejected' && receipt.retryable === false)
       ));
       if (terminal) return terminal;
+
+      assertClaimActive(context, clock);
 
       if (record.status === 'sending' || record.status === 'reconciling') {
         return (await recoverInterruptedAttempt(store, record, clock)).receipt;
@@ -417,7 +564,7 @@ function buildHxaFinalDeliveryAdapter({
         if (replay) return replay;
       }
 
-      record = await claim(store, record, context, lockToken, 'send');
+      record = await claim(store, record, context, lockToken, 'send', clock);
       let org;
       try {
         org = await resolveOrg(normalized.parsed.orgLabel);
@@ -444,6 +591,7 @@ function buildHxaFinalDeliveryAdapter({
           client: org.client,
           content: normalized.text,
         });
+        assertClaimActive(context, clock);
         const externalRef = acceptedExternalRef(result);
         if (!externalRef) {
           const receipt = makeReceipt({
@@ -496,14 +644,21 @@ function buildHxaFinalDeliveryAdapter({
     const normalized = normalizeIntent(input, defaultOrgLabel);
     if (normalized.result) return normalized.result;
     if (normalized.suppressedReason) return deliver(input, attemptContext);
-    const context = normalizeAttemptContext(attemptContext);
+    const context = normalizeAttemptContext(
+      attemptContext,
+      'reconcile',
+      normalized.identity.deliveryId,
+    );
 
     return store.withLock(normalized.identity.deliveryId, async ({ lockToken }) => {
       let record = await ensureRecord(store, normalized);
+      const historical = receiptForClaim(record, context, 'reconcile');
+      if (historical) return historical;
+      assertClaimAvailable(record, context, 'reconcile');
       const terminal = latestReceipt(record, receipt => (
         receipt.outcome === 'platform_accepted'
         || receipt.outcome === 'reconciled'
-        || (receipt.outcome === 'rejected' && receipt.retryable === false)
+        || (!context.coreFenced && receipt.outcome === 'rejected' && receipt.retryable === false)
       ));
       if (terminal) return terminal;
 
@@ -522,7 +677,12 @@ function buildHxaFinalDeliveryAdapter({
         ...context,
         attemptId: unknown.attemptId,
       };
-      record = await claim(store, record, reconcileContext, lockToken, 'reconcile');
+      if (context.coreFenced && context.attemptId !== unknown.attemptId) {
+        fail('HXA_DELIVERY_LEASE_FENCED', 'reconcile claim does not own the unknown attempt');
+      }
+      assertClaimActive(context, clock);
+      const reconcileStartedAt = attemptStartedAt(record, unknown.attemptId);
+      record = await claim(store, record, reconcileContext, lockToken, 'reconcile', clock);
       let org;
       try {
         org = await resolveOrg(normalized.parsed.orgLabel);
@@ -549,7 +709,7 @@ function buildHxaFinalDeliveryAdapter({
           client: org.client,
           org,
           content: normalized.text,
-          startedAt: record.startedAt,
+          startedAt: reconcileStartedAt,
         });
         if (existing) {
           const externalRef = acceptedExternalRef(existing);

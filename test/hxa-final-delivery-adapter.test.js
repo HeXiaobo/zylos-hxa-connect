@@ -8,12 +8,14 @@ import { AssistantResponseDeliveryStore } from '../src/lib/assistant-response-de
 import { createHxaFinalDeliveryAdapter } from '../src/lib/hxa-final-delivery-adapter.js';
 import {
   assertDeliveryReceipt,
-  contentHash,
+  canonicalPayloadHash,
+  canonicalRouteHash,
   loadFixture,
 } from './helpers/reply-contract-fixture.js';
 
 const contract = loadFixture('reply-contract-v1.json');
 const phaseA = loadFixture('hxa-final-delivery-phase-a-v1.json');
+const wt02 = loadFixture('hxa-wt02-c-accepted-v1.json');
 const tempDirs = [];
 const NOW = Date.parse('2026-09-01T00:00:00.000Z');
 
@@ -22,15 +24,34 @@ function clone(value) {
 }
 
 function answerIntent() {
-  return clone(contract.vectors.ReplyIntent.answer);
+  return clone(wt02.intents.answer);
 }
 
 function failureIntent() {
-  return clone(contract.vectors.ReplyIntent.failure_notice);
+  return clone(wt02.intents.failureNotice);
 }
 
 function attempt(attemptId = phaseA.attemptContext.attemptId, ownerId = phaseA.attemptContext.ownerId) {
   return { attemptId, ownerId };
+}
+
+function coreClaim(intent, {
+  action = 'send',
+  attemptNumber = 1,
+  claimEpoch = 1,
+  leaseOwner = 'adapter-owner',
+  leaseToken = `lease:${claimEpoch}`,
+  leaseExpiresAt = Math.floor(NOW / 1_000) + 3_600,
+} = {}) {
+  return {
+    action,
+    deliveryId: `delivery:${intent.intentId}`,
+    attemptId: `attempt:delivery:${intent.intentId}:${attemptNumber}`,
+    claimEpoch,
+    leaseOwner,
+    leaseToken,
+    leaseExpiresAt,
+  };
 }
 
 async function createStore(directory = null) {
@@ -39,11 +60,11 @@ async function createStore(directory = null) {
   return new AssistantResponseDeliveryStore({ directory: target, clock: () => NOW });
 }
 
-function createAdapter({ store, client, resolveOrg, logger } = {}) {
+function createAdapter({ store, client, resolveOrg, logger, clock = () => NOW } = {}) {
   return createHxaFinalDeliveryAdapter({
     store,
     defaultOrgLabel: 'hxa',
-    clock: () => NOW,
+    clock,
     resolveOrg: resolveOrg || (async label => {
       assert.equal(label, 'hxa');
       return { client, agentId: 'self-agent-id', agentName: 'self-agent' };
@@ -58,7 +79,7 @@ afterEach(async () => {
   )));
 });
 
-describe('HxaFinalDeliveryAdapter Phase A', () => {
+describe('HxaFinalDeliveryAdapter Phase A/B', () => {
   it('uses an adapter-private Phase A seam without guessing the pending WT02-C API', () => {
     assert.equal(phaseA.scope, 'adapter_private_phase_a');
     assert.deepEqual(phaseA.upstreamControl, {
@@ -112,6 +133,26 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     }]);
   });
 
+  it('accepts the WT02-C canonical payload hash and derived ReplyIntent identity', async () => {
+    const store = await createStore();
+    const sends = [];
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send(target, text) {
+          sends.push({ target, text });
+          return { channel_id: 'dm-channel-wt02', message: { id: 'hub-wt02-answer' } };
+        },
+      },
+    });
+
+    const receipt = await adapter.deliver(clone(wt02.intents.answer), attempt('attempt:wt02:1'));
+
+    assert.equal(wt02.source.acceptedSha, '944947ee34e759b2015175dda457ea001a284784');
+    assert.equal(receipt.outcome, 'platform_accepted');
+    assert.deepEqual(sends, [{ target: 'peer-agent', text: 'Exact terminal answer.' }]);
+  });
+
   it('fails closed on missing, invalid, or extended frozen ReplyIntent fields before transport', async () => {
     const store = await createStore();
     let sends = 0;
@@ -145,6 +186,39 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
         error => error.code === 'INVALID_DELIVERY_INPUT',
       );
     }
+    assert.equal(sends, 0);
+  });
+
+  it('enforces the WT02-C cause and disposition matrix before capability handling', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          return { message: { id: `hub-illegal-cause-${sends}` } };
+        },
+      },
+    });
+    const taskEffectSend = clone(wt02.intents.taskReceipt);
+    taskEffectSend.disposition = 'send';
+    const runTerminalTaskReceipt = answerIntent();
+    runTerminalTaskReceipt.disposition = 'task_receipt';
+
+    for (const intent of [taskEffectSend, runTerminalTaskReceipt]) {
+      await assert.rejects(
+        adapter.deliver(intent, attempt('attempt:illegal-cause:1')),
+        error => error.code === 'INVALID_DELIVERY_INPUT',
+      );
+    }
+    const unsupportedTaskReceipt = await adapter.deliver(
+      clone(wt02.intents.taskReceipt),
+      attempt('attempt:task-receipt:1'),
+    );
+
+    assert.equal(unsupportedTaskReceipt.status, 'unsupported');
+    assert.equal(unsupportedTaskReceipt.errorCode, 'UNSUPPORTED_DISPOSITION');
     assert.equal(sends, 0);
   });
 
@@ -215,7 +289,7 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     suppress.disposition = 'suppress';
     const skip = answerIntent();
     skip.payload.text = '  [SKIP]  ';
-    skip.contentHash = contentHash(skip.payload.text);
+    skip.contentHash = canonicalPayloadHash(skip.payload);
 
     for (const result of [
       await adapter.deliver(silent),
@@ -256,7 +330,7 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     for (const text of invisibleOnlyInputs) {
       const intent = answerIntent();
       intent.payload.text = text;
-      intent.contentHash = contentHash(text);
+      intent.contentHash = canonicalPayloadHash(intent.payload);
       await assert.rejects(
         adapter.deliver(intent, attempt()),
         error => error.code === 'MISSING_OUTPUT',
@@ -280,14 +354,14 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     });
     const closing = answerIntent();
     closing.payload.text = phaseA.botLoopRegression.closingTurnText;
-    closing.contentHash = contentHash(closing.payload.text);
+    closing.contentHash = canonicalPayloadHash(closing.payload);
     const empty = answerIntent();
     empty.intentId = 'reply:req:hxa:dm:message-loop-empty:hxa-route-001';
     empty.idempotencyKey = empty.intentId;
     empty.requestId = 'req:hxa:dm:message-loop-empty';
     empty.traceId = 'trace:hxa:dm:message-loop-empty';
     empty.payload.text = phaseA.botLoopRegression.emptyTurnText;
-    empty.contentHash = contentHash(empty.payload.text);
+    empty.contentHash = canonicalPayloadHash(empty.payload);
 
     const first = await adapter.deliver(closing, attempt('attempt:loop:1'));
     await assert.rejects(
@@ -310,14 +384,15 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
         throw new Error('transport must not be resolved');
       },
     });
-    const taskReceipt = answerIntent();
-    taskReceipt.disposition = 'task_receipt';
+    const taskReceipt = clone(wt02.intents.taskReceipt);
     const media = answerIntent();
     media.payload = { format: 'media', refs: ['opaque:file-1'] };
     const foreign = answerIntent();
     foreign.route.adapterId = 'feishu';
     const legacyChannel = answerIntent();
     legacyChannel.route.targetRef = 'org:hxa|channel:legacy-group';
+    legacyChannel.intentId = `reply:${legacyChannel.requestId}:${canonicalRouteHash(legacyChannel.route)}`;
+    legacyChannel.idempotencyKey = legacyChannel.intentId;
 
     for (const input of [
       { schemaVersion: 1, type: 'ProgressUpdated' },
@@ -349,7 +424,8 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     const first = createAdapter({ store: await createStore(directory), client });
     const receipt = await first.deliver(answerIntent(), attempt());
     const replay = await first.deliver(answerIntent(), attempt());
-    const restarted = createAdapter({ store: await createStore(directory), client });
+    const restartedStore = await createStore(directory);
+    const restarted = createAdapter({ store: restartedStore, client });
     const afterRestart = await restarted.deliver(answerIntent(), attempt('attempt:new-owner:2', 'owner-b'));
 
     assert.deepEqual(replay, receipt);
@@ -373,14 +449,14 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
 
     const payloadConflict = answerIntent();
     payloadConflict.payload.text = 'Different answer.';
-    payloadConflict.contentHash = contentHash(payloadConflict.payload.text);
+    payloadConflict.contentHash = canonicalPayloadHash(payloadConflict.payload);
     const hashConflict = answerIntent();
-    hashConflict.contentHash = contentHash('not the payload');
+    hashConflict.contentHash = canonicalPayloadHash({ format: 'text', text: 'not the payload' });
     const routeConflict = answerIntent();
     routeConflict.route.targetRef = 'org:hxa|different-peer';
     const skipConflict = answerIntent();
     skipConflict.payload.text = '[SKIP]';
-    skipConflict.contentHash = contentHash(skipConflict.payload.text);
+    skipConflict.contentHash = canonicalPayloadHash(skipConflict.payload);
 
     for (const conflict of [payloadConflict, hashConflict, routeConflict, skipConflict]) {
       await assert.rejects(
@@ -479,6 +555,112 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     assert.equal(sends, 1);
   });
 
+  it('does not reconcile a same-name DM sender when the known agent identity differs', async () => {
+    const store = await createStore();
+    const intent = answerIntent();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          const error = new Error('unknown send result');
+          error.code = 'ECONNRESET';
+          throw error;
+        },
+        async inbox() {
+          return [
+            {
+              id: 'source-message-001',
+              channel_id: 'exact-dm-channel',
+              sender_id: 'peer-id',
+              sender_name: 'peer-agent',
+              content: 'request',
+              created_at: NOW - 100,
+            },
+            {
+              id: 'spoofed-same-name-message',
+              channel_id: 'exact-dm-channel',
+              sender_id: 'different-agent-id',
+              sender_name: 'self-agent',
+              content: intent.payload.text,
+              created_at: NOW + 10,
+            },
+          ];
+        },
+      },
+    });
+    const sendClaim = coreClaim(intent, { claimEpoch: 20, leaseToken: 'sender-token-a' });
+    const reconcileClaim = coreClaim(intent, {
+      action: 'reconcile',
+      claimEpoch: 21,
+      leaseToken: 'sender-token-b',
+    });
+
+    const unknown = await adapter.deliver(intent, sendClaim);
+    const notFound = await adapter.reconcile(intent, reconcileClaim);
+
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(notFound.outcome, 'rejected');
+    assert.equal(notFound.errorCode, 'HXA_RECONCILE_NOT_FOUND');
+    assert.equal(notFound.retryable, true);
+    assert.equal(notFound.externalRef, null);
+    assert.equal(sends, 1);
+  });
+
+  it('keeps reconciliation unknown when more than one exact HXA message matches', async () => {
+    const store = await createStore();
+    const intent = answerIntent();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          const error = new Error('unknown send result');
+          error.code = 'ETIMEDOUT';
+          throw error;
+        },
+        async inbox() {
+          return [
+            {
+              id: 'source-message-001',
+              channel_id: 'exact-dm-channel',
+              sender_id: 'peer-id',
+              sender_name: 'peer-agent',
+              content: 'request',
+              created_at: NOW - 100,
+            },
+            ...['duplicate-a', 'duplicate-b'].map((id, index) => ({
+              id,
+              channel_id: 'exact-dm-channel',
+              sender_id: 'self-agent-id',
+              sender_name: 'self-agent',
+              content: intent.payload.text,
+              created_at: NOW + index + 1,
+            })),
+          ];
+        },
+      },
+    });
+    const sendClaim = coreClaim(intent, { claimEpoch: 22, leaseToken: 'ambiguous-token-a' });
+    const reconcileClaim = coreClaim(intent, {
+      action: 'reconcile',
+      claimEpoch: 23,
+      leaseToken: 'ambiguous-token-b',
+    });
+
+    const unknown = await adapter.deliver(intent, sendClaim);
+    const ambiguous = await adapter.reconcile(intent, reconcileClaim);
+
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(ambiguous.outcome, 'unknown');
+    assert.equal(ambiguous.errorCode, 'HXA_RECONCILE_RESULT_UNKNOWN');
+    assert.equal(ambiguous.nextAction, 'reconcile_before_retry');
+    assert.equal(ambiguous.externalRef, null);
+    assert.equal(sends, 1);
+  });
+
   it('recovers a crash-left sending record after restart by reconciling before any resend', async () => {
     const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-final-crash-'));
     tempDirs.push(directory);
@@ -536,6 +718,65 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     assert.equal(reconciled.outcome, 'reconciled');
     assert.equal(reconciled.externalRef, 'opaque:hub-crash-accepted-1');
     assert.equal(sends, 1);
+  });
+
+  it('restarts an unknown Core claim and reconciles the same attempt under a newer claim epoch', async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-core-claim-restart-'));
+    tempDirs.push(directory);
+    const intent = answerIntent();
+    const inbox = [{
+      id: 'source-message-001',
+      channel_id: 'dm-channel-core-restart',
+      sender_id: 'peer-id',
+      sender_name: 'peer-agent',
+      content: 'request',
+      created_at: NOW - 100,
+    }];
+    let sends = 0;
+    const client = {
+      async send() {
+        sends += 1;
+        inbox.push({
+          id: 'hub-core-restart-reconciled',
+          channel_id: 'dm-channel-core-restart',
+          sender_id: 'self-agent-id',
+          sender_name: 'self-agent',
+          content: intent.payload.text,
+          created_at: NOW + 10,
+        });
+        const error = new Error('timeout after platform acceptance');
+        error.code = 'ETIMEDOUT';
+        throw error;
+      },
+      async inbox() { return inbox; },
+    };
+    const sendClaim = coreClaim(intent, {
+      claimEpoch: 7,
+      leaseOwner: 'send-owner',
+      leaseToken: 'same-restart-token',
+    });
+    const first = createAdapter({ store: await createStore(directory), client });
+    const unknown = await first.deliver(intent, sendClaim);
+
+    const reconcileClaim = coreClaim(intent, {
+      action: 'reconcile',
+      claimEpoch: 8,
+      leaseOwner: 'reconcile-owner',
+      leaseToken: 'same-restart-token',
+    });
+    const restartedStore = await createStore(directory);
+    const restarted = createAdapter({ store: restartedStore, client });
+    const reconciled = await restarted.reconcile(intent, reconcileClaim);
+    const historicalReplay = await restarted.deliver(intent, sendClaim);
+
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(reconciled.outcome, 'reconciled');
+    assert.equal(reconciled.externalRef, 'opaque:hub-core-restart-reconciled');
+    assert.deepEqual(historicalReplay, unknown);
+    assert.equal(sends, 1);
+    const durable = await restartedStore.read(`delivery:${intent.intentId}`);
+    assert.equal(durable.highestClaimEpoch, 8);
+    assert.deepEqual(durable.receipts.map(receipt => receipt.outcome), ['unknown', 'reconciled']);
   });
 
   it('reconciles not-found before allowing a new attempt to retry', async () => {
@@ -616,6 +857,198 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     assert.equal(sends, 1);
   });
 
+  it('preserves exhausted history while a newer Core claim is accepted and fences stale ABA claims', async () => {
+    const store = await createStore();
+    const intent = answerIntent();
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          if (sends === 1) {
+            const error = new Error('permanent first-generation rejection');
+            error.status = 403;
+            throw error;
+          }
+          return { message: { id: 'hub-redrive-generation-2' } };
+        },
+      },
+    });
+    const oldClaim = coreClaim(intent, {
+      claimEpoch: 1,
+      leaseOwner: 'old-owner',
+      leaseToken: 'same-aba-token',
+    });
+    const redriveClaim = coreClaim(intent, {
+      attemptNumber: 2,
+      claimEpoch: 2,
+      leaseOwner: 'new-owner',
+      leaseToken: 'same-aba-token',
+    });
+
+    const exhausted = await adapter.deliver(intent, oldClaim);
+    const accepted = await adapter.deliver(intent, redriveClaim);
+    const historicalReplay = await adapter.deliver(intent, oldClaim);
+
+    assert.equal(exhausted.outcome, 'rejected');
+    assert.equal(exhausted.retryable, false);
+    assert.equal(accepted.outcome, 'platform_accepted');
+    assert.deepEqual(historicalReplay, exhausted);
+    await assert.rejects(
+      adapter.deliver(intent, {
+        ...oldClaim,
+        attemptId: `attempt:delivery:${intent.intentId}:99`,
+      }),
+      error => error.code === 'HXA_DELIVERY_LEASE_FENCED',
+    );
+    assert.equal(sends, 2);
+    const record = await store.read(`delivery:${intent.intentId}`);
+    assert.deepEqual(record.receipts.map(receipt => receipt.outcome), [
+      'rejected',
+      'platform_accepted',
+    ]);
+    assert.equal(record.highestClaimEpoch, 2);
+  });
+
+  it('preserves exhausted history while a redrive generation is reconciled after an ambiguous send', async () => {
+    const store = await createStore();
+    const intent = answerIntent();
+    const inbox = [{
+      id: 'source-message-001',
+      channel_id: 'dm-redrive-reconcile',
+      sender_id: 'peer-agent-id',
+      sender_name: 'peer-agent',
+      content: 'request',
+      created_at: NOW - 100,
+    }];
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      client: {
+        async send() {
+          sends += 1;
+          if (sends === 1) {
+            const rejected = new Error('first generation rejected');
+            rejected.status = 403;
+            throw rejected;
+          }
+          inbox.push({
+            id: 'hub-redrive-reconciled',
+            channel_id: 'dm-redrive-reconcile',
+            sender_id: 'self-agent-id',
+            sender_name: 'self-agent',
+            content: intent.payload.text,
+            created_at: NOW + 10,
+          });
+          const ambiguous = new Error('redrive timeout after write');
+          ambiguous.code = 'ETIMEDOUT';
+          throw ambiguous;
+        },
+        async inbox() { return inbox; },
+      },
+    });
+    const firstClaim = coreClaim(intent, { claimEpoch: 11, leaseToken: 'redrive-token-a' });
+    const redriveClaim = coreClaim(intent, {
+      attemptNumber: 2,
+      claimEpoch: 12,
+      leaseToken: 'redrive-token-b',
+    });
+    const reconcileClaim = coreClaim(intent, {
+      action: 'reconcile',
+      attemptNumber: 2,
+      claimEpoch: 13,
+      leaseToken: 'redrive-token-c',
+    });
+
+    const exhausted = await adapter.deliver(intent, firstClaim);
+    const unknown = await adapter.deliver(intent, redriveClaim);
+    const reconciled = await adapter.reconcile(intent, reconcileClaim);
+
+    assert.equal(exhausted.outcome, 'rejected');
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(reconciled.outcome, 'reconciled');
+    assert.equal(reconciled.externalRef, 'opaque:hub-redrive-reconciled');
+    assert.equal(sends, 2);
+    const record = await store.read(`delivery:${intent.intentId}`);
+    assert.deepEqual(record.receipts.map(receipt => receipt.outcome), [
+      'rejected',
+      'unknown',
+      'reconciled',
+    ]);
+    assert.equal(record.highestClaimEpoch, 13);
+  });
+
+  it('does not reconcile a redrive attempt against an older generation message', async () => {
+    let now = NOW;
+    const store = new AssistantResponseDeliveryStore({
+      directory: await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hxa-redrive-window-')),
+      clock: () => now,
+    });
+    tempDirs.push(store.directory);
+    const intent = answerIntent();
+    const inbox = [{
+      id: 'source-message-001',
+      channel_id: 'dm-redrive-window',
+      sender_id: 'peer-id',
+      sender_name: 'peer-agent',
+      content: 'request',
+      created_at: NOW - 100,
+    }, {
+      id: 'old-generation-message',
+      channel_id: 'dm-redrive-window',
+      sender_id: 'self-agent-id',
+      sender_name: 'self-agent',
+      content: intent.payload.text,
+      created_at: NOW + 10,
+    }];
+    let sends = 0;
+    const adapter = createAdapter({
+      store,
+      clock: () => now,
+      client: {
+        async send() {
+          sends += 1;
+          if (sends === 1) {
+            const rejected = new Error('generation zero rejected');
+            rejected.status = 403;
+            throw rejected;
+          }
+          const ambiguous = new Error('generation one result unknown');
+          ambiguous.code = 'ETIMEDOUT';
+          throw ambiguous;
+        },
+        async inbox() { return inbox; },
+      },
+    });
+    const leaseExpiresAt = Math.floor((NOW + 600_000) / 1_000);
+
+    await adapter.deliver(intent, coreClaim(intent, {
+      claimEpoch: 30,
+      leaseToken: 'window-token-a',
+      leaseExpiresAt,
+    }));
+    now = NOW + 60_000;
+    const unknown = await adapter.deliver(intent, coreClaim(intent, {
+      attemptNumber: 2,
+      claimEpoch: 31,
+      leaseToken: 'window-token-b',
+      leaseExpiresAt,
+    }));
+    const notFound = await adapter.reconcile(intent, coreClaim(intent, {
+      action: 'reconcile',
+      attemptNumber: 2,
+      claimEpoch: 32,
+      leaseToken: 'window-token-c',
+      leaseExpiresAt,
+    }));
+
+    assert.equal(unknown.outcome, 'unknown');
+    assert.equal(notFound.outcome, 'rejected');
+    assert.equal(notFound.errorCode, 'HXA_RECONCILE_NOT_FOUND');
+    assert.equal(sends, 2);
+  });
+
   it('serializes concurrent owners and persists intent, content hash, lease fence, attempts, and receipt', async () => {
     const store = await createStore();
     let sends = 0;
@@ -691,7 +1124,9 @@ describe('HxaFinalDeliveryAdapter Phase A', () => {
     const store = await createStore();
     const intent = answerIntent();
     intent.route.targetRef = 'org:hxa|11111111-2222-3333-4444-555555555555';
-    intent.contentHash = contentHash(intent.payload.text);
+    const routeHash = canonicalRouteHash(intent.route);
+    intent.intentId = `reply:${intent.requestId}:${routeHash}`;
+    intent.idempotencyKey = intent.intentId;
     const sends = [];
     const adapter = createAdapter({
       store,

@@ -92,7 +92,7 @@ describe('HXA current reply behavior characterization', () => {
     assert.deepEqual(await fs.promises.readdir(directory).catch(() => []), []);
   });
 
-  it('characterizes empty legacy RunCompleted output as the current MISSING_OUTPUT gap', async () => {
+  it('rejects blank and invisible legacy RunCompleted output without manufacturing success', async () => {
     const directory = await tempDir('hxa-empty-output-');
     const sent = [];
     const adapter = createAssistantResponseDelivery({
@@ -111,8 +111,16 @@ describe('HXA current reply behavior characterization', () => {
       defaultOrgLabel: 'hxa',
     });
 
-    await adapter.deliver(legacyDelivery({ payload: { output: '   ' } }));
-    assert.deepEqual(sent, [{ target: 'peer-agent', content: '处理完成。' }]);
+    for (const output of ['   ', '\u200B\u200C\u200D\u2060\uFEFF']) {
+      await assert.rejects(
+        adapter.deliver(legacyDelivery({
+          requestId: `hxa.dm.empty-${output.length}`,
+          payload: { output },
+        })),
+        error => error.code === 'MISSING_OUTPUT',
+      );
+    }
+    assert.deepEqual(sent, []);
     assert.equal(characterization.currentSemantics.emptyOutputBehavior, 'empty RunCompleted output is replaced with 处理完成。');
   });
 

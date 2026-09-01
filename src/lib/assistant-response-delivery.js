@@ -5,6 +5,7 @@ import path from 'node:path';
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 const MSG_SUFFIX_RE = /\|msg:([A-Za-z0-9-]+)$/;
 const TERMINAL_EVENTS = new Set(['RunCompleted', 'RunFailed']);
+const INVISIBLE_FORMAT_CHARACTERS = /[\u200B-\u200D\u2060\uFEFF]/g;
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -140,7 +141,13 @@ function terminalFromDelivery(input) {
 }
 
 function publicCompletedContent(terminal) {
-  return terminal.payload.output.trim().length > 0 ? terminal.payload.output : '处理完成。';
+  const output = terminal.payload.output;
+  if (output.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim() === '') {
+    const error = new Error('visible HXA reply output is missing');
+    error.code = 'MISSING_OUTPUT';
+    throw error;
+  }
+  return output;
 }
 
 function canonicalEndpointKey(parsed) {
@@ -343,8 +350,18 @@ export class AssistantResponseDeliveryStore {
 }
 
 function isSelfMessage(message, org) {
-  if (org.agentId && message?.sender_id === org.agentId) return true;
+  if (org.agentId) return message?.sender_id === org.agentId;
   return Boolean(org.agentName && message?.sender_name === org.agentName);
+}
+
+function singleReconcileMatch(messages, predicate) {
+  const matches = messages.filter(predicate);
+  if (matches.length > 1) {
+    const error = new Error('multiple HXA messages match the delivery identity');
+    error.code = 'HXA_RECONCILE_RESULT_AMBIGUOUS';
+    throw error;
+  }
+  return matches[0] || null;
 }
 
 async function reconcileDm({ client, org, target, sourceMessageId, content, startedAt }) {
@@ -364,12 +381,12 @@ async function reconcileDm({ client, org, target, sourceMessageId, content, star
     error.code = 'HXA_RECONCILE_ROUTE_UNKNOWN';
     throw error;
   }
-  return messages.find(message => (
+  return singleReconcileMatch(messages, message => (
     isSelfMessage(message, org)
     && message.content === content
     && Number(message.created_at) >= startedAt - 5_000
     && (expectedChannels.size === 0 || expectedChannels.has(message.channel_id))
-  )) || null;
+  ));
 }
 
 async function reconcileThread({ client, org, threadId, content, startedAt }) {
@@ -377,11 +394,11 @@ async function reconcileThread({ client, org, threadId, content, startedAt }) {
     since: Math.max(0, startedAt - 5_000),
   });
   if (!Array.isArray(messages)) throw new TypeError('Hub thread messages response must be an array');
-  return messages.find(message => (
+  return singleReconcileMatch(messages, message => (
     isSelfMessage(message, org)
     && message.content === content
     && Number(message.created_at) >= startedAt - 5_000
-  )) || null;
+  ));
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
