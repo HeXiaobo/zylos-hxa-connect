@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.7.9] - 2026-09-02
+
+### Added
+- Add a terminal-only final delivery adapter for assistant terminal events.
+- Preserve explicit `silent` and `[SKIP]` compatibility across delivery paths.
+
+### Fixed
+- Enforce an empty/invisible output boundary so non-deliverable responses do
+  not create outbound side effects.
+- Persist durable delivery identity, fence stale owners, and reconcile
+  ambiguous delivery outcomes safely.
+- Return actionable DM policy rejection feedback and harden recovery after
+  lock-owner death.
+
+### Verification
+- Converge main CI, `npm test`, and high-severity `npm audit` coverage for the
+  release path.
+
 ## [1.7.8] - 2026-08-30
 
 ### Fixed
