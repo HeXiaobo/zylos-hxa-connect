@@ -46,16 +46,36 @@ function drive(suppressionEnabled) {
 }
 
 const ALERTFN_SHA = '7d09eae502e22afe75e1ec04a4c49700b7cb427d2487e2d58f3a9ca543652227';
-const ALERTFN_LINES = [398, 410]; // bot.js L398-L410
+
+function findAlertFnRange(src) {
+  const lines = src.split('\n');
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s+alertFn:\s*\(/.test(lines[i])) { start = i; break; }
+  }
+  if (start === -1) return null;
+  const baseIndent = lines[start].match(/^(\s*)/)[1].length;
+  let depth = 0;
+  for (let i = start; i < lines.length; i++) {
+    for (const ch of lines[i]) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+    if (depth <= 0) return [start + 1, i + 1]; // 1-indexed inclusive
+  }
+  return null;
+}
 
 describe('alertFn drift detection (bot.js ↔ test replica)', () => {
   it('bot.js alertFn closure matches known hash — update replica if this fails', () => {
     const src = readFileSync(new URL('../src/bot.js', import.meta.url), 'utf-8');
-    const lines = src.split('\n').slice(ALERTFN_LINES[0] - 1, ALERTFN_LINES[1]);
+    const range = findAlertFnRange(src);
+    assert.ok(range, 'could not locate alertFn closure in bot.js — signature pattern not found');
+    const lines = src.split('\n').slice(range[0] - 1, range[1]);
     const normalized = lines.join('\n').replace(/\s+/g, ' ').replace(/ +/g, ' ') + '\n';
     const sha = createHash('sha256').update(normalized).digest('hex');
     assert.equal(sha, ALERTFN_SHA,
-      `bot.js alertFn (L${ALERTFN_LINES[0]}-${ALERTFN_LINES[1]}) changed — ` +
+      `bot.js alertFn (L${range[0]}-${range[1]}) changed — ` +
       'this test replica is now stale. Read the new bot.js closure, update ' +
       'makeAlertFn() above and ALERTFN_SHA, then re-run.');
   });

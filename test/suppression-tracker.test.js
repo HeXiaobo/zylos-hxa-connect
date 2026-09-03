@@ -487,7 +487,7 @@ describe('SuppressionTracker', () => {
       }
       assert.ok(alerts.some(a => a.reason !== 'recovered'), 'should have triggered alert');
       const prevAlertCount = alerts.length;
-      tracker.evaluate(msg('m-empty', '', { nonSubstantive: true }));
+      tracker.evaluate(msg('m-empty', ''));
       const newAlerts = alerts.slice(prevAlertCount);
       const recoveryAlerts = newAlerts.filter(a => a.reason === 'recovered');
       assert.equal(recoveryAlerts.length, 0, 'empty content must NOT trigger recovered alert');
@@ -509,21 +509,27 @@ describe('SuppressionTracker', () => {
   });
 
   describe('GAP-3 early return: empty content produces zero alerts (Veda scenario)', () => {
-    it('4 empty events + 1 real message → zero alerts fired', () => {
+    it('4 empty events after streak leave counter unchanged and fire no new alert', () => {
       const alerts = [];
       const tracker = makeTracker({
         alertThreshold: 3,
         suppressAfter: 1,
         alertFn: (info) => alerts.push(info),
       });
+      // precondition: establish a real non-substantive streak so counter > 0
+      tracker.evaluate(msg('s1', '收到', { nonSubstantive: true }));
+      tracker.evaluate(msg('s2', '好的', { nonSubstantive: true }));
+      const base = tracker.evaluate(msg('s3', '嗯嗯', { nonSubstantive: true })).consecutiveCount;
+      assert.ok(base > 0, 'precondition: streak established');
+      const alertsBefore = alerts.length;
       for (let i = 1; i <= 4; i++) {
         const r = tracker.evaluate(msg(`e${i}`, ''));
         assert.equal(r.suppress, false, `empty event #${i} not suppressed`);
-        assert.equal(r.consecutiveCount, 0, `empty event #${i} does not increment counter`);
+        assert.equal(r.consecutiveCount, base, `empty event #${i} leaves counter unchanged`);
       }
+      assert.equal(alerts.length, alertsBefore, 'empty events fire no alert at all');
       const r = tracker.evaluate(msg('m-real', '这是一条真正的消息'));
       assert.equal(r.suppress, false, 'first real message passes');
-      assert.equal(alerts.length, 0, 'zero alerts — no whitelist_or_punctuation, no recovered');
     });
 
     it('empty content between two non-substantive streaks does not reset counter', () => {
