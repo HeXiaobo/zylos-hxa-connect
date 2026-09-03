@@ -64,6 +64,22 @@ describe('effectiveText', () => {
     };
     assert.equal(effectiveText(msg), 'only in parts');
   });
+
+  it('includes typeless parts with string content', () => {
+    const msg = {
+      content: '',
+      parts: [{ content: 'no type field' }],
+    };
+    assert.equal(effectiveText(msg), 'no type field');
+  });
+
+  it('ignores typeless parts with non-string content', () => {
+    const msg = {
+      content: '',
+      parts: [{ content: 42 }],
+    };
+    assert.equal(effectiveText(msg), '');
+  });
 });
 
 describe('isPurePunctuation', () => {

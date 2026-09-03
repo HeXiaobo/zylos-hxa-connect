@@ -15,7 +15,7 @@ export function effectiveText(message) {
   let text = message.content || '';
   if (message.parts) {
     for (const p of message.parts) {
-      if ((p.type === 'text' || p.type === 'markdown' || p.type === 'json') && typeof p.content === 'string') {
+      if (typeof p.content === 'string' && (p.type === 'text' || p.type === 'markdown' || p.type === 'json' || !p.type)) {
         if (text && p.content) text += '\n';
         text += p.content;
       }
@@ -25,6 +25,7 @@ export function effectiveText(message) {
 }
 
 export function loadWhitelist(filePath) {
+  let newWhitelist;
   try {
     if (!fs.existsSync(filePath)) {
       process.stderr.write(`[message-classify] WARN whitelist not found: ${filePath} — whitelist matching disabled (fail-open)\n`);
@@ -37,17 +38,20 @@ export function loadWhitelist(filePath) {
       return { loaded: false, reason: 'invalid_format', count: 0, preserved: _whitelist !== null };
     }
     if (entries.length === 0) {
-      _whitelist = null;
-      process.stderr.write(`[message-classify] whitelist cleared (empty array): ${filePath}\n`);
-      return { loaded: true, reason: 'cleared', count: 0 };
+      newWhitelist = null;
+    } else {
+      newWhitelist = new Set(entries.map(e => String(e).trim()));
     }
-    const parsed = new Set(entries.map(e => String(e).trim()));
-    _whitelist = parsed;
-    return { loaded: true, count: _whitelist.size };
   } catch (err) {
-    process.stderr.write(`[message-classify] WARN whitelist load failed: ${err.message} — whitelist matching disabled (fail-open)\n`);
+    process.stderr.write(`[message-classify] WARN whitelist load failed: ${err.message} — preserving previous whitelist (fail-open)\n`);
     return { loaded: false, reason: err.message, count: 0, preserved: _whitelist !== null };
   }
+  _whitelist = newWhitelist;
+  if (newWhitelist === null) {
+    process.stderr.write(`[message-classify] whitelist cleared (empty array): ${filePath}\n`);
+    return { loaded: true, reason: 'cleared', count: 0 };
+  }
+  return { loaded: true, count: _whitelist.size };
 }
 
 export function isWhitelistMatch(text) {

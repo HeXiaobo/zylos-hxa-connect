@@ -49,6 +49,7 @@ export class SuppressionTracker {
   get suppressAfter() { return this.#suppressAfter; }
   get alertThreshold() { return this.#alertThreshold; }
   get maxRepeatLength() { return this.#maxRepeatLength; }
+  get windowMs() { return this.#windowMs; }
 
   #validatePositive(value, name, fallback) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -63,7 +64,7 @@ export class SuppressionTracker {
   #classify(trimmedContent, counter, nonSubstantive, now) {
     const timeSinceLast = now - counter.lastAt;
     const isFresh = counter.lastContent !== null && timeSinceLast <= this.#repeatWindowMs;
-    const isRepeat = isFresh && trimmedContent === counter.lastContent;
+    const isRepeat = isFresh && trimmedContent !== '' && trimmedContent === counter.lastContent;
     const isShortRepeat = isRepeat && trimmedContent.length <= this.#maxRepeatLength;
     const isNonSubstantive = nonSubstantive || isShortRepeat;
     let reason = null;
@@ -75,12 +76,15 @@ export class SuppressionTracker {
 
   evaluate({ messageId, senderId, senderName, orgLabel, content, context, nonSubstantive = false }) {
     const now = Date.now();
+    if (!senderId) {
+      process.stderr.write(`[suppression-tracker] WARN senderId missing for ${senderName}, falling back to display name for bucketing\n`);
+    }
     const senderKey = `${orgLabel}:${senderId || senderName}`;
     const trimmedContent = (content || '').trim();
 
     let counter = this.#counters.get(senderKey);
     if (!counter || (now - counter.lastAt) > this.#windowMs) {
-      counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null, repeatCount: 0 };
+      counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null };
     }
 
     const { isNonSubstantive, isRepeat, isShortRepeat, reason } = this.#classify(trimmedContent, counter, nonSubstantive, now);
@@ -92,11 +96,10 @@ export class SuppressionTracker {
       if (counter.suppressedCount > 0) {
         this.#fireRecoveryAlert(senderKey, senderName, counter, now);
       }
-      counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null, repeatCount: 0 };
+      counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null };
     }
 
     counter.lastContent = trimmedContent;
-    if (isRepeat) counter.repeatCount += 1;
     this.#counters.set(senderKey, counter);
 
     const suppressThreshold = (isShortRepeat && !nonSubstantive) ? 0 : this.#suppressAfter;
@@ -178,7 +181,11 @@ export class SuppressionTracker {
     for (const [key, counter] of this.#counters) {
       if ((now - counter.lastAt) > this.#windowMs) {
         this.#counters.delete(key);
+        this.#lastAlertAt.delete(key);
       }
+    }
+    for (const key of this.#lastAlertAt.keys()) {
+      if (!this.#counters.has(key)) this.#lastAlertAt.delete(key);
     }
   }
 

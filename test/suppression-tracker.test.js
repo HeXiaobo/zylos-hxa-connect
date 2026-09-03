@@ -425,6 +425,68 @@ describe('SuppressionTracker', () => {
       assert.equal(recovery.length, 1);
       assert.equal(recovery[0].senderName, 'veda');
     });
+
+    it('bot.js alertFn pattern: shadow mode does not send to C4 at threshold', () => {
+      let sendToC4Count = 0;
+      const suppressionEnabled = false;
+      const tracker = makeTracker({
+        alertThreshold: 3,
+        alertFn: ({ senderKey, senderName, count, windowSec, reason }) => {
+          if (!suppressionEnabled) return;
+          sendToC4Count++;
+        },
+      });
+      for (let i = 1; i <= 3; i++) {
+        tracker.evaluate(msg(`m${i}`, '好。', { nonSubstantive: true }));
+      }
+      assert.equal(sendToC4Count, 0, 'shadow mode must not send to C4');
+    });
+
+    it('bot.js alertFn pattern: shadow mode does not send to C4 on recovery', () => {
+      let sendToC4Count = 0;
+      const suppressionEnabled = false;
+      const tracker = makeTracker({
+        alertFn: ({ reason }) => {
+          if (!suppressionEnabled) return;
+          sendToC4Count++;
+        },
+      });
+      tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+      tracker.evaluate(msg('m2', '（等 diff）', { nonSubstantive: true }));
+      tracker.evaluate(msg('m3', '实质性消息'));
+      assert.equal(sendToC4Count, 0, 'shadow recovery must not send to C4');
+    });
+
+    it('bot.js alertFn pattern: enabled mode sends to C4 at threshold', () => {
+      let sendToC4Count = 0;
+      const suppressionEnabled = true;
+      const tracker = makeTracker({
+        alertThreshold: 3,
+        alertFn: ({ reason }) => {
+          if (!suppressionEnabled) return;
+          sendToC4Count++;
+        },
+      });
+      for (let i = 1; i <= 3; i++) {
+        tracker.evaluate(msg(`m${i}`, '好。', { nonSubstantive: true }));
+      }
+      assert.equal(sendToC4Count, 1, 'enabled mode must send to C4');
+    });
+
+    it('bot.js alertFn pattern: enabled mode sends to C4 on recovery', () => {
+      let sendToC4Count = 0;
+      const suppressionEnabled = true;
+      const tracker = makeTracker({
+        alertFn: ({ reason }) => {
+          if (!suppressionEnabled) return;
+          sendToC4Count++;
+        },
+      });
+      tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+      tracker.evaluate(msg('m2', '（等 diff）', { nonSubstantive: true }));
+      tracker.evaluate(msg('m3', '实质性消息'));
+      assert.equal(sendToC4Count, 1, 'enabled mode must send recovery to C4');
+    });
   });
 
   describe('combined: repetition + whitelist', () => {
