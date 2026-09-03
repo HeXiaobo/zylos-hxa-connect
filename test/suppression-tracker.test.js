@@ -508,6 +508,49 @@ describe('SuppressionTracker', () => {
     });
   });
 
+  describe('GAP-3 early return: empty content produces zero alerts (Veda scenario)', () => {
+    it('4 empty events + 1 real message → zero alerts fired', () => {
+      const alerts = [];
+      const tracker = makeTracker({
+        alertThreshold: 3,
+        suppressAfter: 1,
+        alertFn: (info) => alerts.push(info),
+      });
+      for (let i = 1; i <= 4; i++) {
+        const r = tracker.evaluate(msg(`e${i}`, ''));
+        assert.equal(r.suppress, false, `empty event #${i} not suppressed`);
+        assert.equal(r.consecutiveCount, 0, `empty event #${i} does not increment counter`);
+      }
+      const r = tracker.evaluate(msg('m-real', '这是一条真正的消息'));
+      assert.equal(r.suppress, false, 'first real message passes');
+      assert.equal(alerts.length, 0, 'zero alerts — no whitelist_or_punctuation, no recovered');
+    });
+
+    it('empty content between two non-substantive streaks does not reset counter', () => {
+      const tracker = makeTracker({ suppressAfter: 1 });
+      tracker.evaluate(msg('m1', '好', { nonSubstantive: true }));
+      tracker.evaluate(msg('m-empty', ''));
+      const r = tracker.evaluate(msg('m2', '嗯', { nonSubstantive: true }));
+      assert.equal(r.suppress, true, 'streak continues past empty content');
+      assert.equal(r.consecutiveCount, 2, 'counter unaffected by empty interjection');
+    });
+
+    it('no alert has windowSec=0 (false alert fingerprint)', () => {
+      const alerts = [];
+      const tracker = makeTracker({
+        alertThreshold: 2,
+        suppressAfter: 0,
+        alertFn: (info) => alerts.push(info),
+      });
+      for (let i = 0; i < 10; i++) {
+        tracker.evaluate(msg(`m${i}`, '', { nonSubstantive: i % 2 === 0 }));
+      }
+      tracker.evaluate(msg('m-real', '真消息'));
+      const zeroWindowAlerts = alerts.filter(a => a.windowSec === 0);
+      assert.equal(zeroWindowAlerts.length, 0, 'window=0s is a false alert fingerprint — must never fire');
+    });
+  });
+
   describe('repeatWindowMs (v9: freshness window for repeat detection)', () => {
     it('does not treat as repeat when gap exceeds repeatWindowMs', () => {
       const tracker = makeTracker({ repeatWindowMs: 100, windowMs: 3_600_000 });

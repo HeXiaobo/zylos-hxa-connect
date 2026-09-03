@@ -91,6 +91,12 @@ export class SuppressionTracker {
       counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null };
     }
 
+    if (!trimmedContent) {
+      this.#evaluateCount += 1;
+      if (this.#evaluateCount % SWEEP_INTERVAL === 0) this.#sweepStale(now);
+      return { suppress: false, consecutiveCount: counter.count, suppressedCount: counter.suppressedCount, reason: null };
+    }
+
     const { isNonSubstantive, isRepeat, isShortRepeat, reason } = this.#classify(trimmedContent, counter, nonSubstantive, now);
 
     if (isNonSubstantive) {

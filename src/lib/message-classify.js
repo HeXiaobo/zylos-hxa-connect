@@ -38,7 +38,7 @@ export function loadWhitelist(filePath) {
       return { loaded: false, reason: 'invalid_format', count: 0, preserved: _whitelist !== null };
     }
     if (entries.length === 0) {
-      newWhitelist = null;
+      newWhitelist = null; // empty array = disable matching; does NOT preserve previous whitelist
     } else {
       newWhitelist = new Set(entries.map(e => String(e).trim()));
     }
