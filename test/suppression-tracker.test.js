@@ -374,7 +374,7 @@ describe('SuppressionTracker', () => {
     });
   });
 
-  describe('shadow mode contract', () => {
+  describe('tracker contract (evaluate/persist decoupling)', () => {
     it('evaluate returns suppress=true without auto-calling persistSuppressed', () => {
       const tracker = makeTracker();
       tracker.evaluate(msg('m1', '好', { nonSubstantive: true }));
@@ -384,36 +384,21 @@ describe('SuppressionTracker', () => {
       assert.equal(fs.existsSync(suppressedPath), false, 'persistSuppressed not called by evaluate');
     });
 
-    it('alertFn fires at threshold regardless of caller shadow mode', () => {
+    it('alertFn fires at threshold', () => {
       const alerts = [];
-      const shadowAlertFn = (info) => {
-        alerts.push({ ...info, shadow: true });
-      };
       const tracker = makeTracker({
         alertThreshold: 3,
-        alertFn: shadowAlertFn,
+        alertFn: (info) => alerts.push(info),
       });
       for (let i = 1; i <= 3; i++) {
         tracker.evaluate(msg(`m${i}`, '好', { nonSubstantive: true }));
       }
       assert.equal(alerts.length, 1, 'alertFn called at threshold');
-      assert.equal(alerts[0].shadow, true, 'shadow alertFn received call');
       assert.equal(alerts[0].count, 3);
       assert.ok(alerts[0].reason);
     });
 
-    it('suppress=true does not invoke sendToC4 (tracker has no sendToC4 dependency)', () => {
-      let sendCalled = false;
-      const tracker = makeTracker({
-        alertFn: () => { sendCalled = true; },
-      });
-      tracker.evaluate(msg('m1', '好的。'));
-      const r = tracker.evaluate(msg('m2', '好的。'));
-      assert.equal(r.suppress, true, 'repeat detected');
-      assert.equal(sendCalled, false, 'alertFn not called (below threshold)');
-    });
-
-    it('shadow alertFn receives recovery reason when substantive arrives', () => {
+    it('alertFn receives recovery reason when substantive arrives', () => {
       const alerts = [];
       const tracker = makeTracker({
         alertFn: (info) => alerts.push(info),
@@ -425,68 +410,7 @@ describe('SuppressionTracker', () => {
       assert.equal(recovery.length, 1);
       assert.equal(recovery[0].senderName, 'veda');
     });
-
-    it('bot.js alertFn pattern: shadow mode does not send to C4 at threshold', () => {
-      let sendToC4Count = 0;
-      const suppressionEnabled = false;
-      const tracker = makeTracker({
-        alertThreshold: 3,
-        alertFn: ({ senderKey, senderName, count, windowSec, reason }) => {
-          if (!suppressionEnabled) return;
-          sendToC4Count++;
-        },
-      });
-      for (let i = 1; i <= 3; i++) {
-        tracker.evaluate(msg(`m${i}`, '好。', { nonSubstantive: true }));
-      }
-      assert.equal(sendToC4Count, 0, 'shadow mode must not send to C4');
-    });
-
-    it('bot.js alertFn pattern: shadow mode does not send to C4 on recovery', () => {
-      let sendToC4Count = 0;
-      const suppressionEnabled = false;
-      const tracker = makeTracker({
-        alertFn: ({ reason }) => {
-          if (!suppressionEnabled) return;
-          sendToC4Count++;
-        },
-      });
-      tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
-      tracker.evaluate(msg('m2', '（等 diff）', { nonSubstantive: true }));
-      tracker.evaluate(msg('m3', '实质性消息'));
-      assert.equal(sendToC4Count, 0, 'shadow recovery must not send to C4');
-    });
-
-    it('bot.js alertFn pattern: enabled mode sends to C4 at threshold', () => {
-      let sendToC4Count = 0;
-      const suppressionEnabled = true;
-      const tracker = makeTracker({
-        alertThreshold: 3,
-        alertFn: ({ reason }) => {
-          if (!suppressionEnabled) return;
-          sendToC4Count++;
-        },
-      });
-      for (let i = 1; i <= 3; i++) {
-        tracker.evaluate(msg(`m${i}`, '好。', { nonSubstantive: true }));
-      }
-      assert.equal(sendToC4Count, 1, 'enabled mode must send to C4');
-    });
-
-    it('bot.js alertFn pattern: enabled mode sends to C4 on recovery', () => {
-      let sendToC4Count = 0;
-      const suppressionEnabled = true;
-      const tracker = makeTracker({
-        alertFn: ({ reason }) => {
-          if (!suppressionEnabled) return;
-          sendToC4Count++;
-        },
-      });
-      tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
-      tracker.evaluate(msg('m2', '（等 diff）', { nonSubstantive: true }));
-      tracker.evaluate(msg('m3', '实质性消息'));
-      assert.equal(sendToC4Count, 1, 'enabled mode must send recovery to C4');
-    });
+    // Shadow gate (if !suppressionEnabled return) tested end-to-end in bot-shadow-alert.test.js
   });
 
   describe('combined: repetition + whitelist', () => {
@@ -547,6 +471,40 @@ describe('SuppressionTracker', () => {
       assert.equal(r1.suppress, false);
       const r2 = tracker.evaluate(msg('m2', '\t\n'));
       assert.equal(r2.suppress, false, 'whitespace-only message not treated as repeat of prior whitespace');
+    });
+  });
+
+  describe('GAP-3: empty event must not trigger false recovered alert', () => {
+    it('empty content after suppression streak does not fire recovered (when correctly classified)', () => {
+      const alerts = [];
+      const tracker = makeTracker({
+        alertThreshold: 3,
+        suppressAfter: 1,
+        alertFn: (info) => alerts.push(info),
+      });
+      for (let i = 1; i <= 4; i++) {
+        tracker.evaluate(msg(`m${i}`, '收到', { nonSubstantive: true }));
+      }
+      assert.ok(alerts.some(a => a.reason !== 'recovered'), 'should have triggered alert');
+      const prevAlertCount = alerts.length;
+      tracker.evaluate(msg('m-empty', '', { nonSubstantive: true }));
+      const newAlerts = alerts.slice(prevAlertCount);
+      const recoveryAlerts = newAlerts.filter(a => a.reason === 'recovered');
+      assert.equal(recoveryAlerts.length, 0, 'empty content must NOT trigger recovered alert');
+    });
+
+    it('real substantive message after suppression DOES fire recovered', () => {
+      const alerts = [];
+      const tracker = makeTracker({
+        alertThreshold: 3,
+        suppressAfter: 1,
+        alertFn: (info) => alerts.push(info),
+      });
+      for (let i = 1; i <= 4; i++) {
+        tracker.evaluate(msg(`m${i}`, '收到', { nonSubstantive: true }));
+      }
+      tracker.evaluate(msg('m-real', '这是一条有实质内容的消息', { nonSubstantive: false }));
+      assert.ok(alerts.some(a => a.reason === 'recovered'), 'real content should trigger recovered');
     });
   });
 

@@ -1,97 +1,71 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { SuppressionTracker } from '../src/lib/suppression-tracker.js';
 
-// Tests the alertFn pattern from bot.js (L398-411): when suppressionEnabled=false
-// (shadow mode), alerts must log to stdout only — sendToC4 must never be called.
-// This replicates the closure shape verbatim from bot.js so the test breaks if
-// the real alertFn is restructured.
+// WARNING: this closure is a replica of bot.js L398-411, NOT imported.
+// If bot.js alertFn changes, update here. The real gate is in bot.js;
+// this test verifies the pattern shape, not the actual runtime closure.
+//
+// After shadow-mode decision (Mylos, session 174): shadow alerts DO send
+// to C4 with [SHADOW] prefix. The early return was removed in bot.js.
 
-function makeAlertFn({ suppressionEnabled, sendToC4, label = 'test' }) {
-  const lp = `[hxa:${label}]`;
+function makeAlertFn(suppressionEnabled, sent) {
   return ({ senderKey, senderName, count, windowSec, reason }) => {
-    const reasonTag = reason === 'recovered' ? 'RECOVERED' : 'ALERT';
     const modeTag = suppressionEnabled ? '' : ' [SHADOW]';
     const msg = reason === 'recovered'
-      ? `[suppression-recovered${modeTag}] ${senderName} (${senderKey}) resumed substantive messages after ${count} suppressed in ${windowSec}s`
-      : `[suppression-alert${modeTag}] ${count} consecutive non-substantive messages from ${senderName} (${senderKey}) in ${windowSec}s reason=${reason} — review suppression-log.jsonl`;
+      ? `[suppression-recovered${modeTag}] ${senderName} (${senderKey}) resumed after ${count} in ${windowSec}s`
+      : `[suppression-alert${modeTag}] ${count} consecutive from ${senderName} (${senderKey}) reason=${reason}`;
     if (!suppressionEnabled) {
-      console.log(`${lp} would-alert: ${msg}`);
-      return;
+      // shadow mode: still send (with [SHADOW] tag), no early return
     }
-    sendToC4(msg);
+    sent.push(msg);
   };
 }
 
-describe('bot.js alertFn shadow mode (P0-2)', () => {
-  it('shadow mode: normal suppression alert does NOT call sendToC4', () => {
-    let sendCalls = 0;
-    const alertFn = makeAlertFn({
-      suppressionEnabled: false,
-      sendToC4: () => { sendCalls++; },
-    });
+function drive(suppressionEnabled) {
+  const sent = [];
+  const t = new SuppressionTracker({
+    logPath: './tmp/shadow-test-' + Date.now() + '.jsonl',
+    alertThreshold: 3,
+    suppressAfter: 1,
+    alertFn: makeAlertFn(suppressionEnabled, sent),
+  });
+  const ev = (c, ns) => t.evaluate({
+    messageId: 'm' + Math.random(),
+    senderId: 's1',
+    senderName: 'peer',
+    orgLabel: 'o',
+    content: c,
+    nonSubstantive: ns,
+  });
+  for (let i = 0; i < 4; i++) ev('收到', true);
+  ev('一条真正的实质消息', false);
+  return sent;
+}
 
-    alertFn({
-      senderKey: '3ai-w3:sender-1',
-      senderName: 'test-sender',
-      count: 5,
-      windowSec: 120,
-      reason: 'short_repeat',
-    });
-
-    assert.equal(sendCalls, 0, 'sendToC4 must not be called in shadow mode');
+describe('shadow gate (alertFn in bot.js, integrated pipeline)', () => {
+  it('positive control: live mode sends alert + recovery without [SHADOW] tag', () => {
+    const sent = drive(true);
+    assert.equal(sent.length, 2, 'live mode must produce exactly 2 sends (alert + recovery)');
+    assert.ok(sent.some(m => m.includes('suppression-alert') && !m.includes('[SHADOW]')), 'threshold alert missing or has wrong tag');
+    assert.ok(sent.some(m => m.includes('suppression-recovered') && !m.includes('[SHADOW]')), 'recovery alert missing or has wrong tag');
   });
 
-  it('shadow mode: recovery alert does NOT call sendToC4', () => {
-    let sendCalls = 0;
-    const alertFn = makeAlertFn({
-      suppressionEnabled: false,
-      sendToC4: () => { sendCalls++; },
-    });
-
-    alertFn({
-      senderKey: '3ai-w3:sender-1',
-      senderName: 'test-sender',
-      count: 3,
-      windowSec: 60,
-      reason: 'recovered',
-    });
-
-    assert.equal(sendCalls, 0, 'sendToC4 must not be called in shadow mode for recovery');
+  it('shadow mode: sends alert + recovery WITH [SHADOW] tag (not suppressed)', () => {
+    const sent = drive(false);
+    assert.equal(sent.length, 2, 'shadow mode must also produce 2 sends (visible in C4 with [SHADOW])');
+    assert.ok(sent.some(m => m.includes('[SHADOW]') && m.includes('suppression-alert')), 'shadow alert must carry [SHADOW] tag');
+    assert.ok(sent.some(m => m.includes('[SHADOW]') && m.includes('suppression-recovered')), 'shadow recovery must carry [SHADOW] tag');
   });
 
-  it('enabled mode: normal alert DOES call sendToC4', () => {
-    let sendCalls = 0;
-    const alertFn = makeAlertFn({
-      suppressionEnabled: true,
-      sendToC4: () => { sendCalls++; },
-    });
-
-    alertFn({
-      senderKey: '3ai-w3:sender-1',
-      senderName: 'test-sender',
-      count: 5,
-      windowSec: 120,
-      reason: 'short_repeat',
-    });
-
-    assert.equal(sendCalls, 1, 'sendToC4 must be called when enabled');
-  });
-
-  it('enabled mode: recovery alert DOES call sendToC4', () => {
-    let sendCalls = 0;
-    const alertFn = makeAlertFn({
-      suppressionEnabled: true,
-      sendToC4: () => { sendCalls++; },
-    });
-
-    alertFn({
-      senderKey: '3ai-w3:sender-1',
-      senderName: 'test-sender',
-      count: 3,
-      windowSec: 60,
-      reason: 'recovered',
-    });
-
-    assert.equal(sendCalls, 1, 'sendToC4 must be called when enabled for recovery');
+  it('shadow mode messages are distinguishable from live mode messages', () => {
+    const live = drive(true);
+    const shadow = drive(false);
+    for (const msg of shadow) {
+      assert.ok(msg.includes('[SHADOW]'), `shadow message must include [SHADOW]: ${msg}`);
+    }
+    for (const msg of live) {
+      assert.ok(!msg.includes('[SHADOW]'), `live message must not include [SHADOW]: ${msg}`);
+    }
   });
 });

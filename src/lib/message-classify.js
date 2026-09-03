@@ -32,13 +32,7 @@ export function loadWhitelist(filePath) {
       return { loaded: false, reason: 'file_not_found', count: 0, preserved: _whitelist !== null };
     }
     const raw = fs.readFileSync(filePath, 'utf-8');
-    const trimmedRaw = raw.trim();
-    if (!trimmedRaw) {
-      _whitelist = null;
-      process.stderr.write(`[message-classify] whitelist cleared (empty file): ${filePath}\n`);
-      return { loaded: true, reason: 'cleared', count: 0 };
-    }
-    const entries = JSON.parse(trimmedRaw);
+    const entries = JSON.parse(raw);
     if (!Array.isArray(entries)) {
       process.stderr.write(`[message-classify] WARN whitelist invalid (not an array): ${filePath} — preserving previous whitelist (fail-open)\n`);
       return { loaded: false, reason: 'invalid_format', count: 0, preserved: _whitelist !== null };
@@ -78,6 +72,7 @@ export function isLikelyNonSubstantive(message) {
   if (message.parts?.some(p => ['image', 'file', 'link'].includes(p.type))) return false;
   if (message.parts?.some(p => !KNOWN_PART_TYPES.has(p.type))) return false;
   const text = effectiveText(message).trim();
+  if (!text) return true;
   return isWhitelistMatch(text) || isPurePunctuation(text);
 }
 

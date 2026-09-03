@@ -132,6 +132,15 @@ describe('whitelist', () => {
     assert.equal(r.reason, 'file_not_found');
   });
 
+  it('load failure preserves previously loaded whitelist (GAP-2: multi-org startup)', () => {
+    resetWhitelist();
+    const fp = writeWhitelist(['好。', '收到。']);
+    assert.equal(loadWhitelist(fp).loaded, true);
+    assert.equal(isWhitelistMatch('好。'), true, 'org A loaded');
+    assert.equal(loadWhitelist('/nonexistent/p.json').loaded, false);
+    assert.equal(isWhitelistMatch('好。'), true, 'org A whitelist must survive org B load failure');
+  });
+
   it('empty array clears whitelist', () => {
     const fp1 = writeWhitelist(['hello']);
     loadWhitelist(fp1);
@@ -192,29 +201,28 @@ describe('whitelist', () => {
     assert.equal(isWhitelistMatch('  好。  '), true);
   });
 
-  it('empty file clears whitelist (not preserved)', () => {
+  it('empty file preserves previous whitelist (fail-open, same as missing/broken)', () => {
     const fp1 = writeWhitelist(['hello']);
     loadWhitelist(fp1);
     assert.equal(isWhitelistMatch('hello'), true);
     const fp2 = path.join(tmpDir, 'empty.json');
     fs.writeFileSync(fp2, '');
     const r = loadWhitelist(fp2);
-    assert.equal(r.loaded, true);
-    assert.equal(r.reason, 'cleared');
-    assert.equal(r.count, 0);
-    assert.equal(isWhitelistMatch('hello'), false);
+    assert.equal(r.loaded, false, 'empty file is a parse failure, not a success');
+    assert.equal(r.preserved, true, 'previous whitelist preserved on parse failure');
+    assert.equal(isWhitelistMatch('hello'), true, 'old whitelist still active');
   });
 
-  it('whitespace-only file clears whitelist (not preserved)', () => {
+  it('whitespace-only file preserves previous whitelist (fail-open)', () => {
     const fp1 = writeWhitelist(['hello']);
     loadWhitelist(fp1);
     assert.equal(isWhitelistMatch('hello'), true);
     const fp2 = path.join(tmpDir, 'ws.json');
     fs.writeFileSync(fp2, '  \n  \n  ');
     const r = loadWhitelist(fp2);
-    assert.equal(r.loaded, true);
-    assert.equal(r.reason, 'cleared');
-    assert.equal(isWhitelistMatch('hello'), false);
+    assert.equal(r.loaded, false, 'whitespace-only file is a parse failure');
+    assert.equal(r.preserved, true);
+    assert.equal(isWhitelistMatch('hello'), true, 'old whitelist still active');
   });
 });
 
@@ -369,6 +377,21 @@ describe('isLikelyNonSubstantive', () => {
       parts: [],
     };
     assert.equal(isLikelyNonSubstantive(msg), true);
+  });
+
+  it('GAP-3: empty content is non-substantive (not a false recovery trigger)', () => {
+    const msg = { id: 'm1', sender_id: 's1', content: '', parts: [] };
+    assert.equal(isLikelyNonSubstantive(msg), true, 'empty content must be non-substantive');
+  });
+
+  it('GAP-3: whitespace-only content is non-substantive', () => {
+    const msg = { id: 'm1', sender_id: 's1', content: '   \n\t  ', parts: [] };
+    assert.equal(isLikelyNonSubstantive(msg), true, 'whitespace-only must be non-substantive');
+  });
+
+  it('GAP-3: undefined content is non-substantive', () => {
+    const msg = { id: 'm1', sender_id: 's1', parts: [] };
+    assert.equal(isLikelyNonSubstantive(msg), true, 'missing content field must be non-substantive');
   });
 });
 

@@ -402,11 +402,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         ? `[suppression-recovered${modeTag}] ${senderName} (${senderKey}) resumed substantive messages after ${count} suppressed in ${windowSec}s`
         : `[suppression-alert${modeTag}] ${count} consecutive non-substantive messages from ${senderName} (${senderKey}) in ${windowSec}s reason=${reason} — review suppression-log.jsonl`;
       if (!suppressionEnabled) {
-        console.log(`${lp} would-alert: ${msg}`);
-        return;
+        console.log(`${lp} would-alert (shadow): ${msg}`);
       }
       sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), msg, {
-        deliveryId: `hxa:${label}:suppression-${reasonTag.toLowerCase()}:${Date.now()}`,
+        deliveryId: `hxa:${label}:suppression-${suppressionEnabled ? '' : 'shadow-'}${reasonTag.toLowerCase()}:${Date.now()}`,
       }).catch(err => console.error(`${lp} suppression ${reasonTag.toLowerCase()} send failed: ${err.message}`));
     },
   });
