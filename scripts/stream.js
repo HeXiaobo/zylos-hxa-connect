@@ -56,6 +56,7 @@ async function main() {
     const mode = process.env.HXA_FINAL_DELIVERY_MODE === 'legacy' ? 'legacy' : 'canonical';
     const delivery = createHxaFinalDeliveryComposition({ adapter, legacyDelivery, mode });
     const input = JSON.parse(await readStdin());
+    console.log(`[hxa-connect] stream delivery mode=${mode} requestId=${input?.requestId ?? '(none)'}`);
     const result = mode === 'legacy' || !isCanonicalHxaDelivery(input)
       ? await legacyDelivery.deliver(input)
       : await delivery.deliver(input);

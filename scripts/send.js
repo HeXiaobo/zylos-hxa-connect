@@ -101,6 +101,12 @@ const client = new HxaConnectClient({
 });
 
 const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+// Make the invocation mode visible: when the runtime intends an assistant
+// response but no longer passes C4_ASSISTANT_REQUEST_ID, the streamed-reply
+// branch is silently skipped and this shows up as mode=explicit instead.
+console.log(assistantRequestId
+  ? `[hxa-connect] send mode=assistant-response requestId=${assistantRequestId} endpoint=${rawEndpoint}`
+  : `[hxa-connect] send mode=explicit endpoint=${rawEndpoint}`);
 if (assistantRequestId) {
   const store = new AssistantResponseDeliveryStore({
     directory: assistantResponseDir,
