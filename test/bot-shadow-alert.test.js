@@ -66,18 +66,46 @@ function findAlertFnRange(src) {
   return null;
 }
 
+function extractNormalized(src) {
+  const range = findAlertFnRange(src);
+  if (!range) return null;
+  const lines = src.split('\n').slice(range[0] - 1, range[1]);
+  const normalized = lines.join('\n').replace(/\s+/g, ' ').replace(/ +/g, ' ') + '\n';
+  return { range, normalized };
+}
+
 describe('alertFn drift detection (bot.js ↔ test replica)', () => {
   it('bot.js alertFn closure matches known hash — update replica if this fails', () => {
     const src = readFileSync(new URL('../src/bot.js', import.meta.url), 'utf-8');
-    const range = findAlertFnRange(src);
-    assert.ok(range, 'could not locate alertFn closure in bot.js — signature pattern not found');
-    const lines = src.split('\n').slice(range[0] - 1, range[1]);
-    const normalized = lines.join('\n').replace(/\s+/g, ' ').replace(/ +/g, ' ') + '\n';
-    const sha = createHash('sha256').update(normalized).digest('hex');
+    const result = extractNormalized(src);
+    assert.ok(result, 'could not locate alertFn closure in bot.js — signature pattern not found');
+    const sha = createHash('sha256').update(result.normalized).digest('hex');
     assert.equal(sha, ALERTFN_SHA,
-      `bot.js alertFn (L${range[0]}-${range[1]}) changed — ` +
+      `bot.js alertFn (L${result.range[0]}-${result.range[1]}) changed — ` +
       'this test replica is now stale. Read the new bot.js closure, update ' +
       'makeAlertFn() above and ALERTFN_SHA, then re-run.');
+  });
+
+  it('two-half control: mutating the closure changes the hash (positive)', () => {
+    const src = readFileSync(new URL('../src/bot.js', import.meta.url), 'utf-8');
+    const original = extractNormalized(src);
+    assert.ok(original, 'precondition: closure found');
+    const mutated = original.normalized.replace('suppression-alert', 'suppression-TAMPERED');
+    const sha = createHash('sha256').update(mutated).digest('hex');
+    assert.notEqual(sha, ALERTFN_SHA, 'mutated closure must produce a different hash');
+  });
+
+  it('two-half control: inserting a blank line above the closure keeps the hash (negative)', () => {
+    const src = readFileSync(new URL('../src/bot.js', import.meta.url), 'utf-8');
+    const original = extractNormalized(src);
+    assert.ok(original, 'precondition: closure found in original');
+    const lines = src.split('\n');
+    lines.splice(original.range[0] - 2, 0, '');
+    const shifted = lines.join('\n');
+    const result = extractNormalized(shifted);
+    assert.ok(result, 'closure must still be found after blank-line insertion');
+    const sha = createHash('sha256').update(result.normalized).digest('hex');
+    assert.equal(sha, ALERTFN_SHA, 'blank line above closure must not change the hash');
   });
 });
 

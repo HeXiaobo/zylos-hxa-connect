@@ -508,7 +508,7 @@ describe('SuppressionTracker', () => {
     });
   });
 
-  describe('GAP-3 early return: empty content produces zero alerts (Veda scenario)', () => {
+  describe('GAP-3 early return: empty content does not affect suppression state (Veda scenario)', () => {
     it('4 empty events after streak leave counter unchanged and fire no new alert', () => {
       const alerts = [];
       const tracker = makeTracker({
