@@ -46,6 +46,10 @@ export class SuppressionTracker {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
   }
 
+  get suppressAfter() { return this.#suppressAfter; }
+  get alertThreshold() { return this.#alertThreshold; }
+  get maxRepeatLength() { return this.#maxRepeatLength; }
+
   #validatePositive(value, name, fallback) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
       process.stderr.write(

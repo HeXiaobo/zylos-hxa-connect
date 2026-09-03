@@ -411,6 +411,8 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     },
   });
 
+  console.log(`${lp} Suppression config: suppressAfter=${suppressionTracker.suppressAfter} alertThreshold=${suppressionTracker.alertThreshold} maxRepeatLength=${suppressionTracker.maxRepeatLength}`);
+
   const whitelistPath = process.env.HXA_NOINFO_PATTERNS_FILE || path.join(DATA_DIR, 'known-noinfo-patterns.json');
   const wlResult = loadWhitelist(whitelistPath);
   console.log(`${lp} Whitelist ${wlResult.loaded ? `loaded (${wlResult.count} patterns)` : `not loaded: ${wlResult.reason}`} from ${whitelistPath}`);
