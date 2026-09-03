@@ -1,3 +1,7 @@
+// Caller contract: alertFn is called unconditionally when thresholds are met.
+// For shadow mode, the caller must supply an alertFn that self-silences (e.g.
+// logs to stdout instead of sending real alerts). The tracker does not check
+// suppressionEnabled — that gate lives in the caller (see bot.js alertFn closure).
 import fs from 'fs';
 import path from 'path';
 

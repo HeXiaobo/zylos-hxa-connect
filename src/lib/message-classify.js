@@ -32,7 +32,13 @@ export function loadWhitelist(filePath) {
       return { loaded: false, reason: 'file_not_found', count: 0, preserved: _whitelist !== null };
     }
     const raw = fs.readFileSync(filePath, 'utf-8');
-    const entries = JSON.parse(raw);
+    const trimmedRaw = raw.trim();
+    if (!trimmedRaw) {
+      _whitelist = null;
+      process.stderr.write(`[message-classify] whitelist cleared (empty file): ${filePath}\n`);
+      return { loaded: true, reason: 'cleared', count: 0 };
+    }
+    const entries = JSON.parse(trimmedRaw);
     if (!Array.isArray(entries)) {
       process.stderr.write(`[message-classify] WARN whitelist invalid (not an array): ${filePath} — preserving previous whitelist (fail-open)\n`);
       return { loaded: false, reason: 'invalid_format', count: 0, preserved: _whitelist !== null };

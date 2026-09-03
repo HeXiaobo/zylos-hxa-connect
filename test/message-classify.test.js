@@ -191,6 +191,31 @@ describe('whitelist', () => {
     loadWhitelist(fp);
     assert.equal(isWhitelistMatch('  好。  '), true);
   });
+
+  it('empty file clears whitelist (not preserved)', () => {
+    const fp1 = writeWhitelist(['hello']);
+    loadWhitelist(fp1);
+    assert.equal(isWhitelistMatch('hello'), true);
+    const fp2 = path.join(tmpDir, 'empty.json');
+    fs.writeFileSync(fp2, '');
+    const r = loadWhitelist(fp2);
+    assert.equal(r.loaded, true);
+    assert.equal(r.reason, 'cleared');
+    assert.equal(r.count, 0);
+    assert.equal(isWhitelistMatch('hello'), false);
+  });
+
+  it('whitespace-only file clears whitelist (not preserved)', () => {
+    const fp1 = writeWhitelist(['hello']);
+    loadWhitelist(fp1);
+    assert.equal(isWhitelistMatch('hello'), true);
+    const fp2 = path.join(tmpDir, 'ws.json');
+    fs.writeFileSync(fp2, '  \n  \n  ');
+    const r = loadWhitelist(fp2);
+    assert.equal(r.loaded, true);
+    assert.equal(r.reason, 'cleared');
+    assert.equal(isWhitelistMatch('hello'), false);
+  });
 });
 
 describe('isLikelyNonSubstantive', () => {

@@ -521,6 +521,35 @@ describe('SuppressionTracker', () => {
     });
   });
 
+  describe('empty-content guard (GAP-2: empty effectiveText must not trigger short_repeat)', () => {
+    it('two consecutive empty-content messages are not treated as short_repeat', () => {
+      const tracker = makeTracker();
+      const r1 = tracker.evaluate(msg('m1', ''));
+      assert.equal(r1.suppress, false, 'first empty-content message passes');
+      assert.equal(r1.reason, null);
+
+      const r2 = tracker.evaluate(msg('m2', ''));
+      assert.equal(r2.suppress, false, 'second empty-content message also passes — empty strings are not repeatable content');
+      assert.equal(r2.reason, null);
+    });
+
+    it('empty-content messages do not accumulate into suppression even after many sends', () => {
+      const tracker = makeTracker({ suppressAfter: 1 });
+      for (let i = 1; i <= 5; i++) {
+        const r = tracker.evaluate(msg(`m${i}`, ''));
+        assert.equal(r.suppress, false, `empty-content message #${i} must not be suppressed`);
+      }
+    });
+
+    it('whitespace-only messages are treated as empty (trimmed to empty string)', () => {
+      const tracker = makeTracker();
+      const r1 = tracker.evaluate(msg('m1', '   '));
+      assert.equal(r1.suppress, false);
+      const r2 = tracker.evaluate(msg('m2', '\t\n'));
+      assert.equal(r2.suppress, false, 'whitespace-only message not treated as repeat of prior whitespace');
+    });
+  });
+
   describe('repeatWindowMs (v9: freshness window for repeat detection)', () => {
     it('does not treat as repeat when gap exceeds repeatWindowMs', () => {
       const tracker = makeTracker({ repeatWindowMs: 100, windowMs: 3_600_000 });
