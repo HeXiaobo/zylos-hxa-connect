@@ -24,10 +24,13 @@ import {
 import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
 import { getMediaBaseDir, generateFilename } from './lib/media.js';
 import { getRuntimePaths } from './lib/config-path.js';
+import { SuppressionTracker } from './lib/suppression-tracker.js';
+import { effectiveText, isLikelyNonSubstantive, loadWhitelist } from './lib/message-classify.js';
 
 const {
   c4ReceivePath: C4_RECEIVE,
   c4SpoolDir: C4_SPOOL_DIR,
+  dataDir: DATA_DIR,
   dmInboxStatePath: DM_INBOX_STATE_PATH,
   dmPolicyRejectionDir: DM_POLICY_REJECTION_DIR,
 } = getRuntimePaths();
@@ -384,6 +387,34 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   const dmInFlight = new Map();
 
+  const suppressionEnabled = process.env.HXA_SUPPRESS_ENABLED === '1' || process.env.HXA_SUPPRESS_ENABLED === 'true';
+  console.log(`${lp} Suppression ${suppressionEnabled ? 'enabled' : 'disabled (default)'} via HXA_SUPPRESS_ENABLED=${process.env.HXA_SUPPRESS_ENABLED || '(unset)'}`);
+
+  const suppressionTracker = new SuppressionTracker({
+    logPath: path.join(DATA_DIR, 'suppression-log.jsonl'),
+    alertThreshold: 5,
+    suppressAfter: 1,
+    alertCooldownMs: 1_800_000,
+    alertFn: ({ senderKey, senderName, count, windowSec, reason }) => {
+      const reasonTag = reason === 'recovered' ? 'RECOVERED' : 'ALERT';
+      const modeTag = suppressionEnabled ? '' : ' [SHADOW]';
+      const msg = reason === 'recovered'
+        ? `[suppression-recovered${modeTag}] ${senderName} (${senderKey}) resumed substantive messages after ${count} suppressed in ${windowSec}s`
+        : `[suppression-alert${modeTag}] ${count} consecutive non-substantive messages from ${senderName} (${senderKey}) in ${windowSec}s reason=${reason} — review suppression-log.jsonl`;
+      if (!suppressionEnabled) {
+        console.log(`${lp} would-alert: ${msg}`);
+        return;
+      }
+      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), msg, {
+        deliveryId: `hxa:${label}:suppression-${reasonTag.toLowerCase()}:${Date.now()}`,
+      }).catch(err => console.error(`${lp} suppression ${reasonTag.toLowerCase()} send failed: ${err.message}`));
+    },
+  });
+
+  const whitelistPath = process.env.HXA_NOINFO_PATTERNS_FILE || path.join(DATA_DIR, 'known-noinfo-patterns.json');
+  const wlResult = loadWhitelist(whitelistPath);
+  console.log(`${lp} Whitelist ${wlResult.loaded ? `loaded (${wlResult.count} patterns)` : `not loaded: ${wlResult.reason}`} from ${whitelistPath}`);
+
   function normalizeDm(raw) {
     const message = raw?.message || raw || {};
     return {
@@ -421,6 +452,22 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         return policyResult;
       }
 
+      const msgText = effectiveText(message);
+      const nonSubstantive = isLikelyNonSubstantive(message);
+      const { suppress, consecutiveCount, reason } = suppressionTracker.evaluate({
+        messageId: message.id, senderId: message.sender_id,
+        senderName: sender, orgLabel: label,
+        content: msgText, context: 'dm', nonSubstantive,
+      });
+      if (suppress && suppressionEnabled) {
+        suppressionTracker.persistSuppressed(message, { context: 'dm', orgLabel: label, source, effectiveText: msgText, reason });
+        console.log(`${lp} DM suppressed id=${message.id} source=${source} sender=${sender} reason=${reason} count=${consecutiveCount}`);
+        return { action: 'suppressed', reason: reason || 'unknown', consecutiveCount };
+      } else if (suppress) {
+        suppressionTracker.persistSuppressed(message, { context: 'dm', orgLabel: label, source, effectiveText: msgText, reason });
+        console.log(`${lp} DM would-suppress id=${message.id} source=${source} sender=${sender} reason=${reason} (shadow mode)`);
+      }
+
       const rlKey = `${label}:dm:${message.sender_id || sender}`;
       if (!getRateLimiter(rlKey).consume()) {
         console.warn(`${lp} DM deferred id=${message.id} source=${source} sender=${sender} reason=rate_limit`);
@@ -434,7 +481,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         return { action: 'discarded', reason: 'content_too_large' };
       }
 
-      console.log(`${lp} DM from ${sender} id=${message.id} source=${source}: ${message.content.substring(0, 80)}`);
+      console.log(`${lp} DM from ${sender} id=${message.id} source=${source}: ${msgText.substring(0, 80)}`);
       const formatted = `[${dp} DM] ${sender} said: ${message.content}${attachments}`;
       const queued = await sendToC4(C4_CHANNEL, dmResponseEndpoint(label, sender, message.id, {
         multiOrg: isMultiOrg,
@@ -545,6 +592,30 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         return;
       }
 
+      const hasCurrentMessage = !!message.id;
+
+      if (hasCurrentMessage && isInteractiveDelivery) {
+        console.log(`${lp} Thread msg fields: ${Object.keys(message).join(',')}`);
+      }
+
+      if (hasCurrentMessage && isInteractiveDelivery) {
+        const threadMsgText = effectiveText(message);
+        const threadNonSubstantive = isLikelyNonSubstantive(message);
+        const { suppress, consecutiveCount, reason: suppressReason } = suppressionTracker.evaluate({
+          messageId: message.id, senderId: message.sender_id,
+          senderName: sender, orgLabel: label,
+          content: threadMsgText, context: `thread:${threadId}`, nonSubstantive: threadNonSubstantive,
+        });
+        if (suppress && suppressionEnabled) {
+          suppressionTracker.persistSuppressed(message, { context: `thread:${threadId}`, orgLabel: label, source: 'thread', effectiveText: threadMsgText, reason: suppressReason });
+          console.log(`${lp} Thread ${threadId} from ${sender} suppressed reason=${suppressReason} count=${consecutiveCount}`);
+          return;
+        } else if (suppress) {
+          suppressionTracker.persistSuppressed(message, { context: `thread:${threadId}`, orgLabel: label, source: 'thread', effectiveText: threadMsgText, reason: suppressReason });
+          console.log(`${lp} Thread ${threadId} from ${sender} would-suppress reason=${suppressReason} count=${consecutiveCount} (shadow mode)`);
+        }
+      }
+
       if (isInteractiveDelivery) {
         const rlKey = `${label}:thread:${message.sender_id || sender}`;
         if (!getRateLimiter(rlKey).consume()) {
@@ -563,7 +634,6 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
 
       const lifecycleBlock = buildLifecycleBlock(snapshot);
-      const hasCurrentMessage = !!message.id;
 
       // Build C4 message with XML tags (consistent with Lark/TG format)
       const parts = [
