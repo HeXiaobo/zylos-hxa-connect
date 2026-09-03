@@ -4,6 +4,7 @@ const KNOWN_PART_TYPES = new Set(['text', 'markdown', 'image', 'file', 'link', '
 const KNOWN_MSG_FIELDS = new Set([
   'id', 'channel_id', 'sender_id', 'sender_name', 'content', 'content_type',
   'parts', 'metadata', 'created_at', 'reply_to_message', 'mention_all',
+  'thread_id', 'org_id',
 ]);
 
 const PURE_PUNCTUATION_RE = /^[\p{P}\p{S}\s]+$/u;
@@ -40,7 +41,8 @@ export function loadWhitelist(filePath) {
       process.stderr.write(`[message-classify] whitelist cleared (empty array): ${filePath}\n`);
       return { loaded: true, reason: 'cleared', count: 0 };
     }
-    _whitelist = new Set(entries.map(e => String(e).trim()));
+    const parsed = new Set(entries.map(e => String(e).trim()));
+    _whitelist = parsed;
     return { loaded: true, count: _whitelist.size };
   } catch (err) {
     process.stderr.write(`[message-classify] WARN whitelist load failed: ${err.message} — whitelist matching disabled (fail-open)\n`);
@@ -61,7 +63,7 @@ export function isPurePunctuation(text) {
 
 export function isLikelyNonSubstantive(message) {
   for (const key of Object.keys(message)) {
-    if (!KNOWN_MSG_FIELDS.has(key) && message[key] != null) return false;
+    if (!KNOWN_MSG_FIELDS.has(key) && message[key] !== undefined) return false;
   }
   if (message.parts?.some(p => ['image', 'file', 'link'].includes(p.type))) return false;
   if (message.parts?.some(p => !KNOWN_PART_TYPES.has(p.type))) return false;

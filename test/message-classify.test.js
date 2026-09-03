@@ -279,12 +279,12 @@ describe('isLikelyNonSubstantive', () => {
     assert.equal(isLikelyNonSubstantive(msg), false);
   });
 
-  it('ignores null-valued unknown fields', () => {
+  it('rejects null-valued unknown fields (fail-open)', () => {
     const msg = {
       id: 'm1', sender_id: 's1', content: '好。',
       parts: [], extra_field: null,
     };
-    assert.equal(isLikelyNonSubstantive(msg), true);
+    assert.equal(isLikelyNonSubstantive(msg), false);
   });
 
   it('ignores undefined-valued unknown fields', () => {
@@ -332,14 +332,15 @@ describe('isLikelyNonSubstantive', () => {
 });
 
 describe('KNOWN_MSG_FIELDS coverage', () => {
-  it('includes all 11 expected fields', () => {
+  it('includes all 13 expected fields', () => {
     const expected = [
       'id', 'channel_id', 'sender_id', 'sender_name', 'content', 'content_type',
       'parts', 'metadata', 'created_at', 'reply_to_message', 'mention_all',
+      'thread_id', 'org_id',
     ];
     for (const f of expected) {
       assert.ok(KNOWN_MSG_FIELDS.has(f), `missing field: ${f}`);
     }
-    assert.equal(KNOWN_MSG_FIELDS.size, 11);
+    assert.equal(KNOWN_MSG_FIELDS.size, 13);
   });
 });
