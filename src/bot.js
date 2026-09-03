@@ -414,7 +414,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   const whitelistPath = process.env.HXA_NOINFO_PATTERNS_FILE || path.join(DATA_DIR, 'known-noinfo-patterns.json');
   const wlResult = loadWhitelist(whitelistPath);
-  console.log(`${lp} Whitelist ${wlResult.loaded ? `loaded (${wlResult.count} patterns)` : `not loaded: ${wlResult.reason}`} from ${whitelistPath}`);
+  const wlStatus = wlResult.loaded
+    ? (wlResult.reason === 'cleared' ? 'cleared (empty array — matching disabled)' : `loaded (${wlResult.count} patterns)`)
+    : `not loaded: ${wlResult.reason}`;
+  console.log(`${lp} Whitelist ${wlStatus} from ${whitelistPath}`);
 
   function normalizeDm(raw) {
     const message = raw?.message || raw || {};
