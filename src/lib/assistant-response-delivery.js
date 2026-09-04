@@ -577,3 +577,18 @@ export function createAssistantResponseDelivery(options = {}) {
     },
   });
 }
+
+export const FINAL_DELIVERY_MODES = Object.freeze(['off', 'legacy', 'canonical']);
+
+/**
+ * Resolves the terminal auto-delivery mode. 'off' (the default) never sends
+ * assistant terminal events to the Hub: the stream adapter consumes the
+ * events and exits successfully so the supervisor acknowledges them and core
+ * records the terminal request state, while every outbound message must come
+ * from an explicit `c4-send --request-id` invocation. 'canonical' and
+ * 'legacy' restore automatic delivery from terminal events.
+ */
+export function resolveFinalDeliveryMode(env = process.env) {
+  const raw = env.HXA_FINAL_DELIVERY_MODE;
+  return FINAL_DELIVERY_MODES.includes(raw) ? raw : 'off';
+}

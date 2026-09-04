@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- Assistant terminal auto-delivery is now disabled by default
+  (`HXA_FINAL_DELIVERY_MODE=off`): the stream adapter consumes terminal
+  events, exits successfully so core records the request state, and never
+  initializes a Hub transport — outbound assistant replies must go through
+  explicit `c4-send --request-id`. Set the mode to `canonical` or `legacy`
+  to restore automatic delivery.
+- Skip the startup delivery-staleness self-check while auto-delivery is
+  disabled, since a quiet delivery ledger is expected in that mode.
+
 ## [1.7.9] - 2026-09-02
 
 ### Added

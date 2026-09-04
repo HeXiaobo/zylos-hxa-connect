@@ -22,7 +22,7 @@ import {
   createDmPolicyRejectionHandler,
   requireCurrentNoticeSecret,
 } from './lib/dm-policy-rejection.js';
-import { dmResponseEndpoint } from './lib/assistant-response-delivery.js';
+import { dmResponseEndpoint, resolveFinalDeliveryMode } from './lib/assistant-response-delivery.js';
 import { newestDeliveryAgeMs } from './lib/delivery-health.js';
 import { getMediaBaseDir, generateFilename } from './lib/media.js';
 import { getRuntimePaths } from './lib/config-path.js';
@@ -58,22 +58,26 @@ try {
 
 // Startup self-check: surface a stale assistant-response delivery store.
 // A store that stops receiving writes is the first sign of streamed-reply
-// delivery silently stopping (issue #26). This is diagnostic only and must
-// never take the service down.
+// delivery silently stopping (issue #26). With terminal auto-delivery off
+// (the default) a quiet ledger is expected, so the check is skipped. This
+// is diagnostic only and must never take the service down.
 const ASSISTANT_DELIVERY_STALE_WARN_MS = 60 * 60 * 1000; // 1 hour
-try {
-  const deliveryHealth = newestDeliveryAgeMs({ directory: ASSISTANT_RESPONSE_DIR });
-  if (deliveryHealth.hasRecords && deliveryHealth.ageMs > ASSISTANT_DELIVERY_STALE_WARN_MS) {
-    console.warn(
-      `[hxa-connect] Assistant-response delivery store is stale: newest record is ` +
-      `${Math.round(deliveryHealth.ageMs / 60_000)} minutes old. ` +
-      'If outbound assistant replies are expected, verify C4_ASSISTANT_REQUEST_ID is still being passed ' +
-      'to scripts/send.js and scripts/stream.js is still being invoked.',
-    );
+if (resolveFinalDeliveryMode(process.env) !== 'off') {
+  try {
+    const deliveryHealth = newestDeliveryAgeMs({ directory: ASSISTANT_RESPONSE_DIR });
+    if (deliveryHealth.hasRecords && deliveryHealth.ageMs > ASSISTANT_DELIVERY_STALE_WARN_MS) {
+      console.warn(
+        `[hxa-connect] Assistant-response delivery store is stale: newest record is ` +
+        `${Math.round(deliveryHealth.ageMs / 60_000)} minutes old. ` +
+        'If outbound assistant replies are expected, verify C4_ASSISTANT_REQUEST_ID is still being passed ' +
+        'to scripts/send.js and scripts/stream.js is still being invoked.',
+      );
+    }
+  } catch (error) {
+    console.warn(`[hxa-connect] Assistant-response delivery health check failed: ${error.message}`);
   }
-} catch (error) {
-  console.warn(`[hxa-connect] Assistant-response delivery health check failed: ${error.message}`);
 }
+
 const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
   && configuredDmReconcileInterval >= 5_000
   ? configuredDmReconcileInterval
