@@ -26,6 +26,7 @@ import { getMediaBaseDir, generateFilename } from './lib/media.js';
 import { getRuntimePaths } from './lib/config-path.js';
 import { SuppressionTracker } from './lib/suppression-tracker.js';
 import { effectiveText, isLikelyNonSubstantive, loadWhitelist } from './lib/message-classify.js';
+import { createAlertFn } from './lib/create-alert-fn.js';
 
 const {
   c4ReceivePath: C4_RECEIVE,
@@ -395,19 +396,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     alertThreshold: 5,
     suppressAfter: 1,
     alertCooldownMs: 1_800_000,
-    alertFn: ({ senderKey, senderName, count, windowSec, reason }) => {
-      const reasonTag = reason === 'recovered' ? 'RECOVERED' : 'ALERT';
-      const modeTag = suppressionEnabled ? '' : ' [SHADOW]';
-      const msg = reason === 'recovered'
-        ? `[suppression-recovered${modeTag}] ${senderName} (${senderKey}) resumed substantive messages after ${count} suppressed in ${windowSec}s`
-        : `[suppression-alert${modeTag}] ${count} consecutive non-substantive messages from ${senderName} (${senderKey}) in ${windowSec}s reason=${reason} — review suppression-log.jsonl`;
-      if (!suppressionEnabled) {
-        console.log(`${lp} would-alert (shadow): ${msg}`);
-      }
-      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), msg, {
-        deliveryId: `hxa:${label}:suppression-${suppressionEnabled ? '' : 'shadow-'}${reasonTag.toLowerCase()}:${Date.now()}`,
-      }).catch(err => console.error(`${lp} suppression ${reasonTag.toLowerCase()} send failed: ${err.message}`));
-    },
+    alertFn: createAlertFn({ suppressionEnabled, sendToC4, c4Endpoint, label, C4_CHANNEL, lp }),
   });
 
   console.log(`${lp} Suppression config: suppressAfter=${suppressionTracker.suppressAfter} alertThreshold=${suppressionTracker.alertThreshold} maxRepeatLength=${suppressionTracker.maxRepeatLength} windowMs=${suppressionTracker.windowMs}`);
