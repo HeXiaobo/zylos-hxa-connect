@@ -399,7 +399,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     alertFn: createAlertFn({ suppressionEnabled, sendToC4, c4Endpoint, label, C4_CHANNEL, lp }),
   });
 
-  console.log(`${lp} Suppression config: suppressAfter=${suppressionTracker.suppressAfter} alertThreshold=${suppressionTracker.alertThreshold} maxRepeatLength=${suppressionTracker.maxRepeatLength} windowMs=${suppressionTracker.windowMs}`);
+  console.log(`${lp} Suppression config: suppressAfter=${suppressionTracker.suppressAfter} alertThreshold=${suppressionTracker.alertThreshold} maxRepeatLength=${suppressionTracker.maxRepeatLength} windowMs=${suppressionTracker.windowMs} maxLifetimeMs=${suppressionTracker.maxLifetimeMs}`);
 
   const whitelistPath = process.env.HXA_NOINFO_PATTERNS_FILE || path.join(DATA_DIR, 'known-noinfo-patterns.json');
   const wlResult = loadWhitelist(whitelistPath);
