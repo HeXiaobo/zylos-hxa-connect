@@ -6,6 +6,7 @@ import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseDelivery,
+  resolveFinalDeliveryMode,
 } from '../src/lib/assistant-response-delivery.js';
 import { createHxaFinalDeliveryAdapter } from '../src/lib/hxa-final-delivery-adapter.js';
 import {
@@ -25,6 +26,19 @@ function readStdin() {
 
 async function main() {
   try {
+    const mode = resolveFinalDeliveryMode(process.env);
+    const input = JSON.parse(await readStdin());
+    console.error(`[hxa-connect] stream delivery mode=${mode} requestId=${input?.requestId ?? '(none)'}`);
+
+    // 'off' (default): the component never auto-delivers terminal events.
+    // Consume the stream and exit successfully so the supervisor acknowledges
+    // the deliveries and core records the terminal request state; every
+    // outbound message must come from an explicit c4-send invocation instead.
+    if (mode === 'off') {
+      process.stdout.write(`${JSON.stringify({ ok: true, mode, status: 'suppressed' })}\n`);
+      return;
+    }
+
     await setupFetchProxy();
     const resolved = resolveOrgs(migrateConfig());
     const { assistantResponseDir } = getRuntimePaths();
@@ -53,9 +67,7 @@ async function main() {
     });
     const legacyDelivery = createAssistantResponseDelivery({ store, resolveOrg, defaultOrgLabel });
     const adapter = createHxaFinalDeliveryAdapter({ store, resolveOrg, defaultOrgLabel });
-    const mode = process.env.HXA_FINAL_DELIVERY_MODE === 'legacy' ? 'legacy' : 'canonical';
     const delivery = createHxaFinalDeliveryComposition({ adapter, legacyDelivery, mode });
-    const input = JSON.parse(await readStdin());
     const result = mode === 'legacy' || !isCanonicalHxaDelivery(input)
       ? await legacyDelivery.deliver(input)
       : await delivery.deliver(input);

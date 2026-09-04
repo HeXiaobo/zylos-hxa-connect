@@ -29,7 +29,7 @@ function requireText(value, field) {
   return value;
 }
 
-function requireCurrentNoticeSecret(value) {
+export function requireCurrentNoticeSecret(value) {
   try {
     return requireText(value, 'HXA_DM_POLICY_NOTICE_SECRET');
   } catch {
