@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.7.10] - 2026-09-04
 
 ### Changed
 - Assistant terminal auto-delivery is now disabled by default
