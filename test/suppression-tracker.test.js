@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
@@ -17,6 +17,7 @@ function makeTracker(opts = {}) {
     repeatWindowMs: opts.repeatWindowMs ?? 1_800_000,
     alertCooldownMs: opts.alertCooldownMs ?? 1_800_000,
     maxRepeatLength: opts.maxRepeatLength ?? 50,
+    maxLifetimeMs: opts.maxLifetimeMs ?? 4 * (opts.windowMs ?? 3_600_000),
     alertFn: opts.alertFn ?? null,
   });
 }
@@ -617,6 +618,107 @@ describe('SuppressionTracker', () => {
       for (let i = 0; i < 150; i++) {
         tracker.evaluate(msg(`m${i}`, `content-${i}`, { senderId: `sender-${i % 10}` }));
       }
+    });
+  });
+
+  describe('max-lifetime hard cap (firstAt expiry)', () => {
+    it('resets counter when maxLifetimeMs exceeded even with recent activity', () => {
+      let now = 10_000;
+      mock.method(Date, 'now', () => now);
+      try {
+        const tracker = makeTracker({ windowMs: 5000, maxLifetimeMs: 10_000 });
+        tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+        const r1 = tracker.evaluate(msg('m2', '好。', { nonSubstantive: true }));
+        assert.equal(r1.suppress, true, 'suppressed within window');
+        assert.equal(r1.consecutiveCount, 2);
+
+        now = 14_000;
+        const r2 = tracker.evaluate(msg('m3', '好。', { nonSubstantive: true }));
+        assert.equal(r2.suppress, true, 'still within lastAt window and lifetime');
+        assert.equal(r2.consecutiveCount, 3);
+
+        now = 18_000;
+        const r3 = tracker.evaluate(msg('m4', '好。', { nonSubstantive: true }));
+        assert.equal(r3.suppress, true, 'still within lastAt window and lifetime (4s gap < 5s)');
+
+        now = 20_001;
+        const r4 = tracker.evaluate(msg('m5', '好。', { nonSubstantive: true }));
+        assert.equal(r4.consecutiveCount, 1, 'counter reset after lifetime exceeded (2.001s gap < 5s silence, but 10.001s > 10s lifetime)');
+        assert.equal(r4.suppress, false, 'first message in new window is not suppressed');
+      } finally {
+        mock.restoreAll();
+      }
+    });
+
+    it('fires recovery alert on lifetime expiry if messages were suppressed', () => {
+      let now = 10_000;
+      mock.method(Date, 'now', () => now);
+      const alerts = [];
+      try {
+        const tracker = makeTracker({
+          windowMs: 5000,
+          maxLifetimeMs: 10_000,
+          alertFn: (a) => alerts.push(a),
+        });
+        tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+        tracker.evaluate(msg('m2', '好。', { nonSubstantive: true }));
+        assert.equal(alerts.length, 0, 'no alert yet');
+
+        now = 20_001;
+        tracker.evaluate(msg('m3', '好。', { nonSubstantive: true }));
+        assert.equal(alerts.length, 1, 'recovery alert fired on lifetime reset');
+        assert.equal(alerts[0].reason, 'recovered');
+      } finally {
+        mock.restoreAll();
+      }
+    });
+
+    it('does not fire recovery alert on lifetime expiry if nothing was suppressed', () => {
+      let now = 10_000;
+      mock.method(Date, 'now', () => now);
+      const alerts = [];
+      try {
+        const tracker = makeTracker({
+          windowMs: 5000,
+          maxLifetimeMs: 10_000,
+          alertFn: (a) => alerts.push(a),
+        });
+        tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+
+        now = 20_001;
+        tracker.evaluate(msg('m2', '好。', { nonSubstantive: true }));
+        assert.equal(alerts.length, 0, 'no recovery alert when nothing was suppressed');
+      } finally {
+        mock.restoreAll();
+      }
+    });
+
+    it('silence timeout still works when lifetime has not expired', () => {
+      let now = 10_000;
+      mock.method(Date, 'now', () => now);
+      try {
+        const tracker = makeTracker({ windowMs: 3000, maxLifetimeMs: 20_000 });
+        tracker.evaluate(msg('m1', '好。', { nonSubstantive: true }));
+        const r1 = tracker.evaluate(msg('m2', '好。', { nonSubstantive: true }));
+        assert.equal(r1.suppress, true);
+
+        now = 14_000;
+        const r2 = tracker.evaluate(msg('m3', '好。', { nonSubstantive: true }));
+        assert.equal(r2.consecutiveCount, 1, 'reset by silence timeout, not lifetime');
+        assert.equal(r2.suppress, false);
+      } finally {
+        mock.restoreAll();
+      }
+    });
+
+    it('exposes maxLifetimeMs getter', () => {
+      const tracker = makeTracker({ maxLifetimeMs: 7200_000 });
+      assert.equal(tracker.maxLifetimeMs, 7200_000);
+    });
+
+    it('defaults maxLifetimeMs to 4x windowMs', () => {
+      const tracker = makeTracker({ windowMs: 1000 });
+      assert.equal(tracker.maxLifetimeMs, 4000);
     });
   });
 });

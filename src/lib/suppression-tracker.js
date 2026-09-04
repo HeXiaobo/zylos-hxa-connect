@@ -11,6 +11,7 @@ const DEFAULT_WINDOW_MS = 3_600_000;
 const DEFAULT_REPEAT_WINDOW_MS = 1_800_000;
 const DEFAULT_ALERT_COOLDOWN_MS = 1_800_000;
 const DEFAULT_MAX_REPEAT_LENGTH = 50;
+const DEFAULT_MAX_LIFETIME_MS = 4 * DEFAULT_WINDOW_MS;
 const SWEEP_INTERVAL = 100;
 
 export class SuppressionTracker {
@@ -23,6 +24,7 @@ export class SuppressionTracker {
   #repeatWindowMs;
   #alertCooldownMs;
   #maxRepeatLength;
+  #maxLifetimeMs;
   #counters = new Map();
   #lastAlertAt = new Map();
   #evaluateCount = 0;
@@ -37,6 +39,7 @@ export class SuppressionTracker {
     repeatWindowMs = DEFAULT_REPEAT_WINDOW_MS,
     alertCooldownMs = DEFAULT_ALERT_COOLDOWN_MS,
     maxRepeatLength = DEFAULT_MAX_REPEAT_LENGTH,
+    maxLifetimeMs = DEFAULT_MAX_LIFETIME_MS,
   }) {
     this.#logPath = logPath;
     this.#suppressedLogPath = suppressedLogPath || path.join(path.dirname(logPath), 'suppressed-messages.jsonl');
@@ -47,6 +50,7 @@ export class SuppressionTracker {
     this.#repeatWindowMs = this.#validatePositive(repeatWindowMs, 'repeatWindowMs', DEFAULT_REPEAT_WINDOW_MS);
     this.#alertCooldownMs = alertCooldownMs;
     this.#maxRepeatLength = this.#validatePositive(maxRepeatLength, 'maxRepeatLength', DEFAULT_MAX_REPEAT_LENGTH);
+    this.#maxLifetimeMs = this.#validatePositive(maxLifetimeMs, 'maxLifetimeMs', DEFAULT_MAX_LIFETIME_MS);
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
   }
 
@@ -54,6 +58,7 @@ export class SuppressionTracker {
   get alertThreshold() { return this.#alertThreshold; }
   get maxRepeatLength() { return this.#maxRepeatLength; }
   get windowMs() { return this.#windowMs; }
+  get maxLifetimeMs() { return this.#maxLifetimeMs; }
 
   #validatePositive(value, name, fallback) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -87,7 +92,12 @@ export class SuppressionTracker {
     const trimmedContent = (content || '').trim();
 
     let counter = this.#counters.get(senderKey);
-    if (!counter || (now - counter.lastAt) > this.#windowMs) {
+    const silenceExpired = counter && (now - counter.lastAt) > this.#windowMs;
+    const lifetimeExpired = counter && (now - counter.firstAt) > this.#maxLifetimeMs;
+    if (!counter || silenceExpired || lifetimeExpired) {
+      if (lifetimeExpired && counter?.suppressedCount > 0) {
+        this.#fireRecoveryAlert(senderKey, senderName, counter, now);
+      }
       counter = { count: 0, suppressedCount: 0, firstAt: now, lastAt: now, lastContent: null };
     }
 
@@ -189,7 +199,7 @@ export class SuppressionTracker {
 
   #sweepStale(now) {
     for (const [key, counter] of this.#counters) {
-      if ((now - counter.lastAt) > this.#windowMs) {
+      if ((now - counter.lastAt) > this.#windowMs || (now - counter.firstAt) > this.#maxLifetimeMs) {
         this.#counters.delete(key);
         this.#lastAlertAt.delete(key);
       }
