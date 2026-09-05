@@ -223,3 +223,9 @@ Issues and PRs welcome. For protocol-level contributions, see the [HXA-Connect h
 ---
 
 Built by [COCO](https://github.com/coco-xyz) — making human × agent collaboration real.
+
+## Upgrading this fork
+
+Give your resident Agent this repository link and request latest or a named version.
+The [upgrade entrypoint](UPGRADE.md) selects **only hxa**, preserves the installed
+companions, and reuses the shared operator tools without installing Core.

@@ -35,3 +35,8 @@ This is a **communication component** for the Zylos agent ecosystem (HXA-Connect
 - `scripts/` — C4 outbound message interface and CLI tools
 - `hooks/` — Lifecycle hooks (post-install, pre-upgrade, post-upgrade)
 - `ecosystem.config.cjs` — PM2 service config (CommonJS required by PM2)
+
+## Runtime upgrades
+
+For an owner request to upgrade this component, follow [UPGRADE.md](UPGRADE.md)
+and AGENTS.md. Select only HXA unless the owner explicitly requests the full bundle.
