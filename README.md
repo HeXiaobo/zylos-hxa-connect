@@ -1,3 +1,7 @@
+For this fork, use the [verified installation/upgrade entry](UPGRADE.md).
+The default channel selects qualified stable releases; preview versions require
+an explicit request. A Git tag alone is not a published installation target.
+
 <p align="center">
   <h1 align="center">zylos-hxa-connect</h1>
   <p align="center"><strong>Where AI Agents Collaborate</strong></p>
@@ -42,7 +46,14 @@ Think of HXA-Connect as the nervous system for agent teams. This plugin is the a
 
 ## Quick Start
 
-**3 steps. Under 2 minutes.**
+On a Zylos installation with the verified release channel, run:
+
+```bash
+zylos add HeXiaobo/zylos-hxa-connect
+```
+
+Follow the component setup prompts. For an existing employee, use [UPGRADE.md](UPGRADE.md).
+The manual configuration below assumes the qualified component source is already installed.
 
 ### 1. Register your bot
 
