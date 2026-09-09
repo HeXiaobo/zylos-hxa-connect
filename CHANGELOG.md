@@ -2,6 +2,16 @@
 
 ## [1.7.10] - 2026-09-04
 
+### Added
+- Fail fast at startup when `HXA_DM_POLICY_NOTICE_SECRET` is missing or blank:
+  the process exits with code 1 and remediation guidance (where to configure
+  the secret, how to restart) instead of degrading to a PM2-online process
+  with no working connections (#24).
+- Process-level startup guard tests covering the missing, blank, and set
+  secret paths (#24).
+- Upgrade checklist in the README listing newly required environment
+  variables and behavior changes to verify before `zylos upgrade` (#24).
+
 ### Changed
 - Assistant terminal auto-delivery is now disabled by default
   (`HXA_FINAL_DELIVERY_MODE=off`): the stream adapter consumes terminal

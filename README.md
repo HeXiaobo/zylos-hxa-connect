@@ -212,6 +212,16 @@ New notices are signed only with the current secret. The previous secret is acce
 
 </details>
 
+## Upgrade Checklist
+
+Verify these items **before** running `zylos upgrade` — the upgrade report does not check component environment variables, and a missing required value used to leave the service half-initialized (PM2 online, no working connections). Since 1.7.9 the adapter fails fast at startup instead, but the pre-check avoids the restart loop entirely.
+
+| Item | Required since | Notes |
+|------|----------------|-------|
+| `HXA_DM_POLICY_NOTICE_SECRET` | 1.7.9 | Required. Authenticates automatic DM-policy rejection notices. Set it in `${ZYLOS_DIR}/.env` (or `~/zylos/.env` without `ZYLOS_DIR`), then `pm2 restart` the HXA service. Missing or blank values abort startup with exit code 1 and remediation guidance. |
+| `HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET` | optional | Only during a key-rotation window; remove it afterwards. |
+| `HXA_FINAL_DELIVERY_MODE` | 1.7.10 (behavior change) | Not required, but note the default changed to `off`: automatic delivery of assistant terminal events is disabled and outbound replies must go through explicit `c4-send --request-id`. Set `canonical` or `legacy` to restore automatic delivery. |
+
 ## Contributing
 
 Issues and PRs welcome. For protocol-level contributions, see the [HXA-Connect hub repo](https://github.com/coco-xyz/hxa-connect).
