@@ -62,6 +62,13 @@ describe('HXA current reply behavior characterization', () => {
     assert.equal(characterization.baselineSha, 'c99baa9215bad3136d62c4688ba115b927b404a2');
     assert.equal(characterization.packageVersion, '1.7.8');
     assert.equal(characterization.officialPeer.verified, false);
+    // The 1.7.8 baseline documented the old "处理完成。" rewrite that kept
+    // bot-to-bot DM pairs looping; issue #20 supersedes it with durable
+    // silence, asserted in the tests below.
+    assert.equal(
+      characterization.currentSemantics.emptyOutputBehavior,
+      'empty RunCompleted output is replaced with 处理完成。',
+    );
     assert.deepEqual(characterization.assets.map(asset => asset.name), [
       'AssistantResponseDeliveryStore',
       'C4DeliveryQueue',
@@ -92,7 +99,7 @@ describe('HXA current reply behavior characterization', () => {
     assert.deepEqual(await fs.promises.readdir(directory).catch(() => []), []);
   });
 
-  it('rejects blank and invisible legacy RunCompleted output without manufacturing success', async () => {
+  it('suppresses blank and invisible legacy RunCompleted output as durable silence (#20)', async () => {
     const directory = await tempDir('hxa-empty-output-');
     const sent = [];
     const adapter = createAssistantResponseDelivery({
@@ -109,19 +116,23 @@ describe('HXA current reply behavior characterization', () => {
         },
       }),
       defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
     });
 
-    for (const output of ['   ', '\u200B\u200C\u200D\u2060\uFEFF']) {
-      await assert.rejects(
-        adapter.deliver(legacyDelivery({
-          requestId: `hxa.dm.empty-${output.length}`,
-          payload: { output },
-        })),
-        error => error.code === 'MISSING_OUTPUT',
-      );
+    for (const [index, output] of ['', '   ', '\u200B\u200C\u200D\u2060\uFEFF'].entries()) {
+      const result = await adapter.deliver(legacyDelivery({
+        requestId: `hxa.dm.empty-${index}`,
+        payload: { output },
+      }));
+      assert.deepEqual(result, {
+        handled: true,
+        replayed: false,
+        status: 'suppressed',
+        terminal: true,
+        eventType: 'RunCompleted',
+      });
     }
-    assert.deepEqual(sent, []);
-    assert.equal(characterization.currentSemantics.emptyOutputBehavior, 'empty RunCompleted output is replaced with 处理完成。');
+    assert.deepEqual(sent, [], 'silence must never be converted into an outbound message');
   });
 
   it('fails closed when the same request-derived delivery identity is replayed with different content', async () => {

@@ -23,6 +23,7 @@ import {
   requireCurrentNoticeSecret,
 } from './lib/dm-policy-rejection.js';
 import { dmResponseEndpoint, resolveFinalDeliveryMode } from './lib/assistant-response-delivery.js';
+import { SMART_MODE_SKIP_HINT, buildDmPromptContent } from './lib/prompt-hints.js';
 import { newestDeliveryAgeMs } from './lib/delivery-health.js';
 import { getMediaBaseDir, generateFilename } from './lib/media.js';
 import { getRuntimePaths } from './lib/config-path.js';
@@ -475,7 +476,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
 
       console.log(`${lp} DM from ${sender} id=${message.id} source=${source}: ${message.content.substring(0, 80)}`);
-      const formatted = `[${dp} DM] ${sender} said: ${message.content}${attachments}`;
+      // The smart-mode [SKIP] hint leads every DM prompt (issue #20 cause 1):
+      // a DM turn has no mention gating and no per-thread mode surface, so
+      // silence is only possible when the agent knows the sentinel exists.
+      const formatted = buildDmPromptContent({
+        displayPrefix: dp,
+        sender,
+        content: message.content,
+        attachments,
+      });
       const queued = await sendToC4(C4_CHANNEL, dmResponseEndpoint(label, sender, message.id, {
         multiOrg: isMultiOrg,
       }), formatted, {
@@ -624,9 +633,12 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
       if (lifecycleBlock) parts.push(lifecycleBlock);
 
-      // Smart mode hint
+      // Smart-mode hint. On DMs it is always injected: a DM turn has no
+      // mention gating and no per-thread mode surface, so the [SKIP] sentinel
+      // is the only way an agent can keep a bot-to-bot DM exchange from
+      // looping — it must be told the sentinel exists (issue #20).
       if (isInteractiveDelivery && !isRealMention && perThreadMode === 'smart') {
-        parts.push('<smart-mode>\nDecide whether to respond. Reply with exactly [SKIP] when a response is unnecessary.\n</smart-mode>\n\n');
+        parts.push(SMART_MODE_SKIP_HINT);
       }
 
       // Reply-to context (like TG's replying-to format)

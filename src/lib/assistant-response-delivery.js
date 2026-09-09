@@ -5,7 +5,21 @@ import path from 'node:path';
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 const MSG_SUFFIX_RE = /\|msg:([A-Za-z0-9-]+)$/;
 const TERMINAL_EVENTS = new Set(['RunCompleted', 'RunFailed']);
-const INVISIBLE_FORMAT_CHARACTERS = /[\u200B-\u200D\u2060\uFEFF]/g;
+// Unicode general category Cf (format characters): zero-width space/joiners,
+// LRM/RLM, word joiner, soft hyphen, BOM, … — every character class that can
+// occupy a message without ever rendering visibly (issue #20).
+const INVISIBLE_FORMAT_CHARACTERS = /\p{Cf}/gu;
+
+/**
+ * Strict silence definition for assistant replies: output counts as visible
+ * only when characters remain after every Unicode format character is
+ * stripped and the remainder is trimmed. Legal short content ('.', '—',
+ * emoji, a single space between words) is never classified as silence.
+ */
+export function hasVisibleReplyContent(text) {
+  return typeof text === 'string'
+    && text.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim().length > 0;
+}
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -138,16 +152,6 @@ function terminalFromDelivery(input) {
     throw new TypeError('RunFailed retryable must be a boolean');
   }
   return { requestId, route, terminal };
-}
-
-function publicCompletedContent(terminal) {
-  const output = terminal.payload.output;
-  if (output.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim() === '') {
-    const error = new Error('visible HXA reply output is missing');
-    error.code = 'MISSING_OUTPUT';
-    throw error;
-  }
-  return output;
 }
 
 function canonicalEndpointKey(parsed) {
@@ -470,7 +474,19 @@ export function createAssistantResponseSender({
     async send({ requestId, endpointId, content, suppressSkip = false } = {}) {
       const safeRequestId = requireText(requestId, 'HXA assistant response requestId');
       const safeEndpointId = requireText(endpointId, 'HXA assistant response endpointId');
-      const safeContent = requireText(content, 'HXA assistant response content');
+      if (typeof content !== 'string') {
+        throw new TypeError('HXA assistant response content must be a string');
+      }
+      // Issue #20: an assistant response whose output is empty or
+      // invisible-only is silence, not a message. When the caller sanctions
+      // silence (suppressSkip), it is suppressed exactly like a [SKIP]
+      // marker: a durable suppressed ledger record, a warning log, no org
+      // resolution and no transport. Without that sanction an empty content
+      // remains a caller error (requireText below).
+      const silent = suppressSkip && !hasVisibleReplyContent(content);
+      const safeContent = silent
+        ? content
+        : requireText(content, 'HXA assistant response content');
       const parsed = parseHxaResponseEndpoint(safeEndpointId, defaultOrgLabel);
       const identity = responseIdentity({
         requestId: safeRequestId,
@@ -483,8 +499,12 @@ export function createAssistantResponseSender({
           return { handled: true, replayed: true, status: record.status };
         }
 
-        if (suppressSkip && /^\s*\[SKIP\]\s*$/i.test(safeContent)) {
+        if (silent || (suppressSkip && /^\s*\[SKIP\]\s*$/i.test(safeContent))) {
           record = await store.update(record, { status: 'suppressed', lastError: null });
+          logger.warn?.(`[hxa-connect] Suppressed silent assistant response ${record.deliveryId}`, {
+            requestId: safeRequestId,
+            reason: silent ? 'empty_output' : 'skip_marker',
+          });
           return { handled: true, replayed: false, status: record.status };
         }
 
@@ -567,10 +587,14 @@ export function createAssistantResponseDelivery(options = {}) {
           failure,
         };
       }
+      // The raw output is handed to the sender unmodified: visible output is
+      // delivered verbatim, while empty or invisible-only output is recorded
+      // as durable silence (status 'suppressed') instead of being rewritten
+      // into a real message that would re-trigger a bot-to-bot peer (#20).
       const result = await sender.send({
         requestId,
         endpointId: route.endpointId,
-        content: publicCompletedContent(terminal),
+        content: terminal.payload.output,
         suppressSkip: true,
       });
       return { ...result, terminal: true, eventType: 'RunCompleted' };
