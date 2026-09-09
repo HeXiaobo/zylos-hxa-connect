@@ -137,6 +137,7 @@ describe('HXA assistant response delivery', () => {
         };
       },
       defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
     });
 
     const result = await adapter.deliver(delivery({
@@ -151,6 +152,131 @@ describe('HXA assistant response delivery', () => {
     });
     assert.equal(resolved, 0);
     assert.equal(sends, 0);
+  });
+
+  it('suppresses an empty RunCompleted output as durable silence instead of a message (issue #20)', async () => {
+    const store = await createStore();
+    let resolved = 0;
+    const warnings = [];
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => {
+        resolved += 1;
+        throw new Error('transport must not be resolved');
+      },
+      defaultOrgLabel: 'hxa',
+      logger: { warn(message, details) { warnings.push({ message, details }); } },
+    });
+
+    const result = await adapter.deliver(delivery({ payload: { output: '' } }));
+    assert.deepEqual(result, {
+      handled: true,
+      replayed: false,
+      status: 'suppressed',
+      terminal: true,
+      eventType: 'RunCompleted',
+    });
+    assert.equal(resolved, 0);
+    const records = (await fs.promises.readdir(store.directory)).filter(name => name.endsWith('.json'));
+    assert.equal(records.length, 1, 'the suppression must leave a durable ledger record');
+    const record = JSON.parse(await fs.promises.readFile(path.join(store.directory, records[0]), 'utf8'));
+    assert.equal(record.status, 'suppressed');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].message, /Suppressed silent assistant response/);
+    assert.deepEqual(warnings[0].details, {
+      requestId: 'hxa.dm.request-1',
+      reason: 'empty_output',
+    });
+  });
+
+  it('suppresses whitespace-only and zero-width-space-only RunCompleted output the same as empty', async () => {
+    const store = await createStore();
+    const contents = [];
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => ({
+        client: {
+          async send(target, content) {
+            contents.push(content);
+            return { channel_id: 'channel-1', message: { id: 'unexpected' } };
+          },
+        },
+        agentId: 'self-1',
+        agentName: 'agent',
+      }),
+      defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
+    });
+
+    for (const output of ['   ', '\u200B', '\u200B\u200C\u200D\u2060\uFEFF', '\u00AD']) {
+      const result = await adapter.deliver(delivery({
+        requestId: `hxa.dm.invisible-${output.length}-${output.codePointAt(0)}`,
+        payload: { output },
+      }));
+      assert.equal(result.status, 'suppressed');
+    }
+    assert.deepEqual(contents, [], 'invisible-only output must never reach the transport');
+  });
+
+  it('replays a suppressed empty-output delivery idempotently without a second record', async () => {
+    const store = await createStore();
+    let sends = 0;
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => ({
+        client: {
+          async send() {
+            sends += 1;
+            return { channel_id: 'channel-1', message: { id: 'unexpected' } };
+          },
+        },
+        agentId: 'self-1',
+        agentName: 'agent',
+      }),
+      defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
+    });
+    const input = delivery({ payload: { output: '   ' } });
+
+    const first = await adapter.deliver(input);
+    const replay = await adapter.deliver(input);
+    assert.equal(first.status, 'suppressed');
+    assert.equal(first.replayed, false);
+    assert.equal(replay.status, 'suppressed');
+    assert.equal(replay.replayed, true);
+    assert.equal(sends, 0);
+    const records = (await fs.promises.readdir(store.directory)).filter(name => name.endsWith('.json'));
+    assert.equal(records.length, 1);
+  });
+
+  it('still delivers short visible RunCompleted output instead of suppressing it', async () => {
+    const store = await createStore();
+    const contents = [];
+    const adapter = createAssistantResponseDelivery({
+      store,
+      resolveOrg: async () => ({
+        client: {
+          async send(target, content) {
+            contents.push(content);
+            return { channel_id: 'channel-1', message: { id: 'outbound-short' } };
+          },
+          async inbox() { return []; },
+        },
+        agentId: 'self-1',
+        agentName: 'agent',
+      }),
+      defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
+    });
+
+    for (const [index, output] of ['.', '—', 'ok'].entries()) {
+      const result = await adapter.deliver(delivery({
+        requestId: `hxa.dm.short-${index}`,
+        payload: { output },
+      }));
+      assert.equal(result.status, 'delivered');
+    }
+    assert.deepEqual(contents, ['.', '—', 'ok'], 'legal short content must never be suppressed');
   });
 
   it('deduplicates an explicit c4-send reply against the later terminal stream event', async () => {
@@ -371,5 +497,57 @@ describe('HXA assistant response delivery', () => {
       failure: { code: 'PERMANENT_FAILURE', retryable: false },
     });
     assert.equal(resolved, 0);
+  });
+
+  it('suppresses an invisible-only assistant response send on the explicit c4-send path', async () => {
+    const store = await createStore();
+    let resolved = 0;
+    const warnings = [];
+    const sender = createAssistantResponseSender({
+      store,
+      resolveOrg: async () => {
+        resolved += 1;
+        throw new Error('transport must not be resolved');
+      },
+      defaultOrgLabel: 'hxa',
+      logger: { warn(message, details) { warnings.push({ message, details }); } },
+    });
+
+    const result = await sender.send({
+      requestId: 'hxa.dm.request-1',
+      endpointId: 'org:hxa|ss|msg:source-message-1',
+      content: '\u200B',
+      suppressSkip: true,
+    });
+    assert.deepEqual(result, { handled: true, replayed: false, status: 'suppressed' });
+    assert.equal(resolved, 0);
+    const records = (await fs.promises.readdir(store.directory)).filter(name => name.endsWith('.json'));
+    assert.equal(records.length, 1);
+    const record = JSON.parse(await fs.promises.readFile(path.join(store.directory, records[0]), 'utf8'));
+    assert.equal(record.status, 'suppressed');
+    assert.deepEqual(warnings[0].details, { requestId: 'hxa.dm.request-1', reason: 'empty_output' });
+  });
+
+  it('keeps empty content a caller error when silence is not sanctioned', async () => {
+    const store = await createStore();
+    const sender = createAssistantResponseSender({
+      store,
+      resolveOrg: async () => {
+        throw new Error('transport must not be resolved');
+      },
+      defaultOrgLabel: 'hxa',
+      logger: { warn() {} },
+    });
+
+    await assert.rejects(
+      sender.send({
+        requestId: 'hxa.dm.request-1',
+        endpointId: 'org:hxa|ss|msg:source-message-1',
+        content: '',
+      }),
+      /must be a non-empty string/,
+    );
+    const records = (await fs.promises.readdir(store.directory).catch(() => [])).filter(name => name.endsWith('.json'));
+    assert.equal(records.length, 0, 'a rejected caller error must not leave a ledger record');
   });
 });

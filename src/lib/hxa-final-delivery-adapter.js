@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import {
   AssistantResponseDeliveryStore,
+  hasVisibleReplyContent,
   normalizeHxaTransportReceipt,
   parseHxaResponseEndpoint,
   reconcileHxaResponse,
@@ -13,7 +14,6 @@ const TERMINAL_DISPOSITIONS = new Set(['send', 'failure_notice']);
 const PROGRESS_EVENTS = new Set(['ProgressUpdated', 'OutputDelta']);
 const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 409, 410, 422]);
 const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
-const INVISIBLE_FORMAT_CHARACTERS = /[\u200B-\u200D\u2060\uFEFF]/g;
 const REPLY_INTENT_FIELDS = Object.freeze([
   'schemaVersion',
   'type',
@@ -92,10 +92,6 @@ function suppressed(reason) {
   });
 }
 
-function hasVisibleContent(text) {
-  return text.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim().length > 0;
-}
-
 function contentHash(payload) {
   return `sha256:${sha256(canonicalJson(payload))}`;
 }
@@ -153,7 +149,7 @@ function normalizeIntent(input, defaultOrgLabel) {
   const text = typeof input.payload.text === 'string' ? input.payload.text : '';
   // A frozen-v1 send is already an explicit delivery decision. Invisible-only
   // content is invalid output here; it must not be reinterpreted as silence.
-  if (!hasVisibleContent(text)) fail('MISSING_OUTPUT', 'visible HXA reply text must not be blank');
+  if (!hasVisibleReplyContent(text)) fail('MISSING_OUTPUT', 'visible HXA reply text must not be blank');
   const compatibilitySkip = /^\s*\[SKIP\]\s*$/i.test(text);
 
   const intentId = requireText(input.intentId, 'ReplyIntent.intentId');

@@ -23,6 +23,7 @@ import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseSender,
+  hasVisibleReplyContent,
 } from '../src/lib/assistant-response-delivery.js';
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
@@ -66,6 +67,19 @@ const isSkipResponse = /^\s*\[SKIP\]\s*$/i.test(message);
 // or leave a delivery log behind. Core records the terminal request state.
 if (isSkipResponse) process.exit(0);
 
+const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+
+// An explicit send whose content is blank or invisible-only is invalid output,
+// not a message: fail fast with the frozen-v1 MISSING_OUTPUT contract before
+// any transport or ledger exists, mirroring the canonical adapter. Sending it
+// verbatim would re-trigger a bot-to-bot peer forever (issue #20).
+// Assistant-response sends fall through to the sender below, which records
+// durable silence instead.
+if (!assistantRequestId && !hasVisibleReplyContent(message)) {
+  console.error('[hxa-connect] MISSING_OUTPUT: refusing to send blank or invisible-only content');
+  process.exit(1);
+}
+
 const { orgLabel: endpointOrg, target: rawTarget } = parseEndpoint(rawEndpoint);
 
 // Extract msg:<id> for reply-to (like TG's msg: pattern)
@@ -100,7 +114,6 @@ const client = new HxaConnectClient({
   ...(org.orgId && { orgId: org.orgId }),
 });
 
-const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
 // Make the invocation mode visible: when the runtime intends an assistant
 // response but no longer passes C4_ASSISTANT_REQUEST_ID, the streamed-reply
 // branch is silently skipped and this shows up as mode=explicit instead.
