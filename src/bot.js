@@ -457,7 +457,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         access: org.access,
       });
       if (policyResult.action !== 'continue') {
-        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=${policyResult.reason}${policyResult.notificationStatus ? ` notification=${policyResult.notificationStatus}` : ''}`);
+        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=${policyResult.reason}${policyResult.policy ? ` policy=${policyResult.policy}` : ''}${policyResult.notificationStatus ? ` notification=${policyResult.notificationStatus}` : ''}`);
         return policyResult;
       }
 

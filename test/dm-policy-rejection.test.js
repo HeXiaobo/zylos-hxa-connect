@@ -1362,6 +1362,7 @@ describe('DM policy rejection', () => {
     }), {
       action: 'discarded',
       reason: 'dm_policy',
+      policy: 'allowlist',
       notificationStatus: 'notified',
       notificationReplayed: false,
     });
@@ -1378,6 +1379,44 @@ describe('DM policy rejection', () => {
       reason: 'dm_policy_rejection_notice',
     });
     assert.equal(sends, 1);
+  });
+
+  it('surfaces the matched policy rule on rejection and keeps accepted DMs untouched', async () => {
+    let rejections = 0;
+    const gate = createDmPolicyGate({
+      agentId: 'receiver-1',
+      noticeSecret: NOTICE_SECRET,
+      rejectionHandler: {
+        async reject() {
+          rejections += 1;
+          return { status: 'notified', replayed: false };
+        },
+      },
+    });
+
+    // Rejected DM: the gate exposes the exact rule that matched, so the
+    // caller's structured log can answer "which policy rejected this DM".
+    assert.deepEqual(await gate.evaluate(rejectedDm(), {
+      source: 'websocket',
+      access: { dmPolicy: 'allowlist', dmAllowFrom: ['someone-else'] },
+    }), {
+      action: 'discarded',
+      reason: 'dm_policy',
+      policy: 'allowlist',
+      notificationStatus: 'notified',
+      notificationReplayed: false,
+    });
+
+    // Accepted DMs behave exactly as before and never reach the handler.
+    assert.deepEqual(await gate.evaluate(rejectedDm({ sender_name: 'PEER-AGENT' }), {
+      source: 'websocket',
+      access: { dmPolicy: 'allowlist', dmAllowFrom: ['peer-agent'] },
+    }), { action: 'continue' });
+    assert.deepEqual(await gate.evaluate(rejectedDm({ id: 'open-2' }), {
+      source: 'websocket',
+      access: { dmPolicy: 'open' },
+    }), { action: 'continue' });
+    assert.equal(rejections, 1);
   });
 
   it('does not change thread open, allowlist, or per-sender policy semantics', () => {
