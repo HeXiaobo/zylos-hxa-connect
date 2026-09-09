@@ -293,13 +293,17 @@ export function createDmPolicyGate({ rejectionHandler, agentId, noticeSecret, no
       }
       const decision = decideDmPolicy(access, message);
       if (decision === 'allow') return { action: 'continue' };
+      const policy = access?.dmPolicy || 'open';
       const notification = await rejectionHandler.reject(message, {
         source,
-        policy: access?.dmPolicy || 'open',
+        policy,
       });
+      // Surface the matched rule so the caller's structured log can answer
+      // "which policy rejected this DM" without re-deriving it (issue #22).
       return {
         action: notification.status === 'retry_wait' ? 'retry' : 'discarded',
         reason: 'dm_policy',
+        policy,
         notificationStatus: notification.status,
         notificationReplayed: notification.replayed,
       };
