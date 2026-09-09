@@ -28,7 +28,12 @@ node tools/upgrade/prepare.mjs --only hxa --hxa latest --installed /absolute/ins
 
 For a named version, replace latest with that exact version (for example 1.7.10).
 The paths and message reference are filled by the Agent, not the owner.
-Continue with the generated WORKFLOW.md. Use `command.mjs` to obtain just the
+
+Before preparing, work through the [Upgrade Checklist](README.md#upgrade-checklist)
+in the README: the upgrade tooling does not validate component environment
+variables, so newly required ones (for example `HXA_DM_POLICY_NOTICE_SECRET`,
+required since 1.7.9) must be confirmed on the host up front. Continue with the
+generated WORKFLOW.md. Use `command.mjs` to obtain just the
 selected component's native update command after the existing deployment gate.
 Do not run a full Core/Feishu pair installation for this single-component request.
 
