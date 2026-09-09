@@ -1,0 +1,12 @@
+{
+  "schema": "zylos.repository-upgrade-entry/v1",
+  "component": "hxa",
+  "repository": "HeXiaobo/zylos-hxa-connect",
+  "catalogRepository": "HeXiaobo/zylos-core",
+  "catalogAsset": "zylos-release.json",
+  "defaultChannel": "stable",
+  "previewChannel": "preview",
+  "operatorEntrypoint": "tools/upgrade/prepare.mjs",
+  "scope": "hxa",
+  "allComponentsRequireExplicitRequest": true
+}

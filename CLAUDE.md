@@ -22,7 +22,10 @@ When releasing a new version, **all four files** must be updated in the same com
 
 Version bump commit message: `chore: bump version to X.Y.Z`
 
-After merge, create a GitHub Release with tag `vX.Y.Z` from the merge commit.
+After merge, a version tag identifies source only. Qualify the complete immutable
+bundle first, then publish through the shared Core `tools/upgrade/publish.mjs`
+procedure. A failed or incomplete qualification must not become a stable/latest
+distribution. See UPGRADE.md.
 
 ## Architecture
 
