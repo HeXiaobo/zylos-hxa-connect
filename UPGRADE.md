@@ -53,12 +53,15 @@ matrix covers this host. Run the authoritative probe that ships with the Core
 tools once, and pass its output file straight to `--environment`:
 
 ```sh
-# The probe comes from the same Core tools checkout. Use the host's installed
-# component sources and the host's runtime (claude or codex).
+# The probe comes from the same Core tools checkout. Every value is filled by
+# the Agent: the host's installed component sources, and the host's own runtime
+# (claude or codex). The probe accepts either value without checking it against
+# the host, and the runtime is part of the fingerprint, so a wrong runtime here
+# silently produces a descriptor that matches no published qualification.
 node tools/upgrade/functional-config-probe.mjs \
   --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" \
   --feishu-source "$FEISHU_SOURCE" --hxa-source "$HXA_SOURCE" \
-  --runtime claude --out /absolute/probe-result.json
+  --runtime "$RUNTIME" --out /absolute/probe-result.json
 
 node tools/upgrade/prepare.mjs --only hxa --hxa latest \
   --installed /absolute/installed.json --environment /absolute/probe-result.json \
