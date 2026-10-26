@@ -440,6 +440,12 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
     try {
+      // zylos-lab-hxa-access: groupPolicy=disabled must stop every thread
+      // delivery (messages, invites, thread_created), not only reason==='message'.
+      if ((org.access?.groupPolicy || 'open') === 'disabled') {
+        console.log(`${lp} Thread ${threadId} skipped (groupPolicy: disabled)`);
+        return;
+      }
       const sender = msgSender(message);
       const content = message.content || '';
       const isInteractiveDelivery = reason === 'message';
