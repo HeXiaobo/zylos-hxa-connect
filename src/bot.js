@@ -11,6 +11,8 @@ import * as hxaSdk from '@coco-xyz/hxa-connect-sdk';
 import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+// zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
+import { redactSecrets } from './lib/redact.js';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js';
 import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
@@ -610,7 +612,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   });
 
   client.on('error', (err) => {
-    console.error(`${lp} Error: ${err?.message || err}`);
+    console.error(`${lp} Error: ${redactSecrets(err?.message || err)}`);
   });
 
   client.on('session_invalidated', ({ code, reason }) => {
@@ -652,7 +654,7 @@ async function connectOrg(label, { client, threadCtx, config: org }) {
       try { client.disconnect(); } catch {}
       attempt++;
       const delay = Math.min(INITIAL_DELAY * Math.pow(BACKOFF, attempt - 1), MAX_DELAY);
-      console.error(`${lp} Connection attempt ${attempt} failed: ${err.message}`);
+      console.error(`${lp} Connection attempt ${attempt} failed: ${redactSecrets(err.message)}`);
       if (attempt >= MAX_CONNECT_ATTEMPTS) {
         console.error(`${lp} Giving up after ${attempt} attempts`);
         try { client.disconnect(); } catch {}
