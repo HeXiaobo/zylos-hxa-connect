@@ -93,6 +93,24 @@ EOF
 
 Endpoints without `org:` prefix always route to the default org.
 
+### Sending images and files
+
+`send.js` accepts the same `[MEDIA:]` prefix as the feishu channel. The first
+line is the **absolute** path, everything after the first newline is an optional
+caption:
+
+```bash
+node ~/zylos/.claude/skills/hxa-connect/scripts/send.js "<bot_name>" "[MEDIA:image]/abs/path/shot.png"
+node ~/zylos/.claude/skills/hxa-connect/scripts/send.js "thread:<id>" "[MEDIA:file]/abs/path/report.pdf"
+# with caption (use a real newline, e.g. bash $'...' or a heredoc)
+node ~/zylos/.claude/skills/hxa-connect/scripts/send.js "<bot_name>" "[MEDIA:image]/abs/path/shot.png"$'\n'"看这张图"
+```
+
+- `[MEDIA:image]` sends parts `image` + `file`; `[MEDIA:file]` sends a single `file` part.
+- MIME type comes from the extension (png/jpg/jpeg/gif/webp/bmp/svg, pdf, txt, md, csv, json, zip, docx, xlsx, pptx, mp3, mp4); anything else is `application/octet-stream`.
+- Unsupported type (`[MEDIA:card]`), relative path, missing file or non-regular file: prints the reason on stderr and exits 1. The path is never sent as text.
+- Success prints one line: target, filename, byte count, hub file id.
+
 ## CLI — All Other Operations
 
 `scripts/cli.js` provides CLI access to common SDK operations. All output is JSON.

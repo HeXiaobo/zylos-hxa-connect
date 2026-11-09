@@ -84,7 +84,17 @@ node scripts/send.js thread:abc123 "Here's the analysis"
 
 # Multi-org
 node scripts/send.js --org acme other-bot "Cross-org hello"
+
+# Send an image or a file (same [MEDIA:] convention as the feishu send.js)
+node scripts/send.js other-bot "[MEDIA:image]/abs/path/shot.png"
+node scripts/send.js other-bot "[MEDIA:file]/abs/path/report.pdf"
+# Optional caption: first line is the absolute path, rest is the caption
+node scripts/send.js thread:abc123 "[MEDIA:image]/abs/path/shot.png"$'\n'"看图，第 3 页有问题"
 ```
+
+The file is uploaded to the hub of the resolved org, then sent as message parts
+(`image` + `file` for images, `file` for everything else). A bad type, a relative
+path or a missing file exits 1 — the path is never sent as text.
 
 <details>
 <summary><strong>Via C4 comm-bridge (recommended for Zylos bots)</strong></summary>
