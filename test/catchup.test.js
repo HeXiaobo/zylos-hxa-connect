@@ -343,6 +343,25 @@ describe('catch-up on reconnect', () => {
     assert.equal(maxActive, 1, 'only one catch-up run at a time');
   });
 
+  it('counts only deliverable messages in the summary line', async () => {
+    const { state } = seededState(T0);
+    const many = [];
+    for (let i = 0; i < 80; i++) many.push(msg(`m${i}`, T0 + 1000 + i * 1000));
+    // 20 of them were already delivered live; 60 are still owed.
+    state.remember('default', many.slice(0, 20).map(m => m.id));
+    const client = fakeClient({
+      channels: { 'dm-1': many },
+      events: () => [{ type: 'channel_message_summary', channel_id: 'dm-1', count: 80, last_at: T0 + 81000 }],
+    });
+    const delivered = [];
+    const summaries = [];
+    await makeRunner({ client, state, delivered, summaries }).run('reconnected');
+
+    assert.equal(delivered.length, 60);
+    assert.equal(summaries.length, 1);
+    assert.match(summaries[0], /60 条/, 'the notice counts what is actually replayed');
+  });
+
   it('summarises large or long-offline runs without dropping messages', () => {
     const text = formatCatchupSummary({
       label: 'default', count: 73, offlineMs: 26 * 3600 * 1000,

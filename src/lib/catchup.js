@@ -205,6 +205,8 @@ export class CatchupRunner {
    * @param {(ms: number) => Promise<void>} [opts.sleep]
    * @param {Partial<typeof DEFAULT_LIMITS>} [opts.limits]
    * @param {boolean} [opts.multiOrg]
+   * @param {DeliveryGate} [opts.gate]  shared with the realtime handlers so an
+   *        in-flight replay is visible to realtime de-duplication (and back)
    */
   constructor({
     client,
@@ -218,6 +220,7 @@ export class CatchupRunner {
     sleep = ms => new Promise(r => setTimeout(r, ms)),
     limits = {},
     multiOrg = true,
+    gate,
   }) {
     if (!client) throw new Error('CatchupRunner requires a client');
     if (!label) throw new Error('CatchupRunner requires an org label');
@@ -235,7 +238,7 @@ export class CatchupRunner {
     this.sleep = sleep;
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.multiOrg = multiOrg;
-    this.gate = new DeliveryGate({ state, label });
+    this.gate = gate || new DeliveryGate({ state, label });
 
     this.running = false;
     this.queued = false;
@@ -362,8 +365,11 @@ export class CatchupRunner {
     });
 
     const total = messages.length;
+    const pending = messages.filter(m => !this.gate.isSeen(m.message?.id));
     const offlineMs = Math.max(0, startedAt - since);
-    const overThreshold = total > this.limits.notifyThreshold || offlineMs > this.limits.offlineThresholdMs;
+    // The notice describes what is actually going to be delivered.
+    const overThreshold = pending.length > this.limits.notifyThreshold
+      || offlineMs > this.limits.offlineThresholdMs;
 
     if (total === 0 && otherEvents.length === 0) {
       this.log('catchup: nothing missed');
@@ -383,7 +389,7 @@ export class CatchupRunner {
         try {
           await this.deliverSummary(formatCatchupSummary({
             label: this.label,
-            count: total,
+            count: pending.length,
             offlineMs,
             since,
             until: startedAt,

@@ -745,6 +745,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     client,
     label,
     state: catchupState,
+    gate, // shared with the realtime handlers: one de-dup view per connection
     multiOrg: isMultiOrg,
     log: (m) => console.log(`${lp} ${m}`),
 
