@@ -191,34 +191,60 @@ try {
       out({
         org: orgLabel,
         state_file: store.filePath,
-        watermark: org.watermark || null,
-        watermark_iso: org.watermark ? new Date(org.watermark).toISOString() : null,
-        last_delivered_at: org.lastDeliveredAt || null,
+        events_since: org.eventsSince || null,
+        events_since_iso: org.eventsSince ? new Date(org.eventsSince).toISOString() : null,
+        event_cursor: org.eventCursor || null,
         gap_suspected: org.dirty === true,
+        gap_epoch: org.gapEpoch || 0,
+        last_delivered_at: org.lastDeliveredAt || null,
         recent_ids: org.recentIds.length,
+        open_targets: Object.entries(org.targets).map(([key, t]) => ({
+          target: key,
+          done_up_to: t.doneUpTo || null,
+          hi: t.hi || null,
+          pending_windows: t.windows.length,
+          window_ids: t.ids.length,
+          anchor: t.anchorId || null,
+        })),
       });
       break;
     }
 
     case 'catchup-pull': {
-      // Peek at everything missed since the stored watermark, right now,
-      // without waiting for a reconnect. Read-only: the shared state file is
-      // NOT modified, so the running bot still replays/delivers as usual.
-      // Output is JSON on stdout; --limit N caps the number of messages.
+      // Replay everything missed since the stored boundary, right now, without
+      // waiting for a reconnect. Read-only: the state file is NOT modified, so
+      // the running bot keeps its own progress (this is a peek, not a consumer).
       const store = new CatchupStateStore({
         filePath: process.env.HXA_CATCHUP_STATE_PATH || resolveCatchupStatePath(),
       }).load();
-      if (!store.getWatermark(orgLabel)) {
-        fail(`No catch-up watermark for org "${orgLabel}" yet — the bot must connect once first`);
+      if (!store.getEventsSince(orgLabel)) {
+        fail(`No catch-up boundary for org "${orgLabel}" yet — the bot must connect once first`);
       }
-      // Never persist from a read-only pull.
+      // Neutralise every write so the on-disk progress is untouched.
       store.save = () => true;
       store.scheduleSave = () => {};
       store.flush = () => true;
+      store.settleGap = () => false;
+      store.commitWindow = () => {};
+      store.shrinkWindowTop = () => {};
+      store.addTargetId = () => {};
+      store.setAnchor = () => {};
+      store.extendTarget = (label, kind, id, hi) => {
+        const t = { doneUpTo: 0, hi: 0, windows: [], ids: [], anchorId: null, anchorAt: 0 };
+        const key = CatchupStateStore.targetKey(kind, id);
+        const org = store.getOrg(label);
+        const existing = org.targets[key];
+        if (existing && existing.windows.length) return existing;
+        t.hi = Number(hi) || 0;
+        t.windows = t.hi > 0 ? [[1, t.hi]] : [];
+        org.targets[key] = t;
+        return t;
+      };
+      store.pruneTargets = () => {};
 
       const limitStr = getFlag('limit');
-      const remaining = limitStr == null ? Infinity : Number(limitStr);
-      if (Number.isFinite(remaining) && remaining < 1) fail('--limit must be a positive integer');
+      const maxMessages = limitStr == null ? Infinity : Number(limitStr);
+      if (Number.isFinite(maxMessages) && maxMessages < 1) fail('--limit must be a positive integer');
 
       const messages = [];
       const events = [];
@@ -229,17 +255,16 @@ try {
         log: msg => console.error(`[catchup-pull] ${msg}`),
         limits: {
           batchDelayMs: 0,
-          // Stop the pull at --limit; the watermark is untouched so the next
-          // bot run still covers everything.
-          ...(Number.isFinite(remaining) ? { maxMessagesPerRun: Math.max(1, Math.floor(remaining)) } : {}),
+          ...(Number.isFinite(maxMessages)
+            ? { maxMessagesPerRun: Math.max(1, Math.floor(maxMessages)) }
+            : {}),
         },
         deliverMessage: async item => {
-          if (messages.length >= remaining) return;
           messages.push({
             kind: item.kind === 'thread' ? 'thread' : 'channel',
             id: item.message?.id,
-            channel_id: item.channelId,
-            thread_id: item.threadId,
+            channel_id: item.kind === 'thread' ? undefined : item.targetId,
+            thread_id: item.kind === 'thread' ? item.targetId : undefined,
             sender_id: item.message?.sender_id,
             sender_name: item.message?.sender_name,
             created_at: item.message?.created_at,
@@ -258,10 +283,10 @@ try {
       out({
         org: orgLabel,
         state_file: store.filePath,
-        watermark: store.getWatermark(orgLabel),
+        events_since: store.getEventsSince(orgLabel),
         gap_suspected: store.isDirty(orgLabel),
         count: messages.length,
-        truncated: !Number.isFinite(remaining) ? false : messages.length >= remaining,
+        truncated: Number.isFinite(maxMessages) && messages.length >= maxMessages,
         messages,
         events,
       });
