@@ -353,9 +353,18 @@ export class CatchupRunner {
           if (at > lastEventAt) lastEventAt = at;
         }
         const hasMore = Array.isArray(res) ? false : !!res?.has_more;
-        if (!hasMore || !res?.cursor) {
+        if (!hasMore) {
           eventsExhausted = true;
           cursor = null;
+          break;
+        }
+        if (!res?.cursor) {
+          // `has_more` without a cursor: the feed is NOT drained, but there is
+          // no way to continue this run. Keep the boundary where it is and
+          // leave the cursor empty so the next run starts the page again.
+          eventsExhausted = false;
+          cursor = null;
+          this.log('catchup: event feed reports more pages but returned no cursor — boundary kept, retrying next run');
           break;
         }
         cursor = res.cursor;

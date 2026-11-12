@@ -71,7 +71,10 @@ export function decideThreadDelivery({
  * boundary as live thread traffic. Anything not delivered stays a log line.
  */
 export function decideCatchupEvent({ access, event }) {
-  if (groupPolicyOff(access)) return verdict(REJECT, 'groupPolicy:disabled');
+  // Only thread-scoped lifecycle events carry thread content (the invite names
+  // the topic). Bot-level notices are not thread traffic and still go through.
+  const threadScoped = typeof event?.type === 'string' && event.type.startsWith('thread_');
+  if (threadScoped && groupPolicyOff(access)) return verdict(REJECT, 'groupPolicy:disabled');
   if ((event?.type === 'thread_invited' || event?.type === 'thread_status_changed')
       && event.thread_id && !isThreadAllowed(access, event.thread_id)) {
     return verdict(REJECT, `groupPolicy:${access?.groupPolicy || 'open'}`);
