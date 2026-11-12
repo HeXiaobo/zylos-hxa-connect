@@ -57,8 +57,9 @@ function emptyOrg() {
     gapEpoch: 0,
     dirty: false,
     lastDeliveredAt: 0,
+    lastRememberedAt: 0,
     recentIds: [],
-    // id buckets keyed by delivery-time slice: `{ "<ms>": ["id", ...] }`
+    // id buckets keyed by DELIVERY-time slice: `{ "<ms>": ["id", ...] }`
     delivered: {},
     targets: {},
   };
@@ -120,6 +121,7 @@ function normalizeOrg(raw, maxRecentIds) {
   org.gapEpoch = Number.isFinite(Number(raw.gapEpoch)) ? Math.max(0, Math.floor(Number(raw.gapEpoch))) : 0;
   org.dirty = raw.dirty === true;
   org.lastDeliveredAt = toPositiveInt(raw.lastDeliveredAt);
+  org.lastRememberedAt = toPositiveInt(raw.lastRememberedAt);
 
   if (Array.isArray(raw.recentIds)) {
     org.recentIds = raw.recentIds.filter(id => typeof id === 'string' && id).slice(-maxRecentIds);
@@ -277,21 +279,27 @@ export class CatchupStateStore {
    *
    * Two records, on purpose:
    *   - `recentIds`: a bounded ring, the hot cache for the common case;
-   *   - `delivered`: ids bucketed by the millisecond they were delivered, kept
-   *     for a full replay window (`retainDeliveredMs`). A ring alone is not
-   *     enough: a backlog can be thousands of messages long and the replay
-   *     re-queries the same window after the boundary moved, so dropping the
-   *     oldest ring entries makes the walk deliver them again.
+   *   - `delivered`: ids bucketed by when they were DELIVERED, kept for
+   *     `retainDeliveredMs`. A ring alone is not enough: a backlog can be
+   *     thousands of messages long and the replay re-queries the same window
+   *     after the boundary moved, so dropping the oldest ring entries makes
+   *     the walk deliver them again.
    *
-   * `at` (message created_at / delivery time) is optional for callers that only
-   * need the ring; the bucket falls back to "now" when it is missing.
+   * Bucketing by delivery time (not by `message.created_at`) is the whole
+   * point: an offline backlog older than the retention window is still
+   * delivered "now", and pruning by message age deleted the record of exactly
+   * those messages the moment the run settled, so the next summary re-scanned
+   * all history and replayed them (round-3 review blocker 2).
+   *
+   * `at` is kept in the signature for callers that want the message timestamp
+   * in the target record; the bucket always uses the wall clock.
    */
   remember(label, ids, at) {
     const list = Array.isArray(ids) ? ids : [ids];
     const org = this.getOrg(label);
-    const stamp = toPositiveInt(at) || Date.now();
     org.delivered ||= {};
-    const bucketKey = String(Math.floor(stamp / DELIVERED_BUCKET_MS) * DELIVERED_BUCKET_MS);
+    const deliveredAt = Date.now();
+    const bucketKey = String(Math.floor(deliveredAt / DELIVERED_BUCKET_MS) * DELIVERED_BUCKET_MS);
     const bucket = org.delivered[bucketKey] ||= [];
     for (const id of list) {
       if (typeof id !== 'string' || !id) continue;
@@ -303,9 +311,12 @@ export class CatchupStateStore {
     if (org.recentIds.length > this.maxRecentIds) {
       org.recentIds = org.recentIds.slice(-this.maxRecentIds);
     }
+    // Keep the "remembered at" stamp for callers that pass one; it is not what
+    // the retention window is measured against.
+    if (at) org.lastRememberedAt = Math.max(org.lastRememberedAt || 0, toPositiveInt(at) || 0);
   }
 
-  /** Drop delivery buckets older than the retention window. */
+  /** Drop delivery buckets older than the retention window (delivery time). */
   pruneDelivered(label, now = Date.now()) {
     const org = this.getOrg(label);
     if (!org.delivered) return;
