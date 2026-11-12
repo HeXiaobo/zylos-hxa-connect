@@ -601,7 +601,18 @@ export class CatchupRunner {
           await maybeSummary();
           this.gate.begin(m.id);
           try {
-            await this.deliverMessage({ kind, targetId: id, message: m, catchup: true, label: this.label });
+            await this.deliverMessage({
+              kind,
+              targetId: id,
+              // The delivery pipelines address a destination, not a "target":
+              // hand them the field name they act on. `targetId` stays for
+              // readers of the catch-up records.
+              channelId: kind === 'channel' ? id : undefined,
+              threadId: kind === 'thread' ? id : undefined,
+              message: m,
+              catchup: true,
+              label: this.label,
+            });
             counters.delivered++;
             progressed = true;
             this.gate.mark(m.id, at, { kind, targetId: id });
@@ -666,7 +677,18 @@ export class CatchupRunner {
         await maybeSummary();
         this.gate.begin(m.id);
         try {
-          await this.deliverMessage({ kind, targetId: id, message: m, catchup: true, label: this.label });
+          await this.deliverMessage({
+              kind,
+              targetId: id,
+              // The delivery pipelines address a destination, not a "target":
+              // hand them the field name they act on. `targetId` stays for
+              // readers of the catch-up records.
+              channelId: kind === 'channel' ? id : undefined,
+              threadId: kind === 'thread' ? id : undefined,
+              message: m,
+              catchup: true,
+              label: this.label,
+            });
           counters.delivered++;
           progressed = true;
           this.gate.mark(m.id, Number(m.created_at) || 0, { kind, targetId: id });
