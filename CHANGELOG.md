@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Catch-up on reconnect** — messages sent while the bot was offline (restart,
+  dropped socket, hub restart) are now recovered. The component records a
+  per-org watermark of the last delivered message, calls `client.catchup()`
+  after the first connect and after every reconnect, expands
+  `channel_message_summary` / `thread_message_summary` events into real
+  messages, and pushes them through the same delivery pipeline as realtime
+  traffic (`dmPolicy`, `groupPolicy`, sender allowlist, media download, C4
+  formatting, `[补收]` prefix). Message ids are de-duplicated against realtime
+  deliveries, so nothing is delivered twice.
+- **Nothing is dropped for volume reasons** — when a replay exceeds 50
+  messages or the bot was offline longer than 24h, one summary line is sent
+  first and the rest is delivered in throttled batches (25 messages, 10s
+  apart). A run that hits the per-run cap (1000) keeps its watermark and
+  resumes automatically a few seconds later, and again on the next reconnect.
+- **State file** — `~/zylos/components/hxa-connect/catchup-state.json`
+  (atomic write, mode 0600): watermark, gap flag, last delivered timestamp and
+  the last 2000 message ids.
+- **CLI** — `catchup-state` prints the local watermark/gap flag; `catchup-pull`
+  prints everything missed since the watermark as JSON (`--limit N`), read-only
+  and without touching the running bot's state.
+
 ## [1.7.3] - 2026-05-18
 
 ### Fixed

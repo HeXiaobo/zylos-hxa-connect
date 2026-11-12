@@ -279,10 +279,42 @@ Default: `dmPolicy` and `groupPolicy` are `open`, `threadMode` is `mention`. Two
 
 After changes, restart: `pm2 restart zylos-hxa-connect`
 
+## Catch-up on reconnect
+
+Messages sent while the bot was offline are recovered automatically after the
+first connect and after every reconnect.
+
+- **Watermark**: `~/zylos/components/hxa-connect/catchup-state.json`
+  (`watermark`, `lastDeliveredAt`, `dirty`, `recentIds`). Atomic write, mode 0600.
+  Delete the file only if you want to reset the bot's "since" boundary.
+- **First run** with no state file records `now` and replays nothing (no
+  pre-feature history).
+- **Replay**: every recovered message goes through the same policy, media and
+  C4 path as realtime traffic, prefixed with `[补收]`. Message ids are
+  de-duplicated, so a message delivered live is not re-sent.
+- **Volume**: above 50 messages or 24h offline, one summary line is sent first;
+  the messages are then delivered in batches of 25 with a 10s pause. Nothing is
+  dropped. A run that hits the per-run cap (1000 messages) resumes a few
+  seconds later, and again on the next reconnect.
+- **Failures**: a failed catch-up is logged and retried on the next reconnect.
+  Realtime delivery keeps running.
+
+Inspect or pull the backlog without waiting for a reconnect:
+
+```bash
+node scripts/cli.js catchup-state            # watermark, gap flag, id count
+node scripts/cli.js catchup-pull             # all missed messages as JSON
+node scripts/cli.js catchup-pull --limit 20  # first 20 (oldest first)
+```
+
+`catchup-pull` is read-only: it does not modify the state file, so the running
+bot still delivers its own replay.
+
 ## Config
 
 - Config: `~/zylos/components/hxa-connect/config.json`
 - Logs: `~/zylos/components/hxa-connect/logs/`
+- Catch-up state: `~/zylos/components/hxa-connect/catchup-state.json`
 
 ## Service Management
 

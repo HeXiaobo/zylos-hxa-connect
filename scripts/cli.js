@@ -14,6 +14,8 @@ import path from 'path';
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import { MEDIA_BASE_DIR, generateFilename } from '../src/lib/media.js';
+import { CatchupRunner } from '../src/lib/catchup.js';
+import { CatchupStateStore, resolveCatchupStatePath } from '../src/lib/catchup-state.js';
 
 const args = process.argv.slice(2);
 
@@ -176,6 +178,93 @@ try {
       if (!since) fail('Usage: cli.js inbox --since <timestamp_ms>');
       const messages = await client.inbox(Number(since));
       out(messages);
+      break;
+    }
+
+    // ─── Catch-up (reconnect replay) ────────────────────────
+
+    case 'catchup-state': {
+      const store = new CatchupStateStore({
+        filePath: process.env.HXA_CATCHUP_STATE_PATH || resolveCatchupStatePath(),
+      }).load();
+      const org = store.getOrg(orgLabel);
+      out({
+        org: orgLabel,
+        state_file: store.filePath,
+        watermark: org.watermark || null,
+        watermark_iso: org.watermark ? new Date(org.watermark).toISOString() : null,
+        last_delivered_at: org.lastDeliveredAt || null,
+        gap_suspected: org.dirty === true,
+        recent_ids: org.recentIds.length,
+      });
+      break;
+    }
+
+    case 'catchup-pull': {
+      // Peek at everything missed since the stored watermark, right now,
+      // without waiting for a reconnect. Read-only: the shared state file is
+      // NOT modified, so the running bot still replays/delivers as usual.
+      // Output is JSON on stdout; --limit N caps the number of messages.
+      const store = new CatchupStateStore({
+        filePath: process.env.HXA_CATCHUP_STATE_PATH || resolveCatchupStatePath(),
+      }).load();
+      if (!store.getWatermark(orgLabel)) {
+        fail(`No catch-up watermark for org "${orgLabel}" yet — the bot must connect once first`);
+      }
+      // Never persist from a read-only pull.
+      store.save = () => true;
+      store.scheduleSave = () => {};
+      store.flush = () => true;
+
+      const limitStr = getFlag('limit');
+      const remaining = limitStr == null ? Infinity : Number(limitStr);
+      if (Number.isFinite(remaining) && remaining < 1) fail('--limit must be a positive integer');
+
+      const messages = [];
+      const events = [];
+      const runner = new CatchupRunner({
+        client,
+        label: orgLabel,
+        state: store,
+        log: msg => console.error(`[catchup-pull] ${msg}`),
+        limits: {
+          batchDelayMs: 0,
+          // Stop the pull at --limit; the watermark is untouched so the next
+          // bot run still covers everything.
+          ...(Number.isFinite(remaining) ? { maxMessagesPerRun: Math.max(1, Math.floor(remaining)) } : {}),
+        },
+        deliverMessage: async item => {
+          if (messages.length >= remaining) return;
+          messages.push({
+            kind: item.kind === 'thread' ? 'thread' : 'channel',
+            id: item.message?.id,
+            channel_id: item.channelId,
+            thread_id: item.threadId,
+            sender_id: item.message?.sender_id,
+            sender_name: item.message?.sender_name,
+            created_at: item.message?.created_at,
+            content: item.message?.content,
+            parts: item.message?.parts,
+          });
+        },
+        deliverSummary: async () => {},
+        deliverEvent: async ev => {
+          events.push({ type: ev.type, thread_id: ev.thread_id, occurred_at: ev.occurred_at });
+        },
+      });
+      await runner.run('cli');
+      runner.dispose();
+
+      out({
+        org: orgLabel,
+        state_file: store.filePath,
+        watermark: store.getWatermark(orgLabel),
+        gap_suspected: store.isDirty(orgLabel),
+        count: messages.length,
+        truncated: !Number.isFinite(remaining) ? false : messages.length >= remaining,
+        messages,
+        events,
+      });
       break;
     }
 
@@ -448,6 +537,8 @@ try {
             org: 'Org info',
             catchup: 'Offline events --since <timestamp_ms> [--cursor X] [--limit N]',
             'catchup-count': 'Count missed events --since <timestamp_ms>',
+            'catchup-state': 'Show the local catch-up watermark / gap flag',
+            'catchup-pull': 'Replay everything missed since the watermark (JSON on stdout)',
             inbox: 'New messages --since <timestamp_ms>',
           },
           thread_ops: {
