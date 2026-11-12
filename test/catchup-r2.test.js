@@ -26,7 +26,7 @@ import { CatchupRunner, DeliveryGate } from '../src/lib/catchup.js';
 import { CatchupStateStore } from '../src/lib/catchup-state.js';
 import {
   decideDmDelivery, decideThreadDelivery, decideCatchupEvent, settleLiveDelivery,
-  DELIVER, SKIP, REJECT,
+  DELIVER, DELIVERED, SKIP, REJECT,
 } from '../src/lib/delivery.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────
@@ -317,9 +317,10 @@ describe('blocker 4 — a live delivery that never reached C4', () => {
     const gate = new DeliveryGate({ state, label: 'default' });
 
     gate.begin('live-2');
-    // The pipeline returns the same verdict constants the gate speaks.
-    const result = settleLiveDelivery({ outcome: DELIVER, id: 'live-2', at: T + 1000, gate });
-    assert.equal(result, DELIVER);
+    // What a pipeline returns after C4 accepted a message is DELIVERED, not the
+    // policy verdict DELIVER (round-3 review blocker 4).
+    const result = settleLiveDelivery({ outcome: DELIVERED, id: 'live-2', at: T + 1000, gate });
+    assert.equal(result, DELIVERED);
     assert.equal(gate.isSeen('live-2'), true);
     assert.equal(gate.inFlight.has('live-2'), false);
   });

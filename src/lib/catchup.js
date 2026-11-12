@@ -93,6 +93,12 @@ export class DeliveryGate {
     return this.inFlight.has(id) || this.isDelivered(id);
   }
 
+  /** A live delivery holds this id right now — not a final answer. */
+  isInFlight(id) {
+    if (!id) return false;
+    return this.inFlight.has(id);
+  }
+
   begin(id) {
     if (id) this.inFlight.add(id);
   }
@@ -510,7 +516,10 @@ export class CatchupRunner {
 
     // ── Phase 5: advance the boundary only when everything is done ──
     const targetsDone = this.state.targetsSettled(this.label);
-    const canAdvance = eventsExhausted && allComplete && targetsDone && !runError;
+    // A live delivery still waiting on C4 has no final answer yet. Closing the
+    // gap now would move the boundary past a message that may still fail.
+    const stillInFlight = this.gate.inFlight.size > 0;
+    const canAdvance = eventsExhausted && allComplete && targetsDone && !runError && !stillInFlight;
 
     this.state.setEventCursor(this.label, canAdvance ? null : cursor);
 
@@ -586,16 +595,23 @@ export class CatchupRunner {
 
         let below = false;
         let hitCap = false;
+        let inFlightHeld = false;
         for (const m of messages) {
           const at = Number(m.created_at) || 0;
           if (at < lo) { below = true; break; }
           // Above the scan's high-water mark: still realtime territory.
           if (at > target.hi) continue;
           if (counters.delivered >= limits.maxMessagesPerRun) { hitCap = true; break; }
-          if (this.gate.isSeen(m.id)) {
+          if (this.gate.isDelivered(m.id)) {
             this.state.addTargetId(this.label, kind, id, m.id, at);
             counters.skipped++;
             progressed = true;
+            continue;
+          }
+          if (this.gate.isInFlight(m.id)) {
+            // See the timestamp branch: an in-flight live delivery is not a
+            // final answer, so it must not be written into the scan record.
+            inFlightHeld = true;
             continue;
           }
           await maybeSummary();
@@ -641,6 +657,13 @@ export class CatchupRunner {
           complete = false;
           break;
         }
+        if (inFlightHeld) {
+          // An in-flight live delivery has no final answer yet: keep the cursor
+          // where it is so the row is re-read next run.
+          complete = false;
+          this.log(`catchup ${kind} ${id}: rows still in flight from realtime — id scan paused, window kept open`);
+          break;
+        }
         // Descending id walk: continue strictly below the smallest id of the
         // page we just consumed.
         const nextAnchor = messages[0].id;
@@ -662,13 +685,22 @@ export class CatchupRunner {
       });
 
       let hitCap = false;
+      let inFlightHeld = false;
       for (const m of messages) {
         if (counters.delivered >= limits.maxMessagesPerRun) { hitCap = true; break; }
-        if (this.gate.isSeen(m.id)) {
+        if (this.gate.isDelivered(m.id)) {
           // Already delivered live (or in an earlier overlapping window).
           this.state.addTargetId(this.label, kind, id, m.id, Number(m.created_at) || 0);
           counters.skipped++;
           progressed = true;
+          continue;
+        }
+        if (this.gate.isInFlight(m.id)) {
+          // A live delivery holds this row right now. It is not a success, so
+          // it must not be written into the scan record: if that live attempt
+          // fails, this window has to still contain the row.
+          this.sawInFlight = true;
+          inFlightHeld = true;
           continue;
         }
         // Before the first delivery of a large/long-offline batch, send one
@@ -701,6 +733,14 @@ export class CatchupRunner {
 
       if (hitCap) {
         complete = false;
+        break;
+      }
+
+      if (inFlightHeld) {
+        // The page is only "complete" if every row on it reached a final
+        // answer. An in-flight live delivery has not, so keep the window.
+        complete = false;
+        this.log(`catchup ${kind} ${id}: ${messages.filter(m => this.gate.isInFlight(m.id)).length} row(s) still in flight from realtime — window kept open`);
         break;
       }
 
