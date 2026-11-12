@@ -362,14 +362,24 @@ export class CatchupStateStore {
       t = { doneUpTo: 0, hi: 0, windows: [], ids: [], anchorId: null, anchorAt: 0 };
       org.targets[key] = t;
     }
-    if (end > t.hi) t.hi = end;
-    if (t.windows.length === 0 && t.hi > t.doneUpTo) {
-      t.windows = [[t.doneUpTo + 1, t.hi]];
-      t.ids = [];
-      t.anchorId = null;
-      t.anchorAt = 0;
-      t.byId = false;
-      this._invalidate(label, key);
+    const grew = end > t.hi;
+    if (grew) t.hi = end;
+    if (t.windows.length === 0) {
+      if (t.hi > t.doneUpTo) {
+        t.windows = [[t.doneUpTo + 1, t.hi]];
+        t.ids = [];
+        t.anchorId = null;
+        t.anchorAt = 0;
+        t.byId = false;
+        this._invalidate(label, key);
+      }
+    } else if (grew) {
+      // A previous run stopped mid-scan and now more messages arrived. The
+      // pending windows only cover the OLD high-water mark; extending `hi`
+      // without extending them would let commitWindow() declare the new range
+      // done although it was never queried (round-3 review blocker 3).
+      const top = t.windows.reduce((max, w) => Math.max(max, w[1]), 0);
+      if (t.hi > top) t.windows.push([top + 1, t.hi]);
     }
     return t;
   }
@@ -454,9 +464,20 @@ export class CatchupStateStore {
     t.anchorId = null;
     t.anchorAt = 0;
     if (t.windows.length === 0) {
-      if (t.hi > t.doneUpTo) t.doneUpTo = t.hi;
-      t.ids = [];
-      t.byId = false;
+      // The scan is done through the last window's top, never further: `hi` is
+      // only the high-water mark, and a window list that does not reach it
+      // means the newest slice was never queried.
+      const reached = hi > t.doneUpTo ? hi : t.doneUpTo;
+      t.doneUpTo = reached;
+      if (t.hi > reached) {
+        // Keep the uncovered tail open instead of declaring it done.
+        t.windows = [[reached + 1, t.hi]];
+        t.ids = [];
+        t.byId = false;
+      } else {
+        t.ids = [];
+        t.byId = false;
+      }
     } else {
       if (hi > t.doneUpTo) t.doneUpTo = hi;
       const bottom = Math.min(...t.windows.map(w => w[0]));
