@@ -149,6 +149,26 @@ export function formatCatchupEventLine({ label, event, multiOrg }) {
   }
 }
 
+/** The hub's hard cap on `limit` for the message endpoints. */
+const MAX_PAGE = 200;
+
+/**
+ * Sentinel for "start an id walk from the newest row".
+ *
+ * The hub resolves an unknown `before` to the channel's newest page ordered by
+ * `(created_at DESC, id DESC)` (hub-db.ts `getMessagesPaginated`, "Unknown
+ * cursor — return from newest with stable ordering"). That is the only way to
+ * reach ids ABOVE an arbitrary timestamp page.
+ */
+export const ID_SCAN_FROM_TOP = '\u0000from-top';
+
+/** True when every row was created in the same millisecond. */
+function sameInstant(messages) {
+  if (messages.length < 2) return false;
+  const first = Number(messages[0].created_at) || 0;
+  return messages.every(m => (Number(m.created_at) || 0) === first);
+}
+
 function toArrayResult(res) {
   if (Array.isArray(res)) return res;
   if (res && Array.isArray(res.messages)) return res.messages;
@@ -680,9 +700,21 @@ export class CatchupRunner {
       remaining--;
       requests++;
 
-      const { messages, full, oldestAt } = await fetchWindow({
+      let page = await fetchWindow({
         fetchPage, lo, hi, limit: limits.messagePageSize,
       });
+      // The hub's timestamp query has no id tiebreak: a full page whose rows all
+      // share one millisecond is an arbitrary slice of that instant and can hide
+      // its newer ids entirely. Ask for the hub maximum (200) before concluding
+      // anything, and remember that this instant is oversubscribed.
+      if (page.full && page.messages.length >= limits.messagePageSize
+          && sameInstant(page.messages) && limits.messagePageSize < MAX_PAGE) {
+        remaining--;
+        requests++;
+        page = await fetchWindow({ fetchPage, lo, hi, limit: MAX_PAGE });
+      }
+      const { messages, full, oldestAt } = page;
+      const oversubscribed = full && messages.length >= MAX_PAGE && sameInstant(messages);
 
       let hitCap = false;
       let inFlightHeld = false;
@@ -774,9 +806,29 @@ export class CatchupRunner {
       // id this page returned; when the walk is done the timestamp query runs
       // again (see the id-scan branch) and the loop only ends once a full page
       // of that instant holds nothing unseen.
-      this.state.useIdScan(this.label, kind, id,
-        messages.reduce((max, m) => (String(m.id) > String(max) ? m.id : max), messages[0].id),
-        oldestAt);
+      if (oversubscribed) {
+        // More than a whole maximum-sized page in one millisecond: the only way
+        // left is the hub's (created_at, id) cursor, started from the channel's
+        // newest row so the tied rows the timestamp page cannot reach are still
+        // visited.
+        this.state.useIdScan(this.label, kind, id, ID_SCAN_FROM_TOP, oldestAt);
+        continue;
+      }
+      if (!sameInstant(messages)) {
+        // The page spans several instants: every row strictly newer than its
+        // oldest row has been read. Narrow the window to that instant and
+        // re-read it — but only when the oldest instant may still hide rows
+        // (i.e. it fills the page on its own). Otherwise the whole page is in
+        // hand and the window can simply continue below it.
+        // Re-read the oldest instant: the page may have room for only part of
+        // it (the loop's ids dedupe make the re-read cheap).
+        this.state.shrinkWindowTop(this.label, kind, id, oldestAt);
+        continue;
+      }
+      // One instant, and a maximum-sized page still did not drain it — already
+      // handled by `oversubscribed` above. Reaching here means the instant fit
+      // in this page: it is fully read.
+      this.state.commitWindow(this.label, kind, id);
       continue;
     }
 

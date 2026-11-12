@@ -471,24 +471,19 @@ export class CatchupStateStore {
     const key = CatchupStateStore.targetKey(kind, id);
     const t = org.targets[key];
     if (!t || t.windows.length === 0) return;
-    const [, hi] = t.windows.shift();
+    const [lo, hi] = t.windows.shift();
     t.anchorId = null;
     t.anchorAt = 0;
     if (t.windows.length === 0) {
-      // The scan is done through the last window's top, never further: `hi` is
-      // only the high-water mark, and a window list that does not reach it
-      // means the newest slice was never queried.
-      const reached = hi > t.doneUpTo ? hi : t.doneUpTo;
+      // One window left and it was read: the scan is done through its top.
+      // `hi` may be BELOW the high-water mark because the window was narrowed
+      // while walking down; that is fine, the rows above were delivered on the
+      // way. Reading forward never re-opens the tail — `extendTarget()` is what
+      // adds new range, and it always adds it as a new window.
+      const reached = Math.max(hi, t.doneUpTo);
       t.doneUpTo = reached;
-      if (t.hi > reached) {
-        // Keep the uncovered tail open instead of declaring it done.
-        t.windows = [[reached + 1, t.hi]];
-        t.ids = [];
-        t.byId = false;
-      } else {
-        t.ids = [];
-        t.byId = false;
-      }
+      t.ids = [];
+      t.byId = false;
     } else {
       if (hi > t.doneUpTo) t.doneUpTo = hi;
       const bottom = Math.min(...t.windows.map(w => w[0]));
