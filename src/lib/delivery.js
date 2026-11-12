@@ -18,9 +18,18 @@
 
 import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './auth.js';
 
-export const DELIVER = 'deliver';
-export const SKIP = 'skipped';
-export const REJECT = 'rejected';
+/**
+ * The ONE vocabulary the delivery pipelines speak.
+ *
+ * `DELIVERED` is what `deliverDm()`/`deliverThread()` return after C4 accepted a
+ * message. `DELIVER` is the policy verdict meaning "go ahead and deliver".
+ * They are different events — keep them different, and let the constants (not
+ * string literals) cross the boundary.
+ */
+export const DELIVER = 'deliver';   // policy: proceed
+export const DELIVERED = 'delivered'; // pipeline: C4 accepted it
+export const SKIP = 'skipped';      // policy: no delivery, no final answer
+export const REJECT = 'rejected';   // policy: final no
 
 const verdict = (verdict, reason) => ({ verdict, reason });
 
@@ -95,16 +104,20 @@ export function decideCatchupEvent({ access, event }) {
  * @returns {'delivered'|'rejected'|'skipped'|'failed'}
  */
 export function settleLiveDelivery({ outcome, error, id, at, gate, markGap, save }) {
-  if (error || (outcome !== DELIVER && outcome !== REJECT && outcome !== SKIP)) {
+  // A pipeline that actually reached C4 answers DELIVERED; a policy decision
+  // answers REJECT. Both are final answers for this message. A policy DELIVER
+  // verdict never comes back here — that is the go-ahead, not a result.
+  const accepted = outcome === DELIVERED || outcome === DELIVER;
+  if (error || (!accepted && outcome !== REJECT && outcome !== SKIP)) {
     gate?.clear?.(id);
     markGap?.();
     save?.();
     return 'failed';
   }
-  if (outcome === DELIVER || outcome === REJECT) {
+  if (accepted || outcome === REJECT) {
     gate?.mark?.(id, at);
     save?.();
-    return outcome;
+    return accepted ? DELIVERED : REJECT;
   }
   gate?.clear?.(id);
   return SKIP;

@@ -17,6 +17,7 @@ import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js
 import {
   decideDmDelivery, decideThreadDelivery, decideCatchupEvent, settleLiveDelivery,
   REJECT as POLICY_REJECT, DELIVER as POLICY_DELIVER,
+  DELIVERED as DELIVERY_OK, SKIP as DELIVERY_SKIP,
 } from './lib/delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
@@ -401,8 +402,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   const deliverDm = async ({ message, sender_name: senderName, parts, catchup = false }) => {
     const sender = senderName || message.sender_name || 'unknown';
     const content = message.content || '';
-    // Return codes: 'delivered' (C4 accepted), 'rejected' (policy said no),
-    // 'skipped' (duplicate / too large / self). Anything else throws.
+    // Return codes (the same constants the shared policy/settle helpers use):
+    // DELIVERY_OK (C4 accepted), POLICY_REJECT (final policy no),
+    // DELIVERY_SKIP (self / duplicate / rate-limited). Anything else throws.
     const decision = decideDmDelivery({
       access: org.access, isSelf, message, sender, catchup,
       takeRateToken: () => getRateLimiter(`${label}:dm:${message.sender_id || sender}`).consume(),
@@ -413,7 +415,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     }
     if (decision.verdict !== POLICY_DELIVER) {
       if (decision.reason === 'rate-limited') console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
-      return decision.verdict;
+      return DELIVERY_SKIP;
     }
 
     // Download media after policy checks to avoid wasted effort
@@ -431,7 +433,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // Awaited for BOTH live and replay: a message only counts as delivered once
     // C4 accepted it. A live failure therefore stays deliverable by catch-up.
     await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
-    return 'delivered';
+    return DELIVERY_OK;
   };
 
   // ─── Event Handlers ───────────────────────────────────
@@ -553,7 +555,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       } else if (decision.reason === 'rate-limited') {
         console.warn(`${lp} Thread ${threadId} from ${sender} rate-limited, dropping`);
       }
-      return decision.verdict;
+      return DELIVERY_SKIP;
     }
 
     // Download media for trigger message (after policy checks)
@@ -614,7 +616,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // Awaited for BOTH live and replay: only a C4 acknowledgement makes this
     // message "delivered" (see the handler's gate.mark()).
     await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
-    return 'delivered';
+    return DELIVERY_OK;
   }
 
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
