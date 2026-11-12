@@ -1,3 +1,4 @@
+import { deliverRealtime, shouldDeliverCatchupEvent } from './lib/delivery.js';
 /**
  * zylos-hxa-connect - HXA-Connect WebSocket client for Zylos Bot
  * Connects to HXA-Connect hubs via SDK and bridges messages to C4.
@@ -415,12 +416,6 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   // until a replay has confirmed the gap is covered.
   if (catchupState.getWatermark(label)) catchupState.setDirty(label, true);
 
-  /** Advance the watermark past a message handled outside the shared pipeline. */
-  const markHandled = (id, at) => {
-    gate.mark(id, at);
-    catchupState.scheduleSave();
-  };
-
   /**
    * Single delivery pipeline for one DM message.
    * Used by both the realtime 'message' handler and catch-up, so policy,
@@ -459,12 +454,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
     console.log(`${lp} DM from ${sender}${catchup ? ' (catch-up)' : ''}: ${content.substring(0, 80)}`);
     const formatted = buildDmContent({ displayPrefix: dp, sender, content, attachments, catchup });
-    if (catchup) {
-      // Awaited so the watermark only advances once C4 accepted the message.
-      await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
-    } else {
-      sendToC4(C4_CHANNEL, c4Endpoint(label, sender), formatted);
-    }
+    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
   };
 
   // ─── Event Handlers ───────────────────────────────────
@@ -473,18 +463,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     try {
       const wire = msg.message || {};
       const at = Number(wire.created_at) || Date.now();
-      // Catch-up may already have delivered this id (and vice versa).
-      if (gate.isSeen(wire.id)) {
-        console.log(`${lp} DM ${wire.id} already handled, skipping realtime duplicate`);
-        return;
-      }
-      gate.begin(wire.id);
-      try {
-        await deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false });
-      } finally {
-        gate.clear(wire.id);
-      }
-      markHandled(wire.id, at);
+      await deliverRealtime({ gate, state: catchupState, label, id: wire.id, at,
+        deliver: () => deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false }),
+        retry: () => catchup._scheduleContinuation(),
+      });
     } catch (err) {
       console.error(`${lp} DM handler error: ${err.message}`);
     }
@@ -640,11 +622,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     } else {
       console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
     }
-    if (catchup) {
-      await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
-    } else {
-      sendToC4(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
-    }
+    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
   }
 
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
@@ -657,17 +635,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       const wire = message || {};
       const at = Number(wire.created_at) || Date.now();
-      if (gate.isSeen(wire.id)) {
-        console.log(`${lp} Thread ${threadId} message ${wire.id} already handled, skipping realtime duplicate`);
-        return;
-      }
-      if (wire.id) gate.begin(wire.id);
-      try {
-        await deliverThread({ threadId, message, snapshot, reason, catchup: false });
-      } finally {
-        gate.clear(wire.id);
-      }
-      markHandled(wire.id, at);
+      await deliverRealtime({ gate, state: catchupState, label, id: wire.id, at,
+        deliver: () => deliverThread({ threadId, message, snapshot, reason, catchup: false }),
+        retry: () => catchup._scheduleContinuation(),
+      });
     } catch (err) {
       console.error(`${lp} Thread handler error: ${err.message}`);
     }
@@ -768,9 +739,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // Invites / status changes that happened while offline: reuse the realtime
     // notification path (admin channel) so they are visible, not just logged.
     deliverEvent: async (event) => {
+      if (!shouldDeliverCatchupEvent(org.access, event)) return;
       const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
       if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
-        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
       } else {
         console.log(`${lp} catch-up event: ${text}`);
       }

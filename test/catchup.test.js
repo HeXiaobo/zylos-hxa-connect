@@ -18,6 +18,7 @@ import path from 'node:path';
 
 import { CatchupRunner, DEFAULT_LIMITS, DeliveryGate, formatCatchupSummary } from '../src/lib/catchup.js';
 import { CatchupStateStore } from '../src/lib/catchup-state.js';
+import { deliverRealtime, shouldDeliverCatchupEvent } from '../src/lib/delivery.js';
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -370,5 +371,91 @@ describe('catch-up on reconnect', () => {
     assert.match(text, /73 条/);
     assert.match(text, /26\.0 小时/);
     assert.match(text, /不丢弃任何消息/);
+  });
+});
+
+
+describe('review regression cases', () => {
+  it('includes split boundary with strict since and before', async () => {
+    const { state } = seededState(1000);
+    const all = [1100, 1300, 1500, 1700, 1900].map((t, i) => msg(`b${i}`, t));
+    const client = { catchup: async () => ({events: [{type:'channel_message_summary', channel_id:'c'}]}),
+      getMessages: async (_, o) => all.filter(m => m.created_at > o.since && m.created_at < o.before).slice(0, o.limit) };
+    const delivered = [];
+    const runner = new CatchupRunner({client, state, label:'default', now:()=>2000,
+      limits:{queryOverlapMs:0, messagePageSize:2, messageMaxPages:100, batchDelayMs:0}, deliverMessage:async x=>delivered.push(x.message.id)});
+    await runner.run(); runner.dispose();
+    assert.deepEqual(delivered, all.map(m => m.id));
+    assert.equal(state.isDirty('default'), false);
+  });
+
+  it('drains 3001 messages without evicting dirty dedup IDs, including after restart', async () => {
+    let {state, filePath} = seededState(1000);
+    const all = Array.from({length:3001}, (_, i) => msg(`id${i}`, 2000+i));
+    const client = fakeClient({channels:{'dm-1':all}, events:()=>[{type:'channel_message_summary',channel_id:'dm-1'}]});
+    const delivered = [];
+    for (let i=0; i<4; i++) {
+      const runner = new CatchupRunner({client,state,label:'default',now:()=>10000,
+        limits:{queryOverlapMs:0,messagePageSize:5000,maxMessagesPerRun:1000,batchSize:10000},
+        deliverMessage:async x=>delivered.push(x.message.id)});
+      await runner.run(); runner.dispose();
+      state = new CatchupStateStore({filePath}).load();
+    }
+    assert.equal(delivered.length, 3001);
+    assert.equal(new Set(delivered).size, 3001);
+    assert.equal(state.isDirty('default'), false);
+  });
+
+  it('continues a channel scan across page budgets and restart', async () => {
+    let {state, filePath} = seededState(1000);
+    const all = Array.from({length:20}, (_, i) => msg(`p${i}`, 1100+i*10));
+    const client = fakeClient({channels:{'dm-1':all},events:()=>[{type:'channel_message_summary',channel_id:'dm-1'}]});
+    const delivered=[];
+    for (let i=0;i<100 && state.isDirty('default');i++) {
+      const runner = new CatchupRunner({client,state,label:'default',now:()=>2000,
+        limits:{queryOverlapMs:0,messagePageSize:2,messageMaxPages:2,batchSize:100},deliverMessage:async x=>delivered.push(x.message.id)});
+      await runner.run(); runner.dispose();
+      state = new CatchupStateStore({filePath}).load();
+    }
+    assert.equal(delivered.length,20);
+    assert.equal(new Set(delivered).size,20);
+    assert.equal(state.isDirty('default'),false);
+  });
+
+  it('retries realtime C4 failure without marking message or moving watermark', async () => {
+    const {state} = seededState(1000); state.setDirty('default',false);
+    const gate = new DeliveryGate({state,label:'default'}); let retried=0;
+    await assert.rejects(deliverRealtime({gate,state,label:'default',id:'failed',at:1200,
+      deliver:async()=>{throw new Error('C4 rejected')},retry:()=>retried++}), /C4 rejected/);
+    assert.equal(state.hasSeen('default','failed'),false);
+    assert.equal(state.getWatermark('default'),1000);
+    assert.equal(state.isDirty('default'),true);
+    assert.equal(retried,1);
+    const client=fakeClient({channels:{'dm-1':[msg('failed',1200)]},events:()=>[{type:'channel_message_summary',channel_id:'dm-1'}]});
+    const delivered=[]; const runner=new CatchupRunner({client,state,label:'default',now:()=>2000,
+      deliverMessage:async x=>delivered.push(x.message.id)});
+    await runner.run(); runner.dispose(); assert.deepEqual(delivered,['failed']);
+  });
+
+  it('resumes event pages and refuses to settle with missing cursor', async () => {
+    let {state,filePath}=seededState(1000); let broken=true;
+    const client={catchup:async ({cursor}) => broken ? {events:[],has_more:true} :
+      cursor ? {events:[{type:'thread_invited',thread_id:'last'}],has_more:false} :
+      {events:[{type:'thread_status_changed',thread_id:'first'}],has_more:true,cursor:'next'}};
+    const delivered=[];
+    const make=()=>new CatchupRunner({client,state,label:'default',now:()=>2000,limits:{eventMaxPages:1},
+      deliverMessage:async()=>{},deliverEvent:async e=>delivered.push(e.thread_id)});
+    let r=make(); await r.run(); r.dispose();
+    assert.equal(state.isDirty('default'),true); assert.equal(state.getWatermark('default'),1000);
+    broken=false; r=make(); await r.run(); r.dispose();
+    assert.equal(state.isDirty('default'),true); assert.deepEqual(delivered,[]);
+    state=new CatchupStateStore({filePath}).load(); r=make(); await r.run(); r.dispose();
+    assert.deepEqual(delivered,['first','last']); assert.equal(state.isDirty('default'),false);
+  });
+
+  it('suppresses offline thread invites under disabled group policy', () => {
+    assert.equal(shouldDeliverCatchupEvent({groupPolicy:'disabled'},{type:'thread_invited'}),false);
+    assert.equal(shouldDeliverCatchupEvent({groupPolicy:'open'},{type:'thread_invited'}),true);
+    assert.equal(shouldDeliverCatchupEvent({groupPolicy:'disabled'},{type:'bot_status_changed'}),true);
   });
 });

@@ -57,10 +57,12 @@ function normalizeOrg(raw, maxRecentIds) {
     org.dirty = true;
   }
   org.dirty = raw.dirty === true;
+  org.dirtyRevision = toPositiveInt(raw.dirtyRevision);
   if (Array.isArray(raw.recentIds)) {
     const ids = raw.recentIds.filter(id => typeof id === 'string' && id.length > 0);
-    org.recentIds = ids.slice(-maxRecentIds);
+    org.recentIds = org.dirty ? ids : ids.slice(-maxRecentIds);
   }
+  if (raw.scan && typeof raw.scan === 'object') org.scan = raw.scan;
   return org;
 }
 
@@ -143,7 +145,10 @@ export class CatchupStateStore {
   }
 
   setDirty(label, value = true) {
-    this.getOrg(label).dirty = value === true;
+    const org = this.getOrg(label);
+    org.dirty = value === true;
+    if (org.dirty) org.dirtyRevision = (org.dirtyRevision || 0) + 1;
+    if (!org.dirty) org.recentIds = org.recentIds.slice(-this.maxRecentIds);
   }
 
   hasSeen(label, id) {
@@ -161,7 +166,7 @@ export class CatchupStateStore {
       if (idx !== -1) org.recentIds.splice(idx, 1);
       org.recentIds.push(id);
     }
-    if (org.recentIds.length > this.maxRecentIds) {
+    if (!org.dirty && org.recentIds.length > this.maxRecentIds) {
       org.recentIds = org.recentIds.slice(-this.maxRecentIds);
     }
   }

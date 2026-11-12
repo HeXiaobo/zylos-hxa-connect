@@ -87,7 +87,7 @@ export class DeliveryGate {
     this.state.remember(this.label, id);
     if (at) {
       this.state.setLastDeliveredAt(this.label, at);
-      if (!this.state.isDirty(this.label)) this.state.setWatermark(this.label, at);
+      if (!this.state.isDirty(this.label) && this.inFlight.size === 0) this.state.setWatermark(this.label, at);
     }
   }
 
@@ -136,59 +136,26 @@ function toArrayResult(res) {
  * ran out or a window could not be split further (many messages sharing one
  * millisecond); the caller keeps its floor and resumes on the next reconnect.
  */
-async function collectMessages({ fetchPage, since, until, limits, log, what }) {
-  const seen = new Map();
+async function collectMessages({ fetchPage, scan, limits, log, what }) {
   let budget = limits.messageMaxPages;
-  let complete = true;
-
-  const take = batch => {
-    const out = [];
-    for (const m of toArrayResult(batch)) {
-      if (!m || !m.id || seen.has(m.id)) continue;
-      seen.set(m.id, m);
-      out.push(m);
-    }
-    return out;
-  };
-
-  // Iterative work list of half-open windows [lo, hi).
-  const windows = [[since, until]];
-  while (windows.length > 0) {
-    if (budget <= 0) {
-      complete = false;
-      break;
-    }
-    const [lo, hi] = windows.shift();
-    budget--;
-
-    const opts = { limit: limits.messagePageSize };
-    if (lo > 0) opts.since = lo;
-    if (hi != null && Number.isFinite(hi)) opts.before = hi;
+  while (scan.windows.length && budget-- > 0) {
+    const [lo, hi] = scan.windows[0];
+    const opts = { limit: limits.messagePageSize, since: Math.max(0, lo - 1), before: hi };
     const batch = toArrayResult(await fetchPage(opts));
-
-    if (batch.length < limits.messagePageSize) {
-      take(batch);
-      continue;
+    scan.windows.shift();
+    for (const m of batch) if (m?.id) scan.messages[m.id] = m;
+    if (batch.length < limits.messagePageSize) continue;
+    const mid = Math.floor((lo + hi) / 2);
+    if (mid <= lo || mid >= hi) {
+      // Keep the window pending: the API provides no way to enumerate a
+      // saturated millisecond without a cursor. Never declare it complete.
+      scan.windows.unshift([lo, hi]);
+      log(`catchup ${what}: cannot narrow saturated window at ${lo}`);
+      return 'stalled';
     }
-
-    // Possibly truncated: split the window and fetch both halves.
-    take(batch);
-    const mid = Math.floor((lo + (hi ?? Date.now())) / 2);
-    if (mid <= lo || (hi != null && mid >= hi)) {
-      // Cannot split further (same-millisecond flood) — resume next reconnect.
-      log(`catchup ${what}: cannot narrow window further at ${new Date(lo).toISOString()}; remaining messages resume on the next reconnect`);
-      complete = false;
-      continue;
-    }
-    windows.unshift([lo, mid], [mid, hi]);
+    scan.windows.unshift([lo, mid], [mid, hi]);
   }
-
-  const messages = [...seen.values()].sort((a, b) => {
-    const ta = Number(a.created_at) || 0;
-    const tb = Number(b.created_at) || 0;
-    return ta - tb || String(a.id).localeCompare(String(b.id));
-  });
-  return { messages, complete };
+  return scan.windows.length === 0;
 }
 
 export class CatchupRunner {
@@ -304,58 +271,60 @@ export class CatchupRunner {
     const querySince = Math.max(0, since - this.limits.queryOverlapMs);
     this.log(`catchup start (${reason}) since ${new Date(since).toISOString()}${resuming ? ' (gap suspected)' : ''}`);
 
-    let events;
+    // Freeze the query and persist its progress across runs and process restarts.
+    // Do not deliver partial scans: doing so would allow a later-discovered
+    // channel or older page to be skipped by a moving watermark.
+    const org = this.state.getOrg(this.label);
+    if (!org.scan) this.state.setDirty(this.label, true);
+    const scan = org.scan ||= { revision: org.dirtyRevision, since: querySince, until: startedAt, events: [], cursor: null, eventsDone: false, sources: {}, sourceIndex: 0 };
     try {
-      events = await this._collectEvents(querySince);
-    } catch (err) {
-      this.log(`catchup failed while fetching events (${err?.message || err}) — realtime traffic unaffected, retrying on next reconnect`);
-      this.lastRun = { reason, error: String(err?.message || err), at: startedAt };
-      return;
-    }
-
-    const messages = [];
-    const otherEvents = [];
-    let complete = true;
-    const names = await this._resolveSenderNames();
-
-    try {
-      for (const ev of events) {
-        if (ev.type === 'channel_message_summary' && ev.channel_id) {
-          const res = await collectMessages({
-            since: querySince,
-            until: startedAt,
-            limits: this.limits,
-            log: this.log,
-            what: `channel ${ev.channel_id}`,
-            fetchPage: opts => this.client.getMessages(ev.channel_id, opts),
-          });
-          complete = complete && res.complete;
-          for (const m of res.messages) {
-            messages.push({ kind: 'channel', channelId: ev.channel_id, message: this._withSenderName(m, names) });
-          }
-        } else if (ev.type === 'thread_message_summary' && ev.thread_id) {
-          const res = await collectMessages({
-            since: querySince,
-            until: startedAt,
-            limits: this.limits,
-            log: this.log,
-            what: `thread ${ev.thread_id}`,
-            fetchPage: opts => this.client.getThreadMessages(ev.thread_id, opts),
-          });
-          complete = complete && res.complete;
-          for (const m of res.messages) {
-            messages.push({ kind: 'thread', threadId: ev.thread_id, message: this._withSenderName(m, names) });
-          }
-        } else if (ev.type) {
-          otherEvents.push(ev);
+      if (!scan.eventsDone) {
+        const progress = await this._collectEvents(scan);
+        this.state.save();
+        if (!progress.complete) {
+          this.lastRun = { reason, truncated: true, at: startedAt };
+          if (progress.progressed) this._scheduleContinuation();
+          return;
         }
       }
+      const sources = scan.events.filter(ev =>
+        (ev.type === 'channel_message_summary' && ev.channel_id) ||
+        (ev.type === 'thread_message_summary' && ev.thread_id));
+      while (scan.sourceIndex < sources.length) {
+        const ev = sources[scan.sourceIndex];
+        const key = `${ev.type}:${ev.channel_id || ev.thread_id}`;
+        const source = scan.sources[key] ||= { windows: [[scan.since, scan.until]], messages: {} };
+        const complete = await collectMessages({
+          scan: source, limits: this.limits, log: this.log, what: key,
+          fetchPage: opts => ev.channel_id ? this.client.getMessages(ev.channel_id, opts) : this.client.getThreadMessages(ev.thread_id, opts),
+        });
+        this.state.save();
+        if (complete !== true) {
+          this.lastRun = { reason, truncated: true, at: startedAt };
+          if (complete !== 'stalled') this._scheduleContinuation();
+          return;
+        }
+        scan.sourceIndex++;
+      }
     } catch (err) {
-      this.log(`catchup failed while expanding events (${err?.message || err}) — realtime traffic unaffected, retrying on next reconnect`);
+      this.state.save();
+      this.log(`catchup failed while fetching events or expanding events (${err?.message || err})`);
       this.lastRun = { reason, error: String(err?.message || err), at: startedAt };
       return;
     }
-
+    const names = await this._resolveSenderNames();
+    const messages = [];
+    for (const [key, source] of Object.entries(scan.sources)) {
+      const isThread = key.startsWith('thread_message_summary:');
+      const id = key.slice(key.indexOf(':') + 1);
+      for (const m of Object.values(source.messages)) messages.push({
+        kind: isThread ? 'thread' : 'channel',
+        ...(isThread ? { threadId: id } : { channelId: id }),
+        message: this._withSenderName(m, names),
+      });
+    }
+    const otherEvents = scan.events.filter(ev => !MESSAGE_EVENT_TYPES.has(ev.type));
+    const complete = true;
     // Stable chronological order; ids break ties.
     messages.sort((a, b) => {
       const ta = Number(a.message?.created_at) || 0;
@@ -373,7 +342,8 @@ export class CatchupRunner {
 
     if (total === 0 && otherEvents.length === 0) {
       this.log('catchup: nothing missed');
-      this._settle(startedAt);
+      this._finishScan(scan);
+      delete org.scan;
       this.state.save();
       this.lastRun = { reason, delivered: 0, skipped: 0, at: startedAt };
       return;
@@ -412,6 +382,10 @@ export class CatchupRunner {
         const id = item.message?.id;
         const at = Number(item.message?.created_at) || 0;
 
+        if (this.gate.inFlight.has(id)) {
+          truncated = true;
+          break;
+        }
         if (this.gate.isSeen(id)) {
           skipped++;
           continue;
@@ -440,16 +414,21 @@ export class CatchupRunner {
         }
       }
 
-      for (const ev of otherEvents) {
+      for (let eventIndex = scan.deliveredEvents || 0; eventIndex < otherEvents.length; eventIndex++) {
+        const ev = otherEvents[eventIndex];
         try {
           if (this.deliverEvent) await this.deliverEvent({ ...ev, catchup: true, label: this.label });
           else this.log(`catchup event ${ev.type}: ${JSON.stringify(ev).substring(0, 200)}`);
+          scan.deliveredEvents = eventIndex + 1;
+          this.state.save();
         } catch (err) {
+          truncated = true;
           this.log(`catchup event ${ev.type} delivery failed (${err?.message || err})`);
+          break;
         }
       }
     } finally {
-      if (!truncated) this._settle(startedAt);
+      if (!truncated) { this._finishScan(scan); delete org.scan; }
       this.state.save();
     }
 
@@ -460,6 +439,15 @@ export class CatchupRunner {
     // (e.g. one millisecond with more messages than a page) waits for the next
     // reconnect instead of spinning.
     if (truncated && delivered > 0) this._scheduleContinuation();
+  }
+
+  _finishScan(scan) {
+    const changed = this.state.getOrg(this.label).dirtyRevision !== scan.revision;
+    if (changed || this.gate.inFlight.size) {
+      this._scheduleContinuation();
+    } else {
+      this._settle(scan.until);
+    }
   }
 
   /**
@@ -491,18 +479,22 @@ export class CatchupRunner {
     this.continuation.unref?.();
   }
 
-  async _collectEvents(since) {
-    const events = [];
-    let cursor;
+  async _collectEvents(scan) {
+    let progressed = false;
     for (let page = 0; page < this.limits.eventMaxPages; page++) {
-      const res = await this.client.catchup({ since, cursor, limit: this.limits.eventPageSize });
+      const res = await this.client.catchup({ since: scan.since, cursor: scan.cursor || undefined, limit: this.limits.eventPageSize });
       const list = Array.isArray(res) ? res : (Array.isArray(res?.events) ? res.events : []);
-      events.push(...list.filter(ev => ev && typeof ev === 'object'));
       const hasMore = Array.isArray(res) ? false : !!res?.has_more;
-      if (!hasMore || !res?.cursor) break;
-      cursor = res.cursor;
+      if (hasMore && (!res?.cursor || res.cursor === scan.cursor)) {
+        this.log('catchup events: missing or unchanged continuation cursor');
+        return { complete: false, progressed: false };
+      }
+      scan.events.push(...list.filter(ev => ev && typeof ev === 'object'));
+      progressed = true;
+      if (!hasMore) { scan.eventsDone = true; return { complete: true, progressed }; }
+      scan.cursor = res.cursor;
     }
-    return events;
+    return { complete: false, progressed };
   }
 
   /** REST messages may omit sender_name; resolve id → name once per run. */
