@@ -1,4 +1,3 @@
-import { deliverRealtime, shouldDeliverCatchupEvent } from './lib/delivery.js';
 /**
  * zylos-hxa-connect - HXA-Connect WebSocket client for Zylos Bot
  * Connects to HXA-Connect hubs via SDK and bridges messages to C4.
@@ -14,7 +13,11 @@ import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js';
-import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
+
+import {
+  decideDmDelivery, decideThreadDelivery, decideCatchupEvent, settleLiveDelivery,
+  REJECT as POLICY_REJECT, DELIVER as POLICY_DELIVER,
+} from './lib/delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
 import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
@@ -271,41 +274,14 @@ function executeC4(c4Args) {
   });
 }
 
+/**
+ * Fire-and-forget C4 send for notifications that carry no delivery guarantee
+ * (admin notices, lifecycle chatter). Message delivery uses sendToC4Awaited().
+ */
 function sendToC4(channel, endpoint, content) {
   if (!content) return;
-  if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-    console.warn(`[hxa-connect] C4 concurrency cap reached (${MAX_CONCURRENT_C4}), dropping message`);
-    return;
-  }
-  _activeC4Calls++;
-  const c4Args = [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
-
-  execFile('node', c4Args, { encoding: 'utf8' }, (error, stdout) => {
-    _activeC4Calls--;
-    if (!error) {
-      console.log(`[hxa-connect] -> C4: ${content.substring(0, 80)}...`);
-      return;
-    }
-    try {
-      const response = JSON.parse(error.stdout || stdout || '{}');
-      if (response.ok === false && response.error?.message) {
-        console.warn(`[hxa-connect] C4 rejected: ${response.error.message}`);
-        return;
-      }
-    } catch {}
-    console.warn(`[hxa-connect] C4 send failed, retrying: ${error.message}`);
-    setTimeout(() => {
-      if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-        console.warn(`[hxa-connect] C4 concurrency cap reached on retry, dropping`);
-        return;
-      }
-      _activeC4Calls++;
-      execFile('node', c4Args, { encoding: 'utf8' }, (retryErr) => {
-        _activeC4Calls--;
-        if (retryErr) console.error(`[hxa-connect] C4 retry failed: ${retryErr.message}`);
-        else console.log(`[hxa-connect] -> C4 (retry): ${content.substring(0, 80)}...`);
-      });
-    }, 2000);
+  sendToC4Awaited(channel, endpoint, content).catch(err => {
+    console.warn(`[hxa-connect] C4 notice dropped: ${err?.message || err}`);
   });
 }
 
@@ -411,10 +387,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   // Shared de-duplication + watermark bookkeeping for realtime and catch-up.
   const gate = new DeliveryGate({ state: catchupState, label });
 
-  // A restart or a dropped socket means we may have missed messages: mark the
-  // org dirty so realtime deliveries stop advancing the catch-up watermark
-  // until a replay has confirmed the gap is covered.
-  if (catchupState.getWatermark(label)) catchupState.setDirty(label, true);
+  // A restart or a dropped socket means we may have missed messages: open a
+  // gap so a replay has to confirm the window is covered before the event
+  // boundary moves. No boundary yet ⇒ the first run only baselines.
+  if (catchupState.getEventsSince(label)) catchupState.markGap(label);
 
   /**
    * Single delivery pipeline for one DM message.
@@ -425,21 +401,19 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   const deliverDm = async ({ message, sender_name: senderName, parts, catchup = false }) => {
     const sender = senderName || message.sender_name || 'unknown';
     const content = message.content || '';
-    if (isSelf(message.sender_id, message.metadata)) return;
-
-    if (!isDmAllowed(org.access, sender)) {
-      console.log(`${lp} DM from ${sender} rejected (dmPolicy: ${org.access?.dmPolicy || 'open'})`);
-      return;
+    // Return codes: 'delivered' (C4 accepted), 'rejected' (policy said no),
+    // 'skipped' (duplicate / too large / self). Anything else throws.
+    const decision = decideDmDelivery({
+      access: org.access, isSelf, message, sender, catchup,
+      takeRateToken: () => getRateLimiter(`${label}:dm:${message.sender_id || sender}`).consume(),
+    });
+    if (decision.verdict === POLICY_REJECT) {
+      console.log(`${lp} DM from ${sender} rejected (${decision.reason})`);
+      return POLICY_REJECT;
     }
-
-    if (!catchup) {
-      // Rate limiting is a realtime-only concern; replayed messages are already
-      // throttled in batches by the catch-up runner.
-      const rlKey = `${label}:dm:${message.sender_id || sender}`;
-      if (!getRateLimiter(rlKey).consume()) {
-        console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
-        return;
-      }
+    if (decision.verdict !== POLICY_DELIVER) {
+      if (decision.reason === 'rate-limited') console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
+      return decision.verdict;
     }
 
     // Download media after policy checks to avoid wasted effort
@@ -449,12 +423,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
     if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
       console.warn(`${lp} DM from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
-      return;
+      return POLICY_REJECT;
     }
 
     console.log(`${lp} DM from ${sender}${catchup ? ' (catch-up)' : ''}: ${content.substring(0, 80)}`);
     const formatted = buildDmContent({ displayPrefix: dp, sender, content, attachments, catchup });
+    // Awaited for BOTH live and replay: a message only counts as delivered once
+    // C4 accepted it. A live failure therefore stays deliverable by catch-up.
     await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
+    return 'delivered';
   };
 
   // ─── Event Handlers ───────────────────────────────────
@@ -463,10 +440,27 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     try {
       const wire = msg.message || {};
       const at = Number(wire.created_at) || Date.now();
-      await deliverRealtime({ gate, state: catchupState, label, id: wire.id, at,
-        deliver: () => deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false }),
-        retry: () => catchup._scheduleContinuation(),
+      // Catch-up may already have delivered this id (and vice versa).
+      if (gate.isSeen(wire.id)) {
+        console.log(`${lp} DM ${wire.id} already handled, skipping realtime duplicate`);
+        return;
+      }
+      gate.begin(wire.id);
+      // Only a C4 acknowledgement (or a final policy rejection) is recorded.
+      // A transport failure opens a gap and stays replayable (blocker 4).
+      let outcome;
+      let error;
+      try {
+        outcome = await deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false });
+      } catch (err) {
+        error = err;
+      }
+      settleLiveDelivery({
+        outcome, error, id: wire.id, at, gate,
+        markGap: () => catchupState.markGap(label),
+        save: () => catchupState.scheduleSave(),
       });
+      if (error) throw error;
     } catch (err) {
       console.error(`${lp} DM handler error: ${err.message}`);
     }
@@ -538,33 +532,28 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const sender = msgSender(message);
     const content = message.content || '';
     const isInteractiveDelivery = reason === 'message';
-
-    // groupPolicy / sender policy apply to interactive thread messages only.
-    // Catch-up reuses them: a message that would not be delivered in realtime
-    // is not delivered when replayed either.
-    if (isInteractiveDelivery && !isThreadAllowed(org.access, threadId)) {
-      console.log(`${lp} Thread ${threadId} rejected (groupPolicy: ${org.access?.groupPolicy || 'open'})`);
-      return;
-    }
-    if (isInteractiveDelivery && !isSenderAllowed(org.access, threadId, sender)) {
-      console.log(`${lp} Sender ${sender} rejected in thread ${threadId}`);
-      return;
-    }
-
     const isRealMention = mentionRe.test(extractText(message)) || !!message.mention_all;
     const perThreadMode = getThreadMode(threadId);
 
-    // Mention-mode gating only applies to interactive thread messages.
-    if (isInteractiveDelivery && perThreadMode === 'mention' && !isRealMention) {
-      return;
+    // One policy gate for the live socket and for replay: self-echo, groupPolicy
+    // (incl. `disabled`, which stops invites too), sender allowlist, mention
+    // mode and realtime rate limiting.
+    const decision = decideThreadDelivery({
+      access: org.access, isSelf, message, threadId, sender, reason,
+      mode: perThreadMode, isMention: isRealMention, catchup,
+      takeRateToken: () => getRateLimiter(`${label}:thread:${message.sender_id || sender}`).consume(),
+    });
+    if (decision.verdict === POLICY_REJECT) {
+      console.log(`${lp} Thread ${threadId} rejected (${decision.reason})`);
+      return POLICY_REJECT;
     }
-
-    if (isInteractiveDelivery && !catchup) {
-      const rlKey = `${label}:thread:${message.sender_id || sender}`;
-      if (!getRateLimiter(rlKey).consume()) {
+    if (decision.verdict !== POLICY_DELIVER) {
+      if (decision.reason === 'self' && message?.id) {
+        console.log(`${lp} Thread ${threadId} message ${message.id} is our own — not delivering`);
+      } else if (decision.reason === 'rate-limited') {
         console.warn(`${lp} Thread ${threadId} from ${sender} rate-limited, dropping`);
-        return;
       }
+      return decision.verdict;
     }
 
     // Download media for trigger message (after policy checks)
@@ -573,7 +562,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
     if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
       console.warn(`${lp} Thread ${threadId} from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
-      return;
+      return POLICY_REJECT;
     }
 
     const lifecycleBlock = buildLifecycleBlock(snapshot);
@@ -622,7 +611,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     } else {
       console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
     }
+    // Awaited for BOTH live and replay: only a C4 acknowledgement makes this
+    // message "delivered" (see the handler's gate.mark()).
     await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
+    return 'delivered';
   }
 
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
@@ -635,10 +627,24 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       const wire = message || {};
       const at = Number(wire.created_at) || Date.now();
-      await deliverRealtime({ gate, state: catchupState, label, id: wire.id, at,
-        deliver: () => deliverThread({ threadId, message, snapshot, reason, catchup: false }),
-        retry: () => catchup._scheduleContinuation(),
+      if (gate.isSeen(wire.id)) {
+        console.log(`${lp} Thread ${threadId} message ${wire.id} already handled, skipping realtime duplicate`);
+        return;
+      }
+      if (wire.id) gate.begin(wire.id);
+      let outcome;
+      let error;
+      try {
+        outcome = await deliverThread({ threadId, message, snapshot, reason, catchup: false });
+      } catch (err) {
+        error = err;
+      }
+      settleLiveDelivery({
+        outcome, error, id: wire.id, at, gate,
+        markGap: () => catchupState.markGap(label),
+        save: () => catchupState.scheduleSave(),
       });
+      if (error) throw error;
     } catch (err) {
       console.error(`${lp} Thread handler error: ${err.message}`);
     }
@@ -722,6 +728,8 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
     // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).
     deliverMessage: async ({ kind, message, channelId, threadId }) => {
+      // Throwing keeps the message queued for the next run; policy rejections
+      // and self-echo resolve normally so they are not retried forever.
       if (kind === 'thread') {
         const snapshot = { thread: { id: threadId }, participants: [], newMessages: [message], bufferedCount: 0, artifacts: [], lifecycleEvents: [] };
         await deliverThread({ threadId, message, snapshot, reason: 'message', catchup: true });
@@ -739,10 +747,17 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // Invites / status changes that happened while offline: reuse the realtime
     // notification path (admin channel) so they are visible, not just logged.
     deliverEvent: async (event) => {
-      if (!shouldDeliverCatchupEvent(org.access, event)) return;
+      // Offline lifecycle events go through the SAME policy boundary as the
+      // realtime handlers: groupPolicy=disabled means thread activity is not
+      // delivered at all, invites included (their metadata names the topic).
+      const decision = decideCatchupEvent({ access: org.access, event });
+      if (decision.verdict === POLICY_REJECT) {
+        console.log(`${lp} catch-up event ${event.type} dropped (${decision.reason})`);
+        return;
+      }
       const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
       if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
-        await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
       } else {
         console.log(`${lp} catch-up event: ${text}`);
       }
@@ -750,12 +765,12 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   });
 
   client.on('close', () => {
-    catchupState.setDirty(label, true);
+    catchupState.markGap(label);
     catchupState.scheduleSave();
   });
 
   client.on('reconnecting', ({ attempt, delay }) => {
-    catchupState.setDirty(label, true);
+    catchupState.markGap(label);
     catchupState.scheduleSave();
     console.log(`${lp} Reconnecting (attempt ${attempt}, delay ${delay}ms)...`);
   });
