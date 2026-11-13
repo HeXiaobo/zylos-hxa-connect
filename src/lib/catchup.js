@@ -659,6 +659,16 @@ export class CatchupRunner {
           }
         }
 
+        // A terminal API page is not a completed scan if consumption stopped
+        // at the run cap or a row is still awaiting realtime C4. Keep both the
+        // window and cursor so the next run can re-read every unfinished row.
+        if (hitCap || inFlightHeld) {
+          complete = false;
+          if (inFlightHeld) {
+            this.log(`catchup ${kind} ${id}: rows still in flight from realtime — id scan paused, window kept open`);
+          }
+          break;
+        }
         if (below || messages.length === 0 || !full) {
           // Walked through the whole channel below the anchor. Go back to the
           // timestamp query for this window once: it may still hold tied rows
@@ -672,17 +682,6 @@ export class CatchupRunner {
           }
           this.state.commitWindow(this.label, kind, id);
           continue;
-        }
-        if (hitCap) {
-          complete = false;
-          break;
-        }
-        if (inFlightHeld) {
-          // An in-flight live delivery has no final answer yet: keep the cursor
-          // where it is so the row is re-read next run.
-          complete = false;
-          this.log(`catchup ${kind} ${id}: rows still in flight from realtime — id scan paused, window kept open`);
-          break;
         }
         // Descending id walk: continue strictly below the smallest id of the
         // page we just consumed.
