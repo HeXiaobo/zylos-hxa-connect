@@ -14,6 +14,8 @@ import path from 'path';
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
 import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import { MEDIA_BASE_DIR, generateFilename } from '../src/lib/media.js';
+import { CatchupRunner } from '../src/lib/catchup.js';
+import { CatchupStateStore, resolveCatchupStatePath } from '../src/lib/catchup-state.js';
 
 const args = process.argv.slice(2);
 
@@ -176,6 +178,118 @@ try {
       if (!since) fail('Usage: cli.js inbox --since <timestamp_ms>');
       const messages = await client.inbox(Number(since));
       out(messages);
+      break;
+    }
+
+    // ─── Catch-up (reconnect replay) ────────────────────────
+
+    case 'catchup-state': {
+      const store = new CatchupStateStore({
+        filePath: process.env.HXA_CATCHUP_STATE_PATH || resolveCatchupStatePath(),
+      }).load();
+      const org = store.getOrg(orgLabel);
+      out({
+        org: orgLabel,
+        state_file: store.filePath,
+        events_since: org.eventsSince || null,
+        events_since_iso: org.eventsSince ? new Date(org.eventsSince).toISOString() : null,
+        event_cursor: org.eventCursor || null,
+        gap_suspected: org.dirty === true,
+        gap_epoch: org.gapEpoch || 0,
+        last_delivered_at: org.lastDeliveredAt || null,
+        recent_ids: org.recentIds.length,
+        open_targets: Object.entries(org.targets).map(([key, t]) => ({
+          target: key,
+          done_up_to: t.doneUpTo || null,
+          hi: t.hi || null,
+          pending_windows: t.windows.length,
+          window_ids: t.ids.length,
+          anchor: t.anchorId || null,
+        })),
+      });
+      break;
+    }
+
+    case 'catchup-pull': {
+      // Replay everything missed since the stored boundary, right now, without
+      // waiting for a reconnect. Read-only: the state file is NOT modified, so
+      // the running bot keeps its own progress (this is a peek, not a consumer).
+      const store = new CatchupStateStore({
+        filePath: process.env.HXA_CATCHUP_STATE_PATH || resolveCatchupStatePath(),
+      }).load();
+      if (!store.getEventsSince(orgLabel)) {
+        fail(`No catch-up boundary for org "${orgLabel}" yet — the bot must connect once first`);
+      }
+      // Neutralise every write so the on-disk progress is untouched.
+      store.save = () => true;
+      store.scheduleSave = () => {};
+      store.flush = () => true;
+      store.settleGap = () => false;
+      store.commitWindow = () => {};
+      store.shrinkWindowTop = () => {};
+      store.addTargetId = () => {};
+      store.setAnchor = () => {};
+      store.extendTarget = (label, kind, id, hi) => {
+        const t = { doneUpTo: 0, hi: 0, windows: [], ids: [], anchorId: null, anchorAt: 0 };
+        const key = CatchupStateStore.targetKey(kind, id);
+        const org = store.getOrg(label);
+        const existing = org.targets[key];
+        if (existing && existing.windows.length) return existing;
+        t.hi = Number(hi) || 0;
+        t.windows = t.hi > 0 ? [[1, t.hi]] : [];
+        org.targets[key] = t;
+        return t;
+      };
+      store.pruneTargets = () => {};
+
+      const limitStr = getFlag('limit');
+      const maxMessages = limitStr == null ? Infinity : Number(limitStr);
+      if (Number.isFinite(maxMessages) && maxMessages < 1) fail('--limit must be a positive integer');
+
+      const messages = [];
+      const events = [];
+      const runner = new CatchupRunner({
+        client,
+        label: orgLabel,
+        state: store,
+        log: msg => console.error(`[catchup-pull] ${msg}`),
+        limits: {
+          batchDelayMs: 0,
+          ...(Number.isFinite(maxMessages)
+            ? { maxMessagesPerRun: Math.max(1, Math.floor(maxMessages)) }
+            : {}),
+        },
+        deliverMessage: async item => {
+          messages.push({
+            kind: item.kind === 'thread' ? 'thread' : 'channel',
+            id: item.message?.id,
+            channel_id: item.kind === 'thread' ? undefined : item.targetId,
+            thread_id: item.kind === 'thread' ? item.targetId : undefined,
+            sender_id: item.message?.sender_id,
+            sender_name: item.message?.sender_name,
+            created_at: item.message?.created_at,
+            content: item.message?.content,
+            parts: item.message?.parts,
+          });
+        },
+        deliverSummary: async () => {},
+        deliverEvent: async ev => {
+          events.push({ type: ev.type, thread_id: ev.thread_id, occurred_at: ev.occurred_at });
+        },
+      });
+      await runner.run('cli');
+      runner.dispose();
+
+      out({
+        org: orgLabel,
+        state_file: store.filePath,
+        events_since: store.getEventsSince(orgLabel),
+        gap_suspected: store.isDirty(orgLabel),
+        count: messages.length,
+        truncated: Number.isFinite(maxMessages) && messages.length >= maxMessages,
+        messages,
+        events,
+      });
       break;
     }
 
@@ -448,6 +562,8 @@ try {
             org: 'Org info',
             catchup: 'Offline events --since <timestamp_ms> [--cursor X] [--limit N]',
             'catchup-count': 'Count missed events --since <timestamp_ms>',
+            'catchup-state': 'Show the local catch-up watermark / gap flag',
+            'catchup-pull': 'Replay everything missed since the watermark (JSON on stdout)',
             inbox: 'New messages --since <timestamp_ms>',
           },
           thread_ops: {

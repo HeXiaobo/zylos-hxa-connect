@@ -13,8 +13,17 @@ import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { migrateConfig, resolveOrgs, setupFetchProxy, PROXY_URL } from './env.js';
-import { isDmAllowed, isThreadAllowed, isSenderAllowed } from './lib/auth.js';
+
+import {
+  decideDmDelivery, decideThreadDelivery, decideCatchupEvent, settleLiveDelivery,
+  REJECT as POLICY_REJECT, DELIVER as POLICY_DELIVER,
+  DELIVERED as DELIVERY_OK, SKIP as DELIVERY_SKIP,
+} from './lib/delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
+// zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
+import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
+import { buildDmContent, buildThreadHeader } from './lib/format.js';
+import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 
 const HOME = process.env.HOME;
 const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -250,42 +259,64 @@ const wsOptions = {
 
 // ─── C4 Bridge ─────────────────────────────────────────────
 
+function executeC4(c4Args) {
+  return new Promise((resolve, reject) => {
+    execFile('node', c4Args, { encoding: 'utf8' }, (error, stdout) => {
+      if (!error) return resolve(stdout);
+      try {
+        const response = JSON.parse(error.stdout || stdout || '{}');
+        if (response.ok === false && response.error?.message) {
+          // Definitive rejection — retrying will not help.
+          return reject(Object.assign(new Error(response.error.message), { c4Rejected: true }));
+        }
+      } catch {}
+      reject(new Error(error.message));
+    });
+  });
+}
+
+/**
+ * Fire-and-forget C4 send for notifications that carry no delivery guarantee
+ * (admin notices, lifecycle chatter). Message delivery uses sendToC4Awaited().
+ */
 function sendToC4(channel, endpoint, content) {
   if (!content) return;
-  if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-    console.warn(`[hxa-connect] C4 concurrency cap reached (${MAX_CONCURRENT_C4}), dropping message`);
-    return;
-  }
-  _activeC4Calls++;
-  const c4Args = [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
+  sendToC4Awaited(channel, endpoint, content).catch(err => {
+    console.warn(`[hxa-connect] C4 notice dropped: ${err?.message || err}`);
+  });
+}
 
-  execFile('node', c4Args, { encoding: 'utf8' }, (error, stdout) => {
-    _activeC4Calls--;
-    if (!error) {
+/**
+ * Awaited variant used by catch-up: the watermark may only move past a message
+ * once C4 actually accepted it, otherwise a failed replay would be lost.
+ * Throws on rejection so the runner stops and retries on the next reconnect.
+ */
+async function sendToC4Awaited(channel, endpoint, content) {
+  if (!content) return;
+  const c4Args = [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
+  const capExceeded = () => {
+    const err = new Error(`C4 concurrency cap reached (${MAX_CONCURRENT_C4})`);
+    err.retryable = true;
+    return err;
+  };
+
+  if (_activeC4Calls >= MAX_CONCURRENT_C4) throw capExceeded();
+  _activeC4Calls++;
+  try {
+    try {
+      await executeC4(c4Args);
       console.log(`[hxa-connect] -> C4: ${content.substring(0, 80)}...`);
       return;
+    } catch (err) {
+      if (err.c4Rejected) throw err; // policy rejection: retrying will not help
+      console.warn(`[hxa-connect] C4 send failed, retrying: ${err.message}`);
     }
-    try {
-      const response = JSON.parse(error.stdout || stdout || '{}');
-      if (response.ok === false && response.error?.message) {
-        console.warn(`[hxa-connect] C4 rejected: ${response.error.message}`);
-        return;
-      }
-    } catch {}
-    console.warn(`[hxa-connect] C4 send failed, retrying: ${error.message}`);
-    setTimeout(() => {
-      if (_activeC4Calls >= MAX_CONCURRENT_C4) {
-        console.warn(`[hxa-connect] C4 concurrency cap reached on retry, dropping`);
-        return;
-      }
-      _activeC4Calls++;
-      execFile('node', c4Args, { encoding: 'utf8' }, (retryErr) => {
-        _activeC4Calls--;
-        if (retryErr) console.error(`[hxa-connect] C4 retry failed: ${retryErr.message}`);
-        else console.log(`[hxa-connect] -> C4 (retry): ${content.substring(0, 80)}...`);
-      });
-    }, 2000);
-  });
+    await new Promise(r => setTimeout(r, 2000));
+    await executeC4(c4Args);
+    console.log(`[hxa-connect] -> C4 (retry): ${content.substring(0, 80)}...`);
+  } finally {
+    _activeC4Calls--;
+  }
 }
 
 // ─── Constants ──────────────────────────────────────────────
@@ -300,6 +331,18 @@ const HANDLED_EVENTS = new Set([
 ]);
 
 const MAX_CONNECT_ATTEMPTS = 20;
+
+// ─── Catch-up State (one file for all orgs, atomic writes) ──
+
+const CATCHUP_STATE_PATH = resolveCatchupStatePath({ home: HOME });
+const catchupState = new CatchupStateStore({
+  filePath: process.env.HXA_CATCHUP_STATE_PATH || CATCHUP_STATE_PATH,
+  log: (msg) => console.warn(`[hxa-connect] ${msg}`),
+}).load();
+
+process.once('exit', () => {
+  try { catchupState.flush(); } catch {}
+});
 
 // ─── Per-Org Connection Setup ──────────────────────────────
 
@@ -342,38 +385,84 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     return true;
   };
 
+  // Shared de-duplication + watermark bookkeeping for realtime and catch-up.
+  const gate = new DeliveryGate({ state: catchupState, label });
+
+  // A restart or a dropped socket means we may have missed messages: open a
+  // gap so a replay has to confirm the window is covered before the event
+  // boundary moves. No boundary yet ⇒ the first run only baselines.
+  if (catchupState.getEventsSince(label)) catchupState.markGap(label);
+
+  /**
+   * Single delivery pipeline for one DM message.
+   * Used by both the realtime 'message' handler and catch-up, so policy,
+   * attachment handling and C4 formatting stay identical.
+   * Throw on failure so catch-up can retry the message on the next reconnect.
+   */
+  const deliverDm = async ({ message, sender_name: senderName, parts, catchup = false }) => {
+    const sender = senderName || message.sender_name || 'unknown';
+    const content = message.content || '';
+    // Return codes (the same constants the shared policy/settle helpers use):
+    // DELIVERY_OK (C4 accepted), POLICY_REJECT (final policy no),
+    // DELIVERY_SKIP (self / duplicate / rate-limited). Anything else throws.
+    const decision = decideDmDelivery({
+      access: org.access, isSelf, message, sender, catchup,
+      takeRateToken: () => getRateLimiter(`${label}:dm:${message.sender_id || sender}`).consume(),
+    });
+    if (decision.verdict === POLICY_REJECT) {
+      console.log(`${lp} DM from ${sender} rejected (${decision.reason})`);
+      return POLICY_REJECT;
+    }
+    if (decision.verdict !== POLICY_DELIVER) {
+      if (decision.reason === 'rate-limited') console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
+      return DELIVERY_SKIP;
+    }
+
+    // Download media after policy checks to avoid wasted effort
+    const msgParts = message.parts || parts;
+    const localPaths = await downloadMediaParts(msgParts, client, label, lp);
+    const attachments = formatAttachments(msgParts, localPaths);
+
+    if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
+      console.warn(`${lp} DM from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
+      return POLICY_REJECT;
+    }
+
+    console.log(`${lp} DM from ${sender}${catchup ? ' (catch-up)' : ''}: ${content.substring(0, 80)}`);
+    const formatted = buildDmContent({ displayPrefix: dp, sender, content, attachments, catchup });
+    // Awaited for BOTH live and replay: a message only counts as delivered once
+    // C4 accepted it. A live failure therefore stays deliverable by catch-up.
+    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
+    return DELIVERY_OK;
+  };
+
   // ─── Event Handlers ───────────────────────────────────
 
   client.on('message', async (msg) => {
     try {
-      const sender = msg.sender_name || 'unknown';
-      const content = msg.message?.content || msg.content || '';
-      if (isSelf(msg.message?.sender_id, msg.message?.metadata)) return;
-
-      if (!isDmAllowed(org.access, sender)) {
-        console.log(`${lp} DM from ${sender} rejected (dmPolicy: ${org.access?.dmPolicy || 'open'})`);
+      const wire = msg.message || {};
+      const at = Number(wire.created_at) || Date.now();
+      // Catch-up may already have delivered this id (and vice versa).
+      if (gate.isSeen(wire.id)) {
+        console.log(`${lp} DM ${wire.id} already handled, skipping realtime duplicate`);
         return;
       }
-
-      const rlKey = `${label}:dm:${msg.message?.sender_id || sender}`;
-      if (!getRateLimiter(rlKey).consume()) {
-        console.warn(`${lp} DM from ${sender} rate-limited, dropping`);
-        return;
+      gate.begin(wire.id);
+      // Only a C4 acknowledgement (or a final policy rejection) is recorded.
+      // A transport failure opens a gap and stays replayable (blocker 4).
+      let outcome;
+      let error;
+      try {
+        outcome = await deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false });
+      } catch (err) {
+        error = err;
       }
-
-      // Download media after policy checks to avoid wasted effort
-      const msgParts = msg.message?.parts || msg.parts;
-      const localPaths = await downloadMediaParts(msgParts, client, label, lp);
-      const attachments = formatAttachments(msgParts, localPaths);
-
-      if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
-        console.warn(`${lp} DM from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
-        return;
-      }
-
-      console.log(`${lp} DM from ${sender}: ${content.substring(0, 80)}`);
-      const formatted = `[${dp} DM] ${sender} said: ${content}${attachments}`;
-      sendToC4(C4_CHANNEL, c4Endpoint(label, sender), formatted);
+      settleLiveDelivery({
+        outcome, error, id: wire.id, at, gate,
+        markGap: () => catchupState.markGap(label),
+        save: () => catchupState.scheduleSave(),
+      });
+      if (error) throw error;
     } catch (err) {
       console.error(`${lp} DM handler error: ${err.message}`);
     }
@@ -436,96 +525,128 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     return botName;
   }
 
+  /**
+   * Single delivery pipeline for one thread message.
+   * Shared by threadCtx.onMention (realtime) and catch-up.
+   * Throws on failure so catch-up can retry the message later.
+   */
+  async function deliverThread({ threadId, message, snapshot, reason, catchup = false }) {
+    const sender = msgSender(message);
+    const content = message.content || '';
+    const isInteractiveDelivery = reason === 'message';
+    const isRealMention = mentionRe.test(extractText(message)) || !!message.mention_all;
+    const perThreadMode = getThreadMode(threadId);
+
+    // One policy gate for the live socket and for replay: self-echo, groupPolicy
+    // (incl. `disabled`, which stops invites too), sender allowlist, mention
+    // mode and realtime rate limiting.
+    const decision = decideThreadDelivery({
+      access: org.access, isSelf, message, threadId, sender, reason,
+      mode: perThreadMode, isMention: isRealMention, catchup,
+      takeRateToken: () => getRateLimiter(`${label}:thread:${message.sender_id || sender}`).consume(),
+    });
+    if (decision.verdict === POLICY_REJECT) {
+      console.log(`${lp} Thread ${threadId} rejected (${decision.reason})`);
+      return POLICY_REJECT;
+    }
+    if (decision.verdict !== POLICY_DELIVER) {
+      if (decision.reason === 'self' && message?.id) {
+        console.log(`${lp} Thread ${threadId} message ${message.id} is our own — not delivering`);
+      } else if (decision.reason === 'rate-limited') {
+        console.warn(`${lp} Thread ${threadId} from ${sender} rate-limited, dropping`);
+      }
+      return DELIVERY_SKIP;
+    }
+
+    // Download media for trigger message (after policy checks)
+    const localPaths = await downloadMediaParts(message.parts, client, label, lp);
+    const attachments = formatAttachments(message.parts, localPaths);
+
+    if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
+      console.warn(`${lp} Thread ${threadId} from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
+      return POLICY_REJECT;
+    }
+
+    const lifecycleBlock = buildLifecycleBlock(snapshot);
+    const hasCurrentMessage = !!message.id;
+
+    // Build C4 message with XML tags (consistent with Lark/TG format)
+    const parts = [
+      buildThreadHeader({ displayPrefix: dp, threadId, sender, hasMessage: hasCurrentMessage, catchup }),
+    ];
+
+    // Thread context: previous messages (excluding trigger) — no media download for context
+    const contextMsgs = (snapshot.newMessages || []).filter(m => m.id !== message.id);
+    if (contextMsgs.length > 0) {
+      const lines = contextMsgs.map(m => {
+        const ctxAtt = formatAttachments(m.parts);
+        return `[${escapeXml(msgSender(m))}]: ${escapeXml(m.content || '')}${escapeXml(ctxAtt)}`;
+      });
+      parts.push(`<thread-context>\n${lines.join('\n')}\n</thread-context>\n\n`);
+    }
+
+    if (lifecycleBlock) parts.push(lifecycleBlock);
+
+    // Smart mode hint
+    if (isInteractiveDelivery && !catchup && !isRealMention && perThreadMode === 'smart') {
+      parts.push('<smart-mode>\nDecide whether to respond. Reply with exactly [SKIP] when a response is unnecessary.\n</smart-mode>\n\n');
+    }
+
+    // Reply-to context (like TG's replying-to format)
+    if (message.reply_to_message) {
+      const reply = message.reply_to_message;
+      const replySender = escapeXml(reply.sender_name || reply.sender_id || 'unknown');
+      const replyContent = escapeXml(reply.content || '');
+      const replyAtt = escapeXml(formatAttachments(reply.parts));
+      parts.push(`<replying-to>\n[${replySender}]: ${replyContent}${replyAtt}\n</replying-to>\n\n`);
+    }
+
+    // Current message (includes non-text attachments with local paths when downloaded)
+    if (hasCurrentMessage) {
+      parts.push(`<current-message>\n${escapeXml(content)}${escapeXml(attachments)}\n</current-message>`);
+    }
+
+    // Include trigger message ID in endpoint for reply-to on send (like TG's msg: pattern)
+    const msgIdSuffix = hasCurrentMessage ? `|msg:${message.id}` : '';
+    if (hasCurrentMessage) {
+      console.log(`${lp} Thread ${threadId} from ${sender}${catchup ? ' (catch-up)' : ''} (${snapshot.bufferedCount} buffered)`);
+    } else {
+      console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
+    }
+    // Awaited for BOTH live and replay: only a C4 acknowledgement makes this
+    // message "delivered" (see the handler's gate.mark()).
+    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
+    return DELIVERY_OK;
+  }
+
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
     try {
-      const sender = msgSender(message);
-      const content = message.content || '';
-      const isInteractiveDelivery = reason === 'message';
-
-      // groupPolicy / sender policy apply to interactive thread messages only.
-      if (isInteractiveDelivery && !isThreadAllowed(org.access, threadId)) {
-        console.log(`${lp} Thread ${threadId} rejected (groupPolicy: ${org.access?.groupPolicy || 'open'})`);
+      // zylos-lab-hxa-access: groupPolicy=disabled must stop every thread
+      // delivery (messages, invites, thread_created), not only reason==='message'.
+      if ((org.access?.groupPolicy || 'open') === 'disabled') {
+        console.log(`${lp} Thread ${threadId} skipped (groupPolicy: disabled)`);
         return;
       }
-      if (isInteractiveDelivery && !isSenderAllowed(org.access, threadId, sender)) {
-        console.log(`${lp} Sender ${sender} rejected in thread ${threadId}`);
+      const wire = message || {};
+      const at = Number(wire.created_at) || Date.now();
+      if (gate.isSeen(wire.id)) {
+        console.log(`${lp} Thread ${threadId} message ${wire.id} already handled, skipping realtime duplicate`);
         return;
       }
-
-      const isRealMention = mentionRe.test(extractText(message)) || !!message.mention_all;
-      const perThreadMode = getThreadMode(threadId);
-
-      // Mention-mode gating only applies to interactive thread messages.
-      if (isInteractiveDelivery && perThreadMode === 'mention' && !isRealMention) {
-        return;
+      if (wire.id) gate.begin(wire.id);
+      let outcome;
+      let error;
+      try {
+        outcome = await deliverThread({ threadId, message, snapshot, reason, catchup: false });
+      } catch (err) {
+        error = err;
       }
-
-      if (isInteractiveDelivery) {
-        const rlKey = `${label}:thread:${message.sender_id || sender}`;
-        if (!getRateLimiter(rlKey).consume()) {
-          console.warn(`${lp} Thread ${threadId} from ${sender} rate-limited, dropping`);
-          return;
-        }
-      }
-
-      // Download media for trigger message (after policy checks)
-      const localPaths = await downloadMediaParts(message.parts, client, label, lp);
-      const attachments = formatAttachments(message.parts, localPaths);
-
-      if ((content.length + attachments.length) > MAX_CONTENT_LENGTH) {
-        console.warn(`${lp} Thread ${threadId} from ${sender} rejected — content too large (${content.length + attachments.length} bytes)`);
-        return;
-      }
-
-      const lifecycleBlock = buildLifecycleBlock(snapshot);
-      const hasCurrentMessage = !!message.id;
-
-      // Build C4 message with XML tags (consistent with Lark/TG format)
-      const parts = [
-        hasCurrentMessage
-          ? `[${dp} Thread:${threadId}] ${sender} said: `
-          : `[${dp} Thread:${threadId}] System update: `,
-      ];
-
-      // Thread context: previous messages (excluding trigger) — no media download for context
-      const contextMsgs = snapshot.newMessages.filter(m => m.id !== message.id);
-      if (contextMsgs.length > 0) {
-        const lines = contextMsgs.map(m => {
-          const ctxAtt = formatAttachments(m.parts);
-          return `[${escapeXml(msgSender(m))}]: ${escapeXml(m.content || '')}${escapeXml(ctxAtt)}`;
-        });
-        parts.push(`<thread-context>\n${lines.join('\n')}\n</thread-context>\n\n`);
-      }
-
-      if (lifecycleBlock) parts.push(lifecycleBlock);
-
-      // Smart mode hint
-      if (isInteractiveDelivery && !isRealMention && perThreadMode === 'smart') {
-        parts.push('<smart-mode>\nDecide whether to respond. Reply with exactly [SKIP] when a response is unnecessary.\n</smart-mode>\n\n');
-      }
-
-      // Reply-to context (like TG's replying-to format)
-      if (message.reply_to_message) {
-        const reply = message.reply_to_message;
-        const replySender = escapeXml(reply.sender_name || reply.sender_id || 'unknown');
-        const replyContent = escapeXml(reply.content || '');
-        const replyAtt = escapeXml(formatAttachments(reply.parts));
-        parts.push(`<replying-to>\n[${replySender}]: ${replyContent}${replyAtt}\n</replying-to>\n\n`);
-      }
-
-      // Current message (includes non-text attachments with local paths when downloaded)
-      if (hasCurrentMessage) {
-        parts.push(`<current-message>\n${escapeXml(content)}${escapeXml(attachments)}\n</current-message>`);
-      }
-
-      // Include trigger message ID in endpoint for reply-to on send (like TG's msg: pattern)
-      const msgIdSuffix = hasCurrentMessage ? `|msg:${message.id}` : '';
-      if (hasCurrentMessage) {
-        console.log(`${lp} Thread ${threadId} from ${sender} (${snapshot.bufferedCount} buffered)`);
-      } else {
-        console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
-      }
-      sendToC4(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
+      settleLiveDelivery({
+        outcome, error, id: wire.id, at, gate,
+        markGap: () => catchupState.markGap(label),
+        save: () => catchupState.scheduleSave(),
+      });
+      if (error) throw error;
     } catch (err) {
       console.error(`${lp} Thread handler error: ${err.message}`);
     }
@@ -538,7 +659,6 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const content = message.content || '';
     console.log(`${lp} Thread ${msg.thread_id} from ${sender} (buffered): ${content.substring(0, 80)}`);
   });
-
   client.on('thread_updated', (msg) => {
     const thread = msg.thread || {};
     const changes = msg.changes || [];
@@ -597,12 +717,73 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   // ─── Connection Lifecycle ──────────────────────────────
 
+  // Catch-up: recover messages missed while offline. Runs on the first
+  // connection (baseline, nothing replayed) and after every reconnect.
+  // Errors are logged and retried on the next reconnect; realtime stays up.
+  const catchup = new CatchupRunner({
+    client,
+    label,
+    state: catchupState,
+    gate, // shared with the realtime handlers: one de-dup view per connection
+    multiOrg: isMultiOrg,
+    log: (m) => console.log(`${lp} ${m}`),
+
+    // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).
+    deliverMessage: async ({ kind, message, channelId, threadId }) => {
+      // Throwing keeps the message queued for the next run; policy rejections
+      // and self-echo resolve normally so they are not retried forever.
+      if (kind === 'thread') {
+        const snapshot = { thread: { id: threadId }, participants: [], newMessages: [message], bufferedCount: 0, artifacts: [], lifecycleEvents: [] };
+        await deliverThread({ threadId, message, snapshot, reason: 'message', catchup: true });
+        return;
+      }
+      await deliverDm({ message, parts: message.parts, catchup: true, channelId });
+    },
+
+    // One notice line before a large replay. Goes to the same channel as the
+    // messages themselves (admin endpoint) so it shows up in context.
+    deliverSummary: async (text) => {
+      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+    },
+
+    // Invites / status changes that happened while offline: reuse the realtime
+    // notification path (admin channel) so they are visible, not just logged.
+    deliverEvent: async (event) => {
+      // Offline lifecycle events go through the SAME policy boundary as the
+      // realtime handlers: groupPolicy=disabled means thread activity is not
+      // delivered at all, invites included (their metadata names the topic).
+      const decision = decideCatchupEvent({ access: org.access, event });
+      if (decision.verdict === POLICY_REJECT) {
+        console.log(`${lp} catch-up event ${event.type} dropped (${decision.reason})`);
+        return;
+      }
+      const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
+      if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
+        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      } else {
+        console.log(`${lp} catch-up event: ${text}`);
+      }
+    },
+  });
+
+  client.on('close', () => {
+    catchupState.markGap(label);
+    catchupState.scheduleSave();
+  });
+
   client.on('reconnecting', ({ attempt, delay }) => {
+    catchupState.markGap(label);
+    catchupState.scheduleSave();
     console.log(`${lp} Reconnecting (attempt ${attempt}, delay ${delay}ms)...`);
   });
 
   client.on('reconnected', ({ attempts }) => {
     console.log(`${lp} Reconnected after ${attempts} attempt(s)`);
+    // Fire and forget: catch-up is serialised internally and never blocks
+    // realtime event handling.
+    catchup.run('reconnected').catch(err => {
+      console.error(`${lp} Catch-up run error: ${err?.message || err}`);
+    });
   });
 
   client.on('reconnect_failed', ({ attempts }) => {
@@ -625,14 +806,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     }
   });
 
-  connections.set(label, { client, threadCtx, config: org });
+  connections.set(label, { client, threadCtx, config: org, catchup });
 }
 
 // ─── Start All Connections ─────────────────────────────────
 
 console.log(`[hxa-connect] Starting ${connections.size} org connection(s): ${orgLabels.join(', ')}`);
 
-async function connectOrg(label, { client, threadCtx, config: org }) {
+async function connectOrg(label, { client, threadCtx, catchup, config: org }) {
   const lp = logPrefix(label);
   const INITIAL_DELAY = 3000;
   const MAX_DELAY = 60000;
@@ -647,6 +828,11 @@ async function connectOrg(label, { client, threadCtx, config: org }) {
       console.log(`${lp} WebSocket connected`);
       await threadCtx.start();
       console.log(`${lp} ThreadContext started (mention filter for @${org.agentName})`);
+      // First connection: establishes the baseline (or resumes an unfinished
+      // replay). Serialised with the reconnect trigger inside the runner.
+      catchup.run('connected').catch(err => {
+        console.error(`${lp} Catch-up run error: ${err?.message || err}`);
+      });
       return;
     } catch (err) {
       try { client.disconnect(); } catch {}
@@ -680,10 +866,12 @@ console.log(`[hxa-connect] Proxy: ${PROXY_URL || 'none'}`);
 // Graceful shutdown
 function shutdown() {
   console.log('[hxa-connect] Shutting down...');
-  for (const { client, threadCtx } of connections.values()) {
+  for (const { client, threadCtx, catchup } of connections.values()) {
+    catchup?.dispose?.();
     threadCtx.stop();
     client.disconnect();
   }
+  try { catchupState.flush(); } catch {}
   process.exit(0);
 }
 process.once('SIGINT', shutdown);
