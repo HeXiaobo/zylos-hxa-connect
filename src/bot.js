@@ -660,10 +660,16 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       // The catch-up replay and the inbox poll read the same hub history from
       // two different stores. Whichever path delivered this id first wins; the
-      // other must not deliver it again.
+      // other must not deliver it again. An id still IN FLIGHT elsewhere is not
+      // a final answer either — defer rather than enqueue a second delivery
+      // under a different spool id.
       if (gate.isDelivered(message.id)) {
         console.log(`${lp} DM discarded id=${message.id} source=${source} reason=already_delivered`);
         return { action: 'discarded', reason: 'already_delivered' };
+      }
+      if (gate.isInFlight(message.id)) {
+        console.log(`${lp} DM deferred id=${message.id} source=${source} reason=in_flight_elsewhere`);
+        return { action: 'retry', reason: 'in_flight_elsewhere' };
       }
       const policyResult = await dmPolicyGate.evaluate(message, {
         source,
@@ -1019,9 +1025,25 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         await deliverThread({ threadId, message, snapshot, reason: 'message', catchup: true });
         return;
       }
-      // The runner hands over the scanned channel id; the endpoint and the
-      // org prefix are derived inside deliverDm from the message itself.
-      await deliverDm({ message, parts: message.parts, catchup: true, channelId });
+      // Same intake seam as the socket: the policy gate (including its signed
+      // rejection notice), the in-flight guard and the stable C4 delivery
+      // identity must all apply to a replayed DM exactly as they do live.
+      // `deliverDm` alone would skip the gate, so a replayed denial would be
+      // silently accepted and a pending notice could never retry.
+      // The runner knows the channel id it scanned; the message row may not
+      // carry one. Keep it on the normalized message so `processDm` addresses
+      // the same target the scan did.
+      const outcome = await processDm(
+        { ...message, channel_id: message?.channel_id || channelId },
+        'catchup',
+      );
+      // A policy retry (notice still backing off) is not a final answer: throw
+      // so the runner keeps the message queued instead of marking it handled.
+      if (outcome?.action === 'retry') {
+        const err = new Error(`DM ${message?.id} still awaiting policy-notice retry`);
+        err.retryable = true;
+        throw err;
+      }
     },
 
     // One notice line before a large replay. Goes to the same channel as the
@@ -1095,14 +1117,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     }
   });
 
-  connections.set(label, { client, threadCtx, config: org, catchup, dmReconciler });
+  connections.set(label, { client, threadCtx, config: org, catchup, dmReconciler, diagnostics });
 }
 
 // ─── Start All Connections ─────────────────────────────────
 
 console.log(`[hxa-connect] Starting ${connections.size} org connection(s): ${orgLabels.join(', ')}`);
 
-async function connectOrg(label, { client, threadCtx, catchup, dmReconciler, config: org }) {
+async function connectOrg(label, { client, threadCtx, catchup, dmReconciler, diagnostics, config: org }) {
   const lp = logPrefix(label);
   const INITIAL_DELAY = 3000;
   const MAX_DELAY = 60000;

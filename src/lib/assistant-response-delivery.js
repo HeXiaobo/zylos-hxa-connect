@@ -507,7 +507,12 @@ export function createAssistantResponseSender({
               ...receipt,
             });
             logger.warn?.(`[hxa-connect] Reconciled ambiguous assistant response ${record.deliveryId}`);
-            return { handled: true, replayed: true, status: record.status };
+            return {
+              handled: true,
+              replayed: true,
+              status: record.status,
+              hubMessageId: record.hubMessageId,
+            };
           }
         }
 

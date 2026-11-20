@@ -69,6 +69,9 @@ export class C4DeliveryQueue {
     maxEntries = 2_000,
     retryMs = DEFAULT_RETRY_MS,
     maxRetryMs = DEFAULT_MAX_RETRY_MS,
+    // How long a delivered id stays "already delivered". Must comfortably
+    // exceed the caller's own handled-id retention (catch-up state: 48h).
+    doneRetentionMs = 72 * 60 * 60 * 1000,
     clock = () => Date.now(),
     logger = console,
   }) {
@@ -91,6 +94,7 @@ export class C4DeliveryQueue {
     this.maxEntries = maxEntries;
     this.retryMs = retryMs;
     this.maxRetryMs = maxRetryMs;
+    this.doneRetentionMs = doneRetentionMs;
     this.clock = clock;
     this.logger = logger;
     this.active = 0;
@@ -104,6 +108,7 @@ export class C4DeliveryQueue {
 
   async start() {
     await fs.promises.mkdir(this.spoolDir, { recursive: true, mode: 0o700 });
+    await this.#pruneDone();
     this.started = true;
     this.stopping = false;
     this.#schedule(0);
@@ -120,6 +125,10 @@ export class C4DeliveryQueue {
       return { queued: true, replayed: true, id: record.id };
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
+    }
+    // Already delivered earlier (possibly before a restart): do not send again.
+    if (this.#isDone(filename)) {
+      return { queued: false, replayed: true, delivered: true, id: record.id };
     }
     if (await this.pendingCount() >= this.maxEntries) {
       const error = new Error(`C4 durable spool is full (${this.maxEntries} entries)`);
@@ -139,6 +148,53 @@ export class C4DeliveryQueue {
     }
     this.#schedule(0);
     return { queued: true, replayed, id: record.id };
+  }
+
+  /** Completion marker path for one spool entry. */
+  #donePath(filename) {
+    return path.join(this.spoolDir, `${filename}.done`);
+  }
+
+  #isDone(filename) {
+    return fs.existsSync(this.#donePath(filename));
+  }
+
+  /**
+   * Record that this entry reached C4, then drop the pending record.
+   * The marker is created FIRST: a crash between the two leaves a marker plus a
+   * pending file, which the next drain sees as delivered and skips — the safe
+   * direction (no duplicate send). The reverse order could lose the memory.
+   */
+  async #markDone(name, record) {
+    const donePath = this.#donePath(name);
+    await fs.promises.writeFile(donePath, `${JSON.stringify({
+      id: record.id,
+      deliveredAt: this.clock(),
+      attempts: record.attempts,
+    })}\n`, { mode: 0o600 });
+    await fs.promises.unlink(path.join(this.spoolDir, name)).catch(() => {});
+  }
+
+  /** Drop completion markers older than `doneRetentionMs` (memory is bounded). */
+  async #pruneDone() {
+    const cutoff = this.clock() - this.doneRetentionMs;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(this.spoolDir);
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const name of entries) {
+      if (!name.endsWith('.done')) continue;
+      const full = path.join(this.spoolDir, name);
+      try {
+        const stat = await fs.promises.stat(full);
+        if (stat.mtimeMs < cutoff) await fs.promises.unlink(full);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
   }
 
   async pendingCount() {
@@ -217,6 +273,12 @@ export class C4DeliveryQueue {
         nextDelay = nextDelay === null ? waitMs : Math.min(nextDelay, waitMs);
         continue;
       }
+      if (this.#isDone(name)) {
+        // Crashed between writing the marker and removing the record: it was
+        // already delivered, so drop the record instead of sending it again.
+        await fs.promises.unlink(filePath).catch(() => {});
+        continue;
+      }
       this.processing.add(name);
       this.active += 1;
       this.#deliver(name, filePath, record)
@@ -235,7 +297,12 @@ export class C4DeliveryQueue {
   async #deliver(name, filePath, record) {
     try {
       await execute(this.execFileFn, process.execPath, [this.c4ReceivePath, ...record.args]);
-      await fs.promises.unlink(filePath);
+      // Remove the pending record and leave a completion marker behind. The
+      // marker is what makes the id still "already delivered" after a restart:
+      // a successful record is otherwise gone, taking its uniqueness with it,
+      // and a crash before the caller persisted its own handled-id would let
+      // the message be enqueued and sent a second time.
+      await this.#markDone(name, record);
       this.logger.log(`[hxa-connect] -> C4 durable id=${record.id}: ${record.preview}`);
     } catch (error) {
       const attempts = record.attempts + 1;

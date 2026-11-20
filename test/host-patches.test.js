@@ -224,3 +224,158 @@ describe('outbound media (Mylos box patch)', () => {
     }
   });
 });
+
+// ─── review round 1 regressions ─────────────────────────────────────────────
+
+describe('round-1 review findings stay fixed', () => {
+  it('P0: diagnostics is passed into connectOrg, not referenced across a block boundary', () => {
+    // `diagnostics` is declared inside the per-org loop; `connectOrg()` is
+    // defined outside it. Reading it there threw ReferenceError on every
+    // successful connect, which the retry handler then turned into a
+    // disconnect loop that never started the recovery paths.
+    assert.match(
+      BOT_SOURCE,
+      /connections\.set\(label, \{[^}]*\bdiagnostics\b[^}]*\}\)/,
+      'the connection record must carry diagnostics',
+    );
+    assert.match(
+      BOT_SOURCE,
+      /async function connectOrg\(label, \{[^}]*\bdiagnostics\b[^}]*\}\)/,
+      'connectOrg must destructure diagnostics instead of closing over the loop scope',
+    );
+  });
+
+  it('P1: the catch-up DM path goes through processDm, so the policy gate and identity apply', () => {
+    const catchup = BOT_SOURCE.slice(
+      BOT_SOURCE.indexOf('deliverMessage: async ({ kind, message, channelId, threadId }) => {'),
+      BOT_SOURCE.indexOf('deliverSummary:'),
+    );
+    assert.match(catchup, /await processDm\(\s*\{[^}]*channel_id[^}]*\},\s*'catchup',?\s*\)/,
+      'a replayed DM must enter the same intake seam as the socket path');
+    assert.doesNotMatch(catchup, /await deliverDm\(\{/,
+      'calling deliverDm directly would skip the DM policy gate and the stable C4 identity');
+  });
+
+  it('P1: an id in flight elsewhere is deferred, not enqueued a second time', () => {
+    assert.match(BOT_SOURCE, /if \(gate\.isInFlight\(message\.id\)\)/);
+    assert.match(BOT_SOURCE, /reason: 'in_flight_elsewhere'/);
+  });
+});
+
+describe('C4 spool completion markers', () => {
+  it('P1: a delivered id is still recognised after a restart', async () => {
+    const { C4DeliveryQueue } = await import('../src/lib/c4-delivery-queue.js');
+    const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hxa-spool-'));
+    const calls = [];
+    const execFileFn = (cmd, args, opts, cb) => { calls.push(args); cb(null, '{}', ''); };
+    const opts = {
+      spoolDir,
+      c4ReceivePath: '/fake/c4-receive.js',
+      execFileFn,
+      retryMs: 5,
+      maxRetryMs: 10,
+    };
+    try {
+      const first = new C4DeliveryQueue(opts);
+      await first.start();
+      await first.enqueue({ id: 'hxa:p1:m1', args: ['--content', 'one'], preview: 'one' });
+      await first.waitForIdle(2000);
+      const afterFirst = calls.length;
+      first.stop();
+
+      assert.equal(afterFirst, 1, 'the first enqueue must reach C4 exactly once');
+      assert.equal(await first.pendingCount(), 0, 'the pending record is gone');
+
+      // Simulate a restart before the caller persisted its handled-id.
+      const second = new C4DeliveryQueue(opts);
+      await second.start();
+      const receipt = await second.enqueue({ id: 'hxa:p1:m1', args: ['--content', 'one'], preview: 'one' });
+      await second.waitForIdle(2000);
+      second.stop();
+
+      assert.equal(receipt.delivered, true, 'a completed id must not be re-queued');
+      assert.equal(calls.length, afterFirst, 'and must not reach C4 a second time');
+    } finally {
+      fs.rmSync(spoolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('malformed [MEDIA:] never leaks a path as text', () => {
+  for (const bad of ['[MEDIA:]/tmp/x.pdf', '[MEDIA:image ]/tmp/x.pdf', '[media:image]/tmp/x.pdf', '[ MEDIA : image]/tmp/x.pdf']) {
+    it(`rejects ${JSON.stringify(bad)} without contacting the hub`, async () => {
+      const home = makeHome();
+      received = [];
+      try {
+        const res = await runSend(home, ['some-bot', bad]);
+        assert.notEqual(res.code, 0, `${bad} must fail loudly, got exit 0:\n${res.stdout}`);
+        assert.equal(received.length, 0, 'nothing may reach the hub');
+        assert.doesNotMatch(res.stdout, /Sent to/, 'the path must never be sent as chat text');
+      } finally {
+        cleanup(home);
+      }
+    });
+  }
+});
+
+describe('connectOrg startup path (P0 regression, executed not grepped)', () => {
+  it('runs a successful connect without a ReferenceError and starts both recovery paths', async () => {
+    const vm = await import('node:vm');
+    const start = BOT_SOURCE.indexOf('async function connectOrg(');
+    assert.notEqual(start, -1);
+    // Take the whole function body up to the top-level await that follows it.
+    const end = BOT_SOURCE.indexOf('\nawait Promise.allSettled(', start);
+    assert.notEqual(end, -1, 'connectOrg must be followed by the top-level connect loop');
+
+    const events = [];
+    const ctx = vm.createContext({
+      console: { log() {}, error() {}, warn() {} },
+      logPrefix: () => '[t]',
+      MAX_CONNECT_ATTEMPTS: 1,
+      connections: new Map(),
+      setTimeout,
+      Promise,
+      redactSecrets: s => String(s),
+      catchupState: { markGap() {}, scheduleSave() {} },
+      client: null,
+      threadCtx: null,
+      catchup: null,
+      dmReconciler: null,
+      // Deliberately NO `diagnostics` here: it must arrive as a parameter. A
+      // global would mask exactly the scoping bug this test exists to catch.
+    });
+    // `return` inside the vm only leaves the extracted function; the surrounding
+    // loop belongs to bot.js. Cap the loop so the test measures ONE pass, which
+    // is what the bug broke, without spinning 20 times with real backoff sleeps.
+    ctx.MAX_CONNECT_ATTEMPTS = 1;
+    vm.runInContext(
+      `${BOT_SOURCE.slice(start, end)}\nglobalThis.connectOrg = connectOrg;`,
+      ctx,
+    );
+
+    // A client that connects on the first attempt.
+    const conn = {
+      client: { connect: async () => { events.push('client.connect'); }, disconnect() {} },
+      threadCtx: { start: async () => { events.push('threadCtx.start'); } },
+      catchup: { run: () => Promise.resolve() },
+      dmReconciler: { start: async () => { events.push('dmReconciler.start'); } },
+      // `diagnostics` reaches connectOrg through the connection record (that is
+      // the fix). It is NOT a sandbox global, so a version that closes over the
+      // loop-scoped variable instead would throw ReferenceError here.
+      diagnostics: { connected: () => events.push('diagnostics.connected') },
+      config: { agentName: 'fixture-bot', hubUrl: 'http://127.0.0.1:1', orgId: 'org-fixture' },
+    };
+
+    await ctx.connectOrg('default', conn);
+
+    // The real `while (attempt < MAX_CONNECT_ATTEMPTS)` loop keeps going because
+    // this fixture's `return` path depends on process-level state; assert on the
+    // FIRST successful pass, which is what the bug broke.
+    assert.deepEqual(events.slice(0, 4), [
+      'client.connect',
+      'diagnostics.connected',
+      'threadCtx.start',
+      'dmReconciler.start',
+    ], `a successful connect must reach every step, got: ${JSON.stringify(events.slice(0, 4))}`);
+  });
+});

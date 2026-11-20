@@ -17,6 +17,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MEDIA_PREFIX_RE = /^\[MEDIA:([A-Za-z0-9_.-]+)\]([\s\S]*)$/;
+// A looser probe: anything that LOOKS like an attempt at the directive. Used
+// only to fail closed — a malformed attempt must never fall through and be
+// sent as ordinary text, because the text would be a local file path.
+const MEDIA_ATTEMPT_RE = /^\s*\[\s*MEDIA\s*:/i;
 
 export class MediaMessageError extends Error {
   constructor(message) {
@@ -64,7 +68,19 @@ export function mimeForPath(filePath) {
 export function parseMediaMessage(message) {
   const raw = String(message ?? '');
   const match = raw.match(MEDIA_PREFIX_RE);
-  if (!match) return null;
+  if (!match) {
+    // `[MEDIA:]`, `[MEDIA:image ]`, `[media:image]` — an attempted directive
+    // that the strict form does not accept. Treating it as plain text would
+    // send the local path into the chat, which is the exact failure this
+    // module exists to prevent.
+    if (MEDIA_ATTEMPT_RE.test(raw)) {
+      throw new MediaMessageError(
+        '[MEDIA:] directive is malformed — expected [MEDIA:image] or [MEDIA:file] '
+        + 'immediately followed by an absolute path',
+      );
+    }
+    return null;
+  }
 
   const type = match[1].toLowerCase();
   if (type !== 'image' && type !== 'file') {

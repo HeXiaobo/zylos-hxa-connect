@@ -172,6 +172,17 @@ const client = new HxaConnectClient({
 
 // A media send is an explicit send by definition; it carries no assistant
 // terminal event, so it must not enter the assistant-response branch.
+/**
+ * C4 reply receipt — lets core bind this Hub message id to the reply it asked
+ * for. Printed on stdout as one machine-readable line; the token is supplied by
+ * the caller and is never logged on its own.
+ */
+function emitReplyReceipt(result) {
+  if (isSkipResponse || !process.env.ZYLOS_REPLY_RECEIPT_TOKEN ||
+      typeof result?.id !== 'string' || !result.id.trim()) return;
+  console.log('C4_RECEIPT ' + JSON.stringify({ platformMessageId: result.id, receiptToken: process.env.ZYLOS_REPLY_RECEIPT_TOKEN }));
+}
+
 const assistantRequestId = mediaRequest ? null : (process.env.C4_ASSISTANT_REQUEST_ID || null);
 // Make the invocation mode visible: when the runtime intends an assistant
 // response but no longer passes C4_ASSISTANT_REQUEST_ID, the streamed-reply
@@ -201,23 +212,15 @@ if (assistantRequestId) {
       suppressSkip: true,
     });
     if (result.status === 'suppressed') process.exit(0);
+    // The assistant-response path is a real send, so it owes the caller the
+    // same receipt the explicit paths emit.
+    emitReplyReceipt({ id: result.hubMessageId });
     console.log(`Sent assistant response to ${target} (${result.status}${result.replayed ? ', replay' : ''})`);
     process.exit(0);
   } catch (error) {
     console.error(`Error sending assistant response to ${target}: ${redactSecrets(error.message)}`);
     process.exit(1);
   }
-}
-
-/**
- * C4 reply receipt — lets core bind this Hub message id to the reply it asked
- * for. Printed on stdout as one machine-readable line; the token is supplied by
- * the caller and is never logged on its own.
- */
-function emitReplyReceipt(result) {
-  if (isSkipResponse || !process.env.ZYLOS_REPLY_RECEIPT_TOKEN ||
-      typeof result?.id !== 'string' || !result.id.trim()) return;
-  console.log('C4_RECEIPT ' + JSON.stringify({ platformMessageId: result.id, receiptToken: process.env.ZYLOS_REPLY_RECEIPT_TOKEN }));
 }
 
 /** Upload the attachment once, before the send (the reply_to retry reuses it). */
