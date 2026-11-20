@@ -281,4 +281,27 @@ describe('outbound org guard — scripts/send.js', () => {
       cleanup(home);
     }
   });
+
+  it('tracks an env-file key the way Node stores it (NUL ends the name)', async () => {
+    // Node truncates a name at NUL when assigning process.env. If the loader
+    // records the raw slice, "HXA_CONFIRM_ORG\0suffix=x" sets the real
+    // variable while the provenance Set holds another string, and the value
+    // reads as if the caller passed it.
+    const home = makeHome({ guard: { internal_labels: ['internal'] } });
+    fs.writeFileSync(
+      path.join(home, 'zylos', '.env'),
+      'HXA_CONFIRM_ORG\u0000suffix=customer-org\n',
+    );
+    sentRequests = [];
+    try {
+      const res = await runSend(home, ['org:customer-org|some-bot', 'hello customer']);
+
+      assert.notEqual(res.code, 0, 'a NUL-suffixed env key must not unlock the send');
+      assert.equal(sentRequests.length, 0, 'nothing may reach the hub');
+      assert.match(res.stderr, /BLOCKED/);
+      assert.match(res.stderr, /zylos\/\.env/);
+    } finally {
+      cleanup(home);
+    }
+  });
 });

@@ -18,6 +18,13 @@ const ACCESS_KEYS = ['dmPolicy', 'dmAllowFrom', 'groupPolicy', 'threads'];
 // Keys filled in from this file are recorded, because a value that sits in
 // ~/zylos/.env is ambient configuration, not a per-send decision. The outbound
 // guard uses this to refuse a confirmation that came from the file.
+//
+// The key is normalised the way Node normalises it when assigning to
+// process.env (a NUL ends the name). Recording the raw slice instead would let
+// a line like "HXA_CONFIRM_ORG\0junk=customer-org" set the real variable while
+// the provenance Set held a different string — the value would then look like
+// it came from the caller.
+const NUL_RE = /\0/;
 const envFileKeys = new Set();
 if (fs.existsSync(ENV_PATH)) {
   for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
@@ -25,13 +32,24 @@ if (fs.existsSync(ENV_PATH)) {
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eqIdx = trimmed.indexOf('=');
     if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx);
+    const key = normaliseEnvKey(trimmed.slice(0, eqIdx));
     const val = trimmed.slice(eqIdx + 1);
+    if (!key) continue;
     if (!process.env[key]) {
       process.env[key] = val;
       envFileKeys.add(key);
     }
   }
+}
+
+/**
+ * The key process.env will actually hold for a name read off disk.
+ * Node truncates env names at NUL; we do the same so the Set and the
+ * assignment can never disagree.
+ */
+function normaliseEnvKey(key) {
+  const nul = key.search(NUL_RE);
+  return nul === -1 ? key : key.slice(0, nul);
 }
 
 /** True when `key` was populated from ~/zylos/.env rather than the caller's env. */
