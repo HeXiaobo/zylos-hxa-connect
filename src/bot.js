@@ -284,7 +284,7 @@ function executeC4(c4Args) {
 function sendToC4(channel, endpoint, content) {
   if (!content) return;
   sendToC4Awaited(channel, endpoint, content).catch(err => {
-    console.warn(`[hxa-connect] C4 notice dropped: ${err?.message || err}`);
+    console.warn(`[hxa-connect] C4 notice dropped: ${redactSecrets(err?.message || err)}`);
   });
 }
 
@@ -311,7 +311,7 @@ async function sendToC4Awaited(channel, endpoint, content) {
       return;
     } catch (err) {
       if (err.c4Rejected) throw err; // policy rejection: retrying will not help
-      console.warn(`[hxa-connect] C4 send failed, retrying: ${err.message}`);
+      console.warn(`[hxa-connect] C4 send failed, retrying: ${redactSecrets(err.message)}`);
     }
     await new Promise(r => setTimeout(r, 2000));
     await executeC4(c4Args);
@@ -466,7 +466,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       });
       if (error) throw error;
     } catch (err) {
-      console.error(`${lp} DM handler error: ${err.message}`);
+      console.error(`${lp} DM handler error: ${redactSecrets(err.message)}`);
     }
   });
 
@@ -650,7 +650,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       });
       if (error) throw error;
     } catch (err) {
-      console.error(`${lp} Thread handler error: ${err.message}`);
+      console.error(`${lp} Thread handler error: ${redactSecrets(err.message)}`);
     }
   });
 
@@ -784,7 +784,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // Fire and forget: catch-up is serialised internally and never blocks
     // realtime event handling.
     catchup.run('reconnected').catch(err => {
-      console.error(`${lp} Catch-up run error: ${err?.message || err}`);
+      console.error(`${lp} Catch-up run error: ${redactSecrets(err?.message || err)}`);
     });
   });
 
@@ -833,7 +833,7 @@ async function connectOrg(label, { client, threadCtx, catchup, config: org }) {
       // First connection: establishes the baseline (or resumes an unfinished
       // replay). Serialised with the reconnect trigger inside the runner.
       catchup.run('connected').catch(err => {
-        console.error(`${lp} Catch-up run error: ${err?.message || err}`);
+        console.error(`${lp} Catch-up run error: ${redactSecrets(err?.message || err)}`);
       });
       return;
     } catch (err) {
