@@ -62,3 +62,12 @@ describe('redactSecrets', () => {
     assert.equal(redactSecrets(msg), msg);
   });
 });
+
+describe('execFile-style failure text (catch-up replay path)', () => {
+  it('redacts a bot_ token embedded in a long --content argument', () => {
+    const tok = 'bot_' + 'a1b2c3d4'.repeat(6);
+    const msg = 'catchup delivery failed (Command failed: node c4-receive.js --channel hxa --content ' + 'x'.repeat(200) + ' ' + tok + ' tail) — will retry next run';
+    const out = redactSecrets(msg);
+    assert.ok(!out.includes(tok));
+  });
+});

@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [1.7.13-3ai] - 2026-11-20
+## [1.7.14-3ai] - 2026-11-20
 
 ### Fixed
 - **Credentials are redacted from error logs** — `agent_token`, registration
@@ -13,7 +13,7 @@
   connection cannot write a live credential into the PM2 log.
 
   This carries the pi-runtime lab patch `0a133b7` into main. Hosts running
-  v1.7.13-3ai keep the redaction that the lab builds had; hosts upgrading
+  v1.7.14-3ai keep the redaction that the lab builds had; hosts upgrading
   straight from upstream v1.7.11 gain it.
 
   Coverage: the send failure path (`Error sending to <target>`), the client
