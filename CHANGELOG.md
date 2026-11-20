@@ -14,6 +14,10 @@
   `CONFIRMED EXTERNAL` line. Internal labels print nothing new.
 - **Off by default** — no guard file means no guard: every send behaves exactly
   as in v1.7.11, so upgrading a host that has not opted in changes nothing.
+- **Confirmation must come from the call** — `HXA_CONFIRM_ORG` read from
+  `~/zylos/.env` is ignored, and a blocked send says so. A value left in that
+  file would approve every send from the host from then on, which is the
+  failure the guard exists to prevent.
 - A present but unreadable or malformed guard file fails the send instead of
   letting it through.
 
