@@ -645,7 +645,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
    * rejected id is written into the catch-up state, so a replay of the same id
    * is skipped — that is the seam between the two recovery mechanisms.
    */
-  async function processDm(raw, source) {
+  async function processDm(raw, source, { ownReservations = [] } = {}) {
     const message = normalizeDm(raw);
     if (!message.id) {
       console.warn(`${lp} DM discarded source=${source} reason=missing_message_id sender=${message.sender_name}`);
@@ -667,7 +667,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         console.log(`${lp} DM discarded id=${message.id} source=${source} reason=already_delivered`);
         return { action: 'discarded', reason: 'already_delivered' };
       }
-      if (gate.isInFlight(message.id)) {
+      // A reservation held by THIS delivery (the catch-up runner reserves an id
+      // before calling back in) is not a conflict; only another owner's is.
+      if (gate.isHeldByOther(message.id, ownReservations)) {
         console.log(`${lp} DM deferred id=${message.id} source=${source} reason=in_flight_elsewhere`);
         return { action: 'retry', reason: 'in_flight_elsewhere' };
       }
@@ -1036,6 +1038,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       const outcome = await processDm(
         { ...message, channel_id: message?.channel_id || channelId },
         'catchup',
+        // The runner reserved this id before calling back; tell the intake
+        // seam that reservation is ours so it does not defer itself.
+        { ownReservations: message?.id ? [message.id] : [] },
       );
       // A policy retry (notice still backing off) is not a final answer: throw
       // so the runner keeps the message queued instead of marking it handled.
@@ -1049,7 +1054,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // One notice line before a large replay. Goes to the same channel as the
     // messages themselves (admin endpoint) so it shows up in context.
     deliverSummary: async (text) => {
-      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      // Best effort: a summary line is an aid, not a guarantee. Await it so a
+      // spool failure is LOGGED here instead of escaping as an unhandled
+      // rejection (which can take the process down), but never let it stop the
+      // replay itself.
+      try {
+        await sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      } catch (err) {
+        console.warn(`${lp} Catch-up summary not delivered: ${redactSecrets(err?.message || err)}`);
+      }
     },
 
     // Invites / status changes that happened while offline: reuse the realtime
@@ -1065,7 +1078,11 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
       if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
-        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        try {
+          await sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        } catch (err) {
+          console.warn(`${lp} Catch-up event notice not delivered: ${redactSecrets(err?.message || err)}`);
+        }
       } else {
         console.log(`${lp} catch-up event: ${text}`);
       }

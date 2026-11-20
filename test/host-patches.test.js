@@ -250,15 +250,22 @@ describe('round-1 review findings stay fixed', () => {
       BOT_SOURCE.indexOf('deliverMessage: async ({ kind, message, channelId, threadId }) => {'),
       BOT_SOURCE.indexOf('deliverSummary:'),
     );
-    assert.match(catchup, /await processDm\(\s*\{[^}]*channel_id[^}]*\},\s*'catchup',?\s*\)/,
+    assert.match(catchup, /await processDm\(\s*\{[^}]*channel_id[^}]*\},\s*'catchup',/,
       'a replayed DM must enter the same intake seam as the socket path');
     assert.doesNotMatch(catchup, /await deliverDm\(\{/,
       'calling deliverDm directly would skip the DM policy gate and the stable C4 identity');
   });
 
-  it('P1: an id in flight elsewhere is deferred, not enqueued a second time', () => {
-    assert.match(BOT_SOURCE, /if \(gate\.isInFlight\(message\.id\)\)/);
+  it('P1: an id in flight elsewhere is deferred, but the caller\'s own reservation is not', () => {
+    // A plain isInFlight() check would make the catch-up runner defer to ITSELF:
+    // it calls gate.begin(id) before invoking the intake path.
+    assert.match(BOT_SOURCE, /gate\.isHeldByOther\(message\.id, ownReservations\)/);
     assert.match(BOT_SOURCE, /reason: 'in_flight_elsewhere'/);
+    assert.match(
+      BOT_SOURCE,
+      /ownReservations: message\?\.id \? \[message\.id\] : \[\]/,
+      'the catch-up caller must declare its own reservation as its own',
+    );
   });
 });
 
@@ -332,6 +339,10 @@ describe('connectOrg startup path (P0 regression, executed not grepped)', () => 
       console: { log() {}, error() {}, warn() {} },
       logPrefix: () => '[t]',
       MAX_CONNECT_ATTEMPTS: 1,
+      // Needed by the success log line. Without it the line throws, connectOrg
+      // catches the error, disconnects and deletes the connection — which the
+      // old four-event assertion could not see.
+      DM_RECONCILE_INTERVAL_MS: 15_000,
       connections: new Map(),
       setTimeout,
       Promise,
@@ -355,7 +366,10 @@ describe('connectOrg startup path (P0 regression, executed not grepped)', () => 
 
     // A client that connects on the first attempt.
     const conn = {
-      client: { connect: async () => { events.push('client.connect'); }, disconnect() {} },
+      client: {
+        connect: async () => { events.push('client.connect'); },
+        disconnect: () => { events.push('client.disconnect'); },
+      },
       threadCtx: { start: async () => { events.push('threadCtx.start'); } },
       catchup: { run: () => Promise.resolve() },
       dmReconciler: { start: async () => { events.push('dmReconciler.start'); } },
@@ -377,5 +391,138 @@ describe('connectOrg startup path (P0 regression, executed not grepped)', () => 
       'threadCtx.start',
       'dmReconciler.start',
     ], `a successful connect must reach every step, got: ${JSON.stringify(events.slice(0, 4))}`);
+
+    // And the happy path must COMPLETE: no error-driven disconnect, and the
+    // connection must stay registered. Without DM_RECONCILE_INTERVAL_MS in this
+    // context the success log line threw, connectOrg caught it, disconnected and
+    // deleted the connection — while the four-event assertion above still saw
+    // only the first pass and went green.
+    assert.deepEqual(events, [
+      'client.connect',
+      'diagnostics.connected',
+      'threadCtx.start',
+      'dmReconciler.start',
+    ], `a successful connect must not disconnect or retry: ${JSON.stringify(events)}`);
+    assert.equal(ctx.connections.has('default'), false,
+      'this fixture never registers the connection itself, so connectOrg must not have deleted one');
+  });
+});
+
+// ─── review round 2 regressions ─────────────────────────────────────────────
+
+describe('round-2 review findings stay fixed', () => {
+  it('the catch-up runner does not defer to its own in-flight reservation', async () => {
+    // The runner does gate.begin(id) BEFORE calling back. A plain isInFlight()
+    // check therefore made every recovered DM defer to itself, forever.
+    const { CatchupRunner, DeliveryGate } = await import('../src/lib/catchup.js');
+    const { CatchupStateStore } = await import('../src/lib/catchup-state.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hxa-selfres-'));
+    const state = new CatchupStateStore({ filePath: path.join(dir, 's.json') }).load();
+    const T = Date.now() - 60_000;
+    state.setEventsSince('default', T);
+    state.markGap('default');
+    const gate = new DeliveryGate({ state, label: 'default' });
+
+    const delivered = [];
+    const client = {
+      async catchup() {
+        return { events: [{ type: 'channel_message_summary', channel_id: 'dm', occurred_at: T + 1000 }], has_more: false };
+      },
+      async getMessages() { return [{ id: 'm1', sender_id: 'peer', created_at: T + 1000, content: 'x' }]; },
+      async getThreadMessages() { return []; },
+    };
+    const runner = new CatchupRunner({
+      client, state, label: 'default', gate, now: () => T + 30_000,
+      limits: { batchDelayMs: 0 }, log: () => {},
+      deliverMessage: async ({ message }) => {
+        // Mimic the real intake check with the runner's reservation declared.
+        if (gate.isHeldByOther(message.id, [message.id])) {
+          throw new Error('deferred to itself');
+        }
+        delivered.push(message.id);
+        gate.mark(message.id, T + 1000);
+      },
+    });
+    try {
+      await runner.run();
+      runner.dispose();
+      assert.deepEqual(delivered, ['m1'], 'the reserved message must be delivered, not deferred to itself');
+    } finally {
+      runner.dispose?.();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('catch-up summary and event notices cannot escape as unhandled rejections', () => {
+    const catchupCfg = BOT_SOURCE.slice(
+      BOT_SOURCE.indexOf('deliverSummary: async (text) => {'),
+      BOT_SOURCE.indexOf('deliverEvent: async (event) => {'),
+    );
+    assert.match(catchupCfg, /await sendToC4\(/, 'the summary enqueue must be awaited');
+    assert.match(catchupCfg, /catch \(err\)/, 'and its failure logged, not left unhandled');
+
+    const eventCfg = BOT_SOURCE.slice(
+      BOT_SOURCE.indexOf('deliverEvent: async (event) => {'),
+      BOT_SOURCE.indexOf("client.on('close'", BOT_SOURCE.indexOf('deliverEvent: async (event) => {')),
+    );
+    assert.match(eventCfg, /await sendToC4\(/, 'the event notice enqueue must be awaited');
+    assert.match(eventCfg, /catch \(err\)/);
+  });
+
+  it('expiring a completion marker drops its pending record first', async () => {
+    const { C4DeliveryQueue } = await import('../src/lib/c4-delivery-queue.js');
+    const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hxa-marker-'));
+    const calls = [];
+    const opts = {
+      spoolDir,
+      c4ReceivePath: '/fake/c4-receive.js',
+      execFileFn: (c, a, o, cb) => { calls.push(a); cb(null, '{}', ''); },
+      // Expire markers immediately, so startup prunes.
+      doneRetentionMs: 0,
+    };
+    try {
+      const id = 'hxa:p1:marker';
+      const q1 = new C4DeliveryQueue(opts);
+      await q1.start();
+      await q1.enqueue({ id, args: ['--content', 'x'], preview: 'x' });
+      await q1.waitForIdle(2000);
+      q1.stop();
+      assert.equal(calls.length, 1);
+
+      // Recreate the crash window: marker present AND its pending record still
+      // there. With the old prune order the marker went first and the record
+      // was re-sent.
+      const files = fs.readdirSync(spoolDir);
+      const marker = files.find(f => f.endsWith('.done'));
+      assert.ok(marker, 'a completion marker must exist');
+      const record = path.join(spoolDir, marker.slice(0, -'.done'.length));
+      fs.writeFileSync(record, JSON.stringify({
+        schemaVersion: 1, id, args: ['--content', 'x'], preview: 'x',
+        enqueuedAt: Date.now(), attempts: 0, availableAt: Date.now(), lastError: null,
+      }));
+      // Backdate the marker so `doneRetentionMs: 0` prunes it on start.
+      const old = new Date(Date.now() - 10_000);
+      fs.utimesSync(path.join(spoolDir, marker), old, old);
+
+      const q2 = new C4DeliveryQueue(opts);
+      await q2.start();
+      await q2.waitForIdle(2000);
+      q2.stop();
+
+      assert.equal(calls.length, 1, 'an expired marker must take its pending record with it, not re-send');
+      assert.equal(await q2.pendingCount(), 0);
+    } finally {
+      fs.rmSync(spoolDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a completed assistant-response replay still yields the Hub message id', async () => {
+    const source = fs.readFileSync(path.join(ROOT, 'src', 'lib', 'assistant-response-delivery.js'), 'utf8');
+    const replay = source.slice(
+      source.indexOf("if (record.status === 'delivered' || record.status === 'suppressed')"),
+      source.indexOf("if (suppressSkip"),
+    );
+    assert.match(replay, /hubMessageId: record\.hubMessageId/,
+      'the ordinary completed-replay branch must return the stored Hub id for the receipt');
   });
 });

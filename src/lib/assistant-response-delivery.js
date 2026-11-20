@@ -480,7 +480,15 @@ export function createAssistantResponseSender({
       return store.withLock(identity.deliveryId, async () => {
         let record = await store.begin(identity);
         if (record.status === 'delivered' || record.status === 'suppressed') {
-          return { handled: true, replayed: true, status: record.status };
+          // Carry the recorded Hub message id on the ordinary completed replay
+          // too, so the caller can emit the same C4 receipt it would have
+          // emitted on the first attempt (it missed the first one's stdout).
+          return {
+            handled: true,
+            replayed: true,
+            status: record.status,
+            hubMessageId: record.hubMessageId,
+          };
         }
 
         if (suppressSkip && /^\s*\[SKIP\]\s*$/i.test(safeContent)) {

@@ -175,7 +175,14 @@ export class C4DeliveryQueue {
     await fs.promises.unlink(path.join(this.spoolDir, name)).catch(() => {});
   }
 
-  /** Drop completion markers older than `doneRetentionMs` (memory is bounded). */
+  /**
+   * Drop completion markers older than `doneRetentionMs` (memory is bounded).
+   *
+   * A marker is only expired once its pending record is gone. Otherwise a
+   * marker-plus-record pair left by a crash (or a failed unlink) that survives
+   * a long outage would lose its marker first and then be re-sent — the exact
+   * duplicate the marker exists to prevent. Recover the pair, then forget it.
+   */
   async #pruneDone() {
     const cutoff = this.clock() - this.doneRetentionMs;
     let entries;
@@ -188,9 +195,16 @@ export class C4DeliveryQueue {
     for (const name of entries) {
       if (!name.endsWith('.done')) continue;
       const full = path.join(this.spoolDir, name);
+      const pending = path.join(this.spoolDir, name.slice(0, -'.done'.length));
       try {
         const stat = await fs.promises.stat(full);
-        if (stat.mtimeMs < cutoff) await fs.promises.unlink(full);
+        if (stat.mtimeMs >= cutoff) continue;
+        // Still paired with a pending record: that record was delivered. Drop
+        // the record first, so expiring the marker cannot resurrect it.
+        await fs.promises.unlink(pending).catch(error => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+        await fs.promises.unlink(full);
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
