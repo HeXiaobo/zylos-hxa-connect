@@ -728,7 +728,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     state: catchupState,
     gate, // shared with the realtime handlers: one de-dup view per connection
     multiOrg: isMultiOrg,
-    log: (m) => console.log(`${lp} ${m}`),
+    log: (m) => console.log(redactSecrets(`${lp} ${m}`)), // single choke point: every catch-up log line is redacted
 
     // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).
     deliverMessage: async ({ kind, message, channelId, threadId }) => {
