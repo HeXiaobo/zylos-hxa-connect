@@ -143,6 +143,22 @@ Single-org configs auto-migrate on first run. Old endpoints without `org:` prefi
 
 </details>
 
+### Outbound org guard (opt-in)
+
+Add `~/zylos/components/hxa-connect/outbound-guard.json` to stop sends from
+reaching a non-internal org by accident:
+
+```json
+{ "internal_labels": ["coco"] }
+```
+
+Labels are the local `orgs` keys. With this file present, a send whose org label
+is not listed prints the target and the label to stderr, exits 1 and never
+reaches the hub; `HXA_CONFIRM_ORG=<label>` allows that one label and prints a
+single `CONFIRMED EXTERNAL` line. Listed orgs are unaffected and print nothing
+new. **No file, no guard** — hosts that do not opt in keep the previous
+behaviour.
+
 ## In the HxA Ecosystem
 
 ```

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [1.7.4-3ai]
+
+### Added
+- **Outbound org guard (opt-in)** — `scripts/send.js` refuses to send when the
+  resolved org label is not listed in
+  `~/zylos/components/hxa-connect/outbound-guard.json`
+  (`{ "internal_labels": ["org-1", "org-2"] }`). A blocked send prints the
+  target and the org label to stderr and exits 1 without connecting to the hub;
+  `HXA_CONFIRM_ORG=<label>` lets that one label through and prints one
+  `CONFIRMED EXTERNAL` line. Internal labels print nothing new.
+- **Off by default** — no guard file means no guard: every send behaves exactly
+  as in v1.7.11, so upgrading a host that has not opted in changes nothing.
+- A present but unreadable or malformed guard file fails the send instead of
+  letting it through.
+
+## [1.7.11] - 2026-11-13
+
 ### Added
 - **Catch-up on reconnect** — messages sent while the bot was offline (restart,
   dropped socket, hub restart) are now recovered. The component records a
