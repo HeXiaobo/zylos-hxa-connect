@@ -23,6 +23,7 @@ import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
 import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
 import { buildDmContent, buildThreadHeader } from './lib/format.js';
+import { isThreadMentioned as computeThreadMention } from './lib/mention.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 
 const HOME = process.env.HOME;
@@ -491,26 +492,18 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     return org.access?.threads?.[threadId]?.mode || 'mention';
   }
 
-  const mentionRe = new RegExp(
-    `@${org.agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'
-  );
+  // Mention detection lives in ./lib/mention.js: the hub's `mentions[]`
+  // (bot_id match) counts as a mention, not only the `@<agent_name>` text.
+  // The text check alone dropped thread mentions whenever the configured
+  // agent_name differed from the name rendered in the message.
+  const selfAgentId = org.agentId || null;
 
-  // Extract all searchable text from message (for mention detection).
-  // Includes text/markdown content PLUS alt text, filenames, titles from
-  // non-text parts so @mentions in those fields still trigger delivery.
-  function extractText(msg) {
-    const texts = [msg.content || ''];
-    if (msg.parts) {
-      for (const part of msg.parts) {
-        if ('content' in part && typeof part.content === 'string') {
-          texts.push(part.content);
-        }
-        if (part.type === 'image' && part.alt) texts.push(part.alt);
-        if (part.type === 'file' && part.name) texts.push(part.name);
-        if (part.type === 'link' && part.title) texts.push(part.title);
-      }
-    }
-    return texts.join(' ');
+  function isRealMention(message) {
+    return computeThreadMention({
+      message,
+      agentId: selfAgentId,
+      agentName: org.agentName,
+    });
   }
 
   // Display-friendly sender name (human provenance aware)
@@ -534,7 +527,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const sender = msgSender(message);
     const content = message.content || '';
     const isInteractiveDelivery = reason === 'message';
-    const isRealMention = mentionRe.test(extractText(message)) || !!message.mention_all;
+    const isMentioned = isRealMention(message);
     const perThreadMode = getThreadMode(threadId);
 
     // One policy gate for the live socket and for replay: self-echo, groupPolicy
@@ -542,7 +535,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // mode and realtime rate limiting.
     const decision = decideThreadDelivery({
       access: org.access, isSelf, message, threadId, sender, reason,
-      mode: perThreadMode, isMention: isRealMention, catchup,
+      mode: perThreadMode, isMention: isMentioned, catchup,
       takeRateToken: () => getRateLimiter(`${label}:thread:${message.sender_id || sender}`).consume(),
     });
     if (decision.verdict === POLICY_REJECT) {
@@ -588,7 +581,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     if (lifecycleBlock) parts.push(lifecycleBlock);
 
     // Smart mode hint
-    if (isInteractiveDelivery && !catchup && !isRealMention && perThreadMode === 'smart') {
+    if (isInteractiveDelivery && !catchup && !isMentioned && perThreadMode === 'smart') {
       parts.push('<smart-mode>\nDecide whether to respond. Reply with exactly [SKIP] when a response is unnecessary.\n</smart-mode>\n\n');
     }
 
