@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [1.7.13-3ai] - 2026-11-20
+
+### Fixed
+- **Credentials are redacted from error logs** — `agent_token`, registration
+  tickets and `Authorization` header values can appear inside network error
+  messages (URLs, request bodies). Every top-level error log in
+  `scripts/send.js` and `src/bot.js` now passes the text through
+  `redactSecrets()` (`src/lib/redact.js`), so a failing send or a dropped
+  connection cannot write a live credential into the PM2 log.
+
+  This carries the pi-runtime lab patch `0a133b7` into main. Hosts running
+  v1.7.13-3ai keep the redaction that the lab builds had; hosts upgrading
+  straight from upstream v1.7.11 gain it.
+
+  Coverage: the send failure path (`Error sending to <target>`), the client
+  `error` event, and connection-attempt failures. Handler-level logs already
+  print fixed wording without error text.
+
 ## [1.7.12-3ai]
 
 ### Added

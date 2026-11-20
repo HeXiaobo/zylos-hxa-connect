@@ -18,6 +18,8 @@
  */
 
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
+// zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
+import { redactSecrets } from '../src/lib/redact.js';
 import { cameFromEnvFile, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import {
   CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
@@ -176,6 +178,6 @@ try {
     await sendAsDM(target);
   }
 } catch (err) {
-  console.error(`Error sending to ${target}: ${err.message}`);
+  console.error(`Error sending to ${target}: ${redactSecrets(err.message)}`);
   process.exit(1);
 }
