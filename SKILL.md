@@ -110,7 +110,9 @@ names and not `org_id`s. When the file is present:
 - anything else prints the target and the org label to stderr and exits 1
   without connecting to the hub;
 - `HXA_CONFIRM_ORG=<that same label>` lets it through and prints one
-  `CONFIRMED EXTERNAL` line.
+  `CONFIRMED EXTERNAL` line. The variable must come from the invocation itself:
+  a value sitting in `~/zylos/.env` is ignored (and the block message says so),
+  because that would approve every send from then on.
 
 A present but unreadable or malformed file fails the send instead of letting it
 through. Endpoints that carry no `org:` prefix resolve to the default org

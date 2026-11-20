@@ -18,7 +18,7 @@
  */
 
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
-import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { cameFromEnvFile, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import {
   CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
 } from '../src/lib/outbound-guard.js';
@@ -101,6 +101,10 @@ const guardDecision = evaluateSend({
   target,
   guard,
   confirmOrg: process.env[CONFIRM_ENV],
+  // A confirmation that lives in ~/zylos/.env would approve every send from
+  // then on, which is the failure this guard exists to prevent. Only a value
+  // from this invocation's environment counts.
+  confirmFromEnvFile: cameFromEnvFile(CONFIRM_ENV),
 });
 
 if (guardDecision.action !== 'allow') {

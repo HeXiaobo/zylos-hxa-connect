@@ -14,6 +14,11 @@ const LABEL_RE = /^[a-z0-9][a-z0-9-]*$/;
 const ACCESS_KEYS = ['dmPolicy', 'dmAllowFrom', 'groupPolicy', 'threads'];
 
 // Load .env into process.env (don't override existing vars)
+//
+// Keys filled in from this file are recorded, because a value that sits in
+// ~/zylos/.env is ambient configuration, not a per-send decision. The outbound
+// guard uses this to refuse a confirmation that came from the file.
+const envFileKeys = new Set();
 if (fs.existsSync(ENV_PATH)) {
   for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
     const trimmed = line.trim();
@@ -22,8 +27,16 @@ if (fs.existsSync(ENV_PATH)) {
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx);
     const val = trimmed.slice(eqIdx + 1);
-    if (!process.env[key]) process.env[key] = val;
+    if (!process.env[key]) {
+      process.env[key] = val;
+      envFileKeys.add(key);
+    }
   }
+}
+
+/** True when `key` was populated from ~/zylos/.env rather than the caller's env. */
+export function cameFromEnvFile(key) {
+  return envFileKeys.has(key);
 }
 
 export const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';

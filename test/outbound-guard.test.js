@@ -246,4 +246,39 @@ describe('outbound org guard — scripts/send.js', () => {
       cleanup(home);
     }
   });
+
+  it('ignores HXA_CONFIRM_ORG when it comes from ~/zylos/.env, not the command', async () => {
+    // A confirmation left in the env file would approve every later send from
+    // this host. The guard must not read that as a decision.
+    const home = makeHome({ guard: { internal_labels: ['internal'] } });
+    fs.writeFileSync(path.join(home, 'zylos', '.env'), 'HXA_CONFIRM_ORG=customer-org\n');
+    sentRequests = [];
+    try {
+      const res = await runSend(home, ['org:customer-org|some-bot', 'hello customer']);
+
+      assert.notEqual(res.code, 0, 'an env-file confirmation must not unlock the send');
+      assert.equal(sentRequests.length, 0, 'nothing may reach the hub');
+      assert.match(res.stderr, /BLOCKED/);
+      assert.match(res.stderr, /zylos\/\.env/, 'the operator should be told why their value did not apply');
+    } finally {
+      cleanup(home);
+    }
+  });
+
+  it('still honours HXA_CONFIRM_ORG passed on the command when .env also has one', async () => {
+    const home = makeHome({ guard: { internal_labels: ['internal'] } });
+    fs.writeFileSync(path.join(home, 'zylos', '.env'), 'HXA_CONFIRM_ORG=customer-org\n');
+    sentRequests = [];
+    try {
+      const res = await runSend(home, ['org:customer-org|some-bot', 'hello customer'], {
+        env: { HXA_CONFIRM_ORG: 'customer-org' },
+      });
+
+      assert.equal(res.code, 0, `expected exit 0, got ${res.code}: ${res.stderr}`);
+      assert.equal(sentRequests.length, 1);
+      assert.match(res.stdout, /CONFIRMED EXTERNAL/);
+    } finally {
+      cleanup(home);
+    }
+  });
 });

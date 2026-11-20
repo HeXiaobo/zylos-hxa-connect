@@ -82,20 +82,25 @@ export function loadGuardConfig(guardPath = resolveGuardPath()) {
  *
  * Pure: no I/O, no process state, so it is cheap to test.
  */
-export function evaluateSend({ effectiveLabel, target, guard, confirmOrg }) {
+export function evaluateSend({ effectiveLabel, target, guard, confirmOrg, confirmFromEnvFile = false }) {
   if (!guard || !guard.enabled) return { action: 'allow', guarded: false };
 
   if (guard.internalLabels.includes(effectiveLabel)) {
     return { action: 'allow', guarded: false };
   }
 
-  const confirmed = typeof confirmOrg === 'string' && confirmOrg !== '' && confirmOrg === effectiveLabel;
+  const confirmed = !confirmFromEnvFile
+    && typeof confirmOrg === 'string'
+    && confirmOrg !== ''
+    && confirmOrg === effectiveLabel;
   return {
     action: confirmed ? 'confirm' : 'block',
     guarded: true,
     effectiveLabel,
     target,
     internalLabels: guard.internalLabels,
+    // Tells a blocked operator why a value they thought was set did not work.
+    ignoredEnvFileConfirmation: !confirmed && confirmFromEnvFile && confirmOrg === effectiveLabel,
   };
 }
 
@@ -110,13 +115,17 @@ export function formatGuardMessage(decision) {
   const { action, target, effectiveLabel, internalLabels } = decision;
 
   if (action === 'block') {
-    return [
+    const lines = [
       `[hxa-connect] BLOCKED: org "${effectiveLabel}" is not in internal_labels — message not sent`,
       `[hxa-connect] target: ${target}`,
       `[hxa-connect] org label: ${effectiveLabel}`,
       `[hxa-connect] internal_labels: ${internalLabels.join(', ')}`,
-      `[hxa-connect] to send anyway: HXA_CONFIRM_ORG=${effectiveLabel} node send.js ...`,
-    ].join('\n');
+    ];
+    if (decision.ignoredEnvFileConfirmation) {
+      lines.push(`[hxa-connect] HXA_CONFIRM_ORG=${effectiveLabel} was found in ~/zylos/.env — ignored, pass it on this command instead`);
+    }
+    lines.push(`[hxa-connect] to send anyway: HXA_CONFIRM_ORG=${effectiveLabel} node send.js ...`);
+    return lines.join('\n');
   }
 
   return `[hxa-connect] CONFIRMED EXTERNAL: org "${effectiveLabel}" approved by HXA_CONFIRM_ORG — target: ${target}`;
