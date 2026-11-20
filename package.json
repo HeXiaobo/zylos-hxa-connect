@@ -1,6 +1,6 @@
 {
   "name": "zylos-hxa-connect",
-  "version": "1.7.4-3ai",
+  "version": "1.7.12-3ai",
   "type": "module",
   "private": true,
   "dependencies": {
