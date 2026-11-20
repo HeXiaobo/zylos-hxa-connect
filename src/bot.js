@@ -689,12 +689,18 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         return policyResult;
       }
 
-      const rlKey = `${label}:dm:${message.sender_id || sender}`;
-      if (!getRateLimiter(rlKey).consume()) {
-        // Not a final answer: leave the id unremembered so a later replay or
-        // inbox poll can still deliver it.
-        console.warn(`${lp} DM deferred id=${message.id} source=${source} sender=${sender} reason=rate_limit`);
-        return { action: 'retry', reason: 'rate_limit' };
+      // Rate limiting is a REALTIME throttle (a burst on the socket). A replay
+      // is already paced by the runner's batches, and deferring it here would
+      // strand a finite backlog until tokens refill — or throw and end the run.
+      // Same rule `decideDmDelivery()` applies via its `catchup` flag.
+      if (source === 'websocket') {
+        const rlKey = `${label}:dm:${message.sender_id || sender}`;
+        if (!getRateLimiter(rlKey).consume()) {
+          // Not a final answer: leave the id unremembered so a later replay or
+          // inbox poll can still deliver it.
+          console.warn(`${lp} DM deferred id=${message.id} source=${source} sender=${sender} reason=rate_limit`);
+          return { action: 'retry', reason: 'rate_limit' };
+        }
       }
 
       gate.begin(message.id);
@@ -1042,12 +1048,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         // seam that reservation is ours so it does not defer itself.
         { ownReservations: message?.id ? [message.id] : [] },
       );
-      // A policy retry (notice still backing off) is not a final answer: throw
-      // so the runner keeps the message queued instead of marking it handled.
+      // A `retry` verdict (pending rejection notice, or a competing in-flight
+      // delivery) is not a final answer, but it must NOT abort the whole run:
+      // the runner's catch would end message scanning, so a later deliverable
+      // thread in the same replay would never be visited, and the same row
+      // would be picked first next time. Leaving the id unmarked is enough —
+      // the inbox poll retries the notice and the runner rescans the row.
       if (outcome?.action === 'retry') {
-        const err = new Error(`DM ${message?.id} still awaiting policy-notice retry`);
-        err.retryable = true;
-        throw err;
+        console.log(`${lp} catch-up DM ${message?.id} left unresolved (${outcome.reason}) — retried later, run continues`);
+        return;
       }
     },
 

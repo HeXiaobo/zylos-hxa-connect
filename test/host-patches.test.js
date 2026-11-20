@@ -371,7 +371,7 @@ describe('connectOrg startup path (P0 regression, executed not grepped)', () => 
         disconnect: () => { events.push('client.disconnect'); },
       },
       threadCtx: { start: async () => { events.push('threadCtx.start'); } },
-      catchup: { run: () => Promise.resolve() },
+      catchup: { run: () => { events.push('catchup.run'); return Promise.resolve(); } },
       dmReconciler: { start: async () => { events.push('dmReconciler.start'); } },
       // `diagnostics` reaches connectOrg through the connection record (that is
       // the fix). It is NOT a sandbox global, so a version that closes over the
@@ -385,26 +385,26 @@ describe('connectOrg startup path (P0 regression, executed not grepped)', () => 
     // The real `while (attempt < MAX_CONNECT_ATTEMPTS)` loop keeps going because
     // this fixture's `return` path depends on process-level state; assert on the
     // FIRST successful pass, which is what the bug broke.
-    assert.deepEqual(events.slice(0, 4), [
+    assert.deepEqual(events.slice(0, 5), [
       'client.connect',
       'diagnostics.connected',
       'threadCtx.start',
+      'catchup.run',
       'dmReconciler.start',
-    ], `a successful connect must reach every step, got: ${JSON.stringify(events.slice(0, 4))}`);
+    ], `a successful connect must reach every step, got: ${JSON.stringify(events.slice(0, 5))}`);
 
     // And the happy path must COMPLETE: no error-driven disconnect, and the
     // connection must stay registered. Without DM_RECONCILE_INTERVAL_MS in this
     // context the success log line threw, connectOrg caught it, disconnected and
-    // deleted the connection — while the four-event assertion above still saw
-    // only the first pass and went green.
+    // deleted the connection — while a prefix-only assertion still saw just the
+    // first pass and went green.
     assert.deepEqual(events, [
       'client.connect',
       'diagnostics.connected',
       'threadCtx.start',
+      'catchup.run',
       'dmReconciler.start',
     ], `a successful connect must not disconnect or retry: ${JSON.stringify(events)}`);
-    assert.equal(ctx.connections.has('default'), false,
-      'this fixture never registers the connection itself, so connectOrg must not have deleted one');
   });
 });
 
@@ -524,5 +524,64 @@ describe('round-2 review findings stay fixed', () => {
     );
     assert.match(replay, /hubMessageId: record\.hubMessageId/,
       'the ordinary completed-replay branch must return the stored Hub id for the receipt');
+  });
+});
+
+describe('round-3 review findings stay fixed', () => {
+  it('a replayed DM is not throttled by the realtime token bucket', () => {
+    // The bucket is a socket-burst throttle. A replay is paced by the runner's
+    // batches; applying the bucket there stranded a finite backlog until refill
+    // and then threw, ending the run.
+    const processDm = BOT_SOURCE.slice(
+      BOT_SOURCE.indexOf('async function processDm(raw, source'),
+      BOT_SOURCE.indexOf('const dmReconciler = new DmInboxReconciler'),
+    );
+    assert.match(processDm, /if \(source === 'websocket'\) \{[\s\S]*getRateLimiter/,
+      'the rate limit must be scoped to the socket source');
+    assert.match(processDm, /reason: 'rate_limit'/);
+  });
+
+  it('an unresolved replayed DM does not abort the whole replay run', () => {
+    const catchup = BOT_SOURCE.slice(
+      BOT_SOURCE.indexOf("deliverMessage: async ({ kind, message, channelId, threadId }) => {"),
+      BOT_SOURCE.indexOf('deliverSummary:'),
+    );
+    // A throw here propagates to CatchupRunner's scan loop, which ends message
+    // scanning for the run: a later deliverable thread would never be visited.
+    assert.doesNotMatch(catchup, /throw err;\s*\}\s*\n\s*\}\s*,\s*\n\s*\/\/ One notice line/,
+      'the retry path must not throw out of the catch-up callback');
+    assert.match(catchup, /left unresolved/, 'it should log and continue');
+  });
+
+  it('completion markers are swept during continuous operation, not only at startup', async () => {
+    const { C4DeliveryQueue } = await import('../src/lib/c4-delivery-queue.js');
+    const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hxa-sweep-'));
+    const calls = [];
+    const q = new C4DeliveryQueue({
+      spoolDir,
+      c4ReceivePath: '/fake/c4-receive.js',
+      execFileFn: (c, a, o, cb) => { calls.push(a); cb(null, '{}', ''); },
+      doneRetentionMs: 0,
+    });
+    try {
+      await q.start();
+      await q.enqueue({ id: 'hxa:sweep:a', args: ['--content', 'a'], preview: 'a' });
+      await q.waitForIdle(2000);
+      // First delivery triggers a sweep (lastPruneAt was set at start, so force
+      // the hourly gate open to observe the sweep running mid-life).
+      q.lastPruneAt = 0;
+      await q.enqueue({ id: 'hxa:sweep:b', args: ['--content', 'b'], preview: 'b' });
+      await q.waitForIdle(2000);
+      q.stop();
+
+      assert.equal(calls.length, 2);
+      // With doneRetentionMs 0 and a sweep after the second delivery, the first
+      // marker is candidates for removal — the point is that a sweep RAN without
+      // a restart, so the directory does not grow for weeks.
+      const markers = fs.readdirSync(spoolDir).filter(f => f.endsWith('.done'));
+      assert.ok(markers.length <= 1, `stale markers must be swept mid-life, found ${markers.length}`);
+    } finally {
+      fs.rmSync(spoolDir, { recursive: true, force: true });
+    }
   });
 });

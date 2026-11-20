@@ -95,6 +95,7 @@ export class C4DeliveryQueue {
     this.retryMs = retryMs;
     this.maxRetryMs = maxRetryMs;
     this.doneRetentionMs = doneRetentionMs;
+    this.lastPruneAt = 0;
     this.clock = clock;
     this.logger = logger;
     this.active = 0;
@@ -109,6 +110,7 @@ export class C4DeliveryQueue {
   async start() {
     await fs.promises.mkdir(this.spoolDir, { recursive: true, mode: 0o700 });
     await this.#pruneDone();
+    this.lastPruneAt = this.clock();
     this.started = true;
     this.stopping = false;
     this.#schedule(0);
@@ -173,6 +175,18 @@ export class C4DeliveryQueue {
       attempts: record.attempts,
     })}\n`, { mode: 0o600 });
     await fs.promises.unlink(path.join(this.spoolDir, name)).catch(() => {});
+  }
+
+  /**
+   * Run the marker sweep at most once an hour, off the delivery path.
+   */
+  #pruneDoneSoon() {
+    const now = this.clock();
+    if (this.lastPruneAt && now - this.lastPruneAt < 60 * 60 * 1000) return;
+    this.lastPruneAt = now;
+    this.#pruneDone().catch(error => {
+      this.logger.warn(`[hxa-connect] Completion-marker sweep failed: ${redactSecrets(error.message)}`);
+    });
   }
 
   /**
@@ -317,6 +331,9 @@ export class C4DeliveryQueue {
       // and a crash before the caller persisted its own handled-id would let
       // the message be enqueued and sent a second time.
       await this.#markDone(name, record);
+      // Bound the marker directory during continuous operation, not only on the
+      // next restart (swept at most hourly, off the delivery path).
+      this.#pruneDoneSoon();
       this.logger.log(`[hxa-connect] -> C4 durable id=${record.id}: ${record.preview}`);
     } catch (error) {
       const attempts = record.attempts + 1;
