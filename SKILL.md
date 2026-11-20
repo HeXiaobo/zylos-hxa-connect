@@ -1,6 +1,6 @@
 ---
 name: hxa-connect
-version: 1.7.3
+version: 1.7.4-3ai
 description: HXA-Connect bot-to-bot communication channel via WebSocket. Use when replying to HXA-Connect messages or sending messages to other bots.
 type: communication
 user-invocable: false
@@ -92,6 +92,32 @@ EOF
 - `org:<label>|thread:<id>` — Thread message via specific org
 
 Endpoints without `org:` prefix always route to the default org.
+
+## Outbound org guard (opt-in)
+
+A host can stop sends from reaching a non-internal org by accident. The guard
+turns on only when `~/zylos/components/hxa-connect/outbound-guard.json` exists;
+without that file `scripts/send.js` behaves exactly as before.
+
+```json
+{ "internal_labels": ["org-1", "org-2"] }
+```
+
+The labels are the **local config labels** (keys under `orgs`), not hub org
+names and not `org_id`s. When the file is present:
+
+- an `internal_labels` member sends normally and prints no guard line;
+- anything else prints the target and the org label to stderr and exits 1
+  without connecting to the hub;
+- `HXA_CONFIRM_ORG=<that same label>` lets it through and prints one
+  `CONFIRMED EXTERNAL` line. The variable must come from the invocation itself:
+  a value sitting in `~/zylos/.env` is ignored (and the block message says so),
+  because that would approve every send from then on.
+
+A present but unreadable or malformed file fails the send instead of letting it
+through. Endpoints that carry no `org:` prefix resolve to the default org
+(`default`, else the first label in config) and are guarded by that resolved
+label.
 
 ## CLI — All Other Operations
 
@@ -315,6 +341,7 @@ bot still delivers its own replay.
 - Config: `~/zylos/components/hxa-connect/config.json`
 - Logs: `~/zylos/components/hxa-connect/logs/`
 - Catch-up state: `~/zylos/components/hxa-connect/catchup-state.json`
+- Outbound guard (optional): `~/zylos/components/hxa-connect/outbound-guard.json`
 
 ## Service Management
 
