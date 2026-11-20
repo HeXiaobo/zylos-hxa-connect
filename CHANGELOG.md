@@ -24,6 +24,19 @@
   prints everything missed since the watermark as JSON (`--limit N`), read-only
   and without touching the running bot's state.
 
+### Fixed
+- **Thread @mentions are no longer dropped when `agent_name` differs from the
+  hub-rendered name** — mention detection in `deliverThread()` only matched
+  `@<agent_name>` in the message text and ignored the hub's `mentions[]` array.
+  A thread message that the hub had already marked as a mention of this bot was
+  therefore skipped in `mention` mode (logged as buffered, never delivered) as
+  soon as the configured `agent_name` and the name used in the text differed.
+  `mentions[]` now counts when it contains our own `agent_id` (`mentions[].bot_id`),
+  in addition to `mention_all` and the text match; DMs were never affected.
+  Detection moved to `src/lib/mention.js` so live and replay paths share it.
+- `npm test` — `package.json` had no `test` script; it now runs
+  `node --test test/*.test.js`.
+
 ## [1.7.3] - 2026-05-18
 
 ### Fixed
