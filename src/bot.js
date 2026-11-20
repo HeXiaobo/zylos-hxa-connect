@@ -24,6 +24,8 @@ import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
 import { buildDmContent, buildThreadHeader } from './lib/format.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
+// zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
+import { redactSecrets } from './lib/redact.js';
 
 const HOME = process.env.HOME;
 const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -791,7 +793,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   });
 
   client.on('error', (err) => {
-    console.error(`${lp} Error: ${err?.message || err}`);
+    console.error(`${lp} Error: ${redactSecrets(err?.message || err)}`);
   });
 
   client.on('session_invalidated', ({ code, reason }) => {
@@ -838,7 +840,7 @@ async function connectOrg(label, { client, threadCtx, catchup, config: org }) {
       try { client.disconnect(); } catch {}
       attempt++;
       const delay = Math.min(INITIAL_DELAY * Math.pow(BACKOFF, attempt - 1), MAX_DELAY);
-      console.error(`${lp} Connection attempt ${attempt} failed: ${err.message}`);
+      console.error(`${lp} Connection attempt ${attempt} failed: ${redactSecrets(err.message)}`);
       if (attempt >= MAX_CONNECT_ATTEMPTS) {
         console.error(`${lp} Giving up after ${attempt} attempts`);
         try { client.disconnect(); } catch {}
