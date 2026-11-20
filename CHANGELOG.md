@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [1.7.4-3ai]
+## [1.7.12-3ai]
 
 ### Added
 - **Outbound org guard (opt-in)** — `scripts/send.js` refuses to send when the
