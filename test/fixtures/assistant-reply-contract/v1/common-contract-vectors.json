@@ -1,0 +1,712 @@
+{
+  "schemaVersion": 1,
+  "contractId": "zylos.assistant-reply-contract/v1",
+  "semantics": {
+    "platformAcceptedMeans": "platform_accepted_not_user_read",
+    "progressReliability": "best_effort_projection",
+    "finalDeliveryReliability": "durable_outbox_at_least_once",
+    "unknownOutcomePolicy": "reconcile_before_retry",
+    "silentCreatesReplyIntent": false,
+    "cancelledCreatesReplyIntent": false,
+    "cancelledFinishesPresence": true,
+    "derivedSourceKeysCrossBoundary": false
+  },
+  "acceptMessage": {
+    "command": {
+      "schemaVersion": 1,
+      "type": "AcceptMessage",
+      "commandId": "cmd:feishu:evt-001",
+      "idempotencyKey": "feishu:acct-01:im.message.receive_v1:evt-001",
+      "traceId": "trace:req-001",
+      "causationId": "evt-001",
+      "issuedAt": "2026-09-01T00:00:00.000Z",
+      "source": {
+        "adapterId": "feishu",
+        "accountRef": "acct-01",
+        "targetRef": "opaque:chat-01:msg-001",
+        "conversationKey": "opaque:reply-tree-01",
+        "messageId": "msg-001",
+        "eventId": "evt-001",
+        "eventType": "im.message.receive_v1",
+        "payloadHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "actor": {
+        "provider": "feishu",
+        "tenantRef": "tenant-01",
+        "externalId": "user-01"
+      },
+      "content": {
+        "kind": "text",
+        "text": "Please summarize the decision."
+      },
+      "contextHints": {
+        "threadRef": null,
+        "rootRef": "root-01",
+        "parentRef": "parent-01",
+        "quoteRefs": [],
+        "mentionRefs": [],
+        "attachmentRefs": []
+      },
+      "reply": {
+        "mode": "required",
+        "targetRef": "opaque:chat-01:parent-01"
+      },
+      "policy": {
+        "priority": 2,
+        "requireIdle": false
+      }
+    },
+    "accepted": {
+      "schemaVersion": 1,
+      "type": "MessageAccepted",
+      "requestId": "req-001",
+      "traceId": "trace:req-001",
+      "conversationLaneKey": "feishu:acct-01:group:chat-01:reply:root-01",
+      "laneSequence": 42,
+      "orderingMode": "acceptance",
+      "sourceOrder": null
+    },
+    "replayRules": {
+      "transportIdentityFields": [
+        "source.adapterId",
+        "source.accountRef",
+        "source.eventType",
+        "source.eventId"
+      ],
+      "logicalMessageIdentityFields": [
+        "source.adapterId",
+        "source.accountRef",
+        "source.eventType",
+        "source.messageId"
+      ],
+      "sameKeySamePayload": "safe_replay",
+      "sameKeyDifferentPayload": "IDEMPOTENCY_CONFLICT"
+    }
+  },
+  "runtimeLane": {
+    "runtimeLaneId": "runtime:shared",
+    "capacity": 1,
+    "conversationLaneAcceptance": "concurrent",
+    "runtimeTurnExecution": "global_serial",
+    "scheduler": "priority_then_acceptance_fifo",
+    "laneExposure": "head_only",
+    "ordinaryMessageDuringActiveTurn": "queued",
+    "ordinaryMessageMayAppendOrPreempt": false,
+    "cancelMode": "cooperative_with_generation_fence"
+  },
+  "cancelRequest": {
+    "schemaVersion": 1,
+    "type": "CancelRequest",
+    "commandId": "cancel:req-003:user-01",
+    "idempotencyKey": "cancel:req-003:g1:user-01",
+    "requestId": "req-003",
+    "turnId": "turn:req-003:1",
+    "generation": 1,
+    "traceId": "trace:req-003",
+    "causationId": "cancel-event-003",
+    "issuedAt": "2026-09-01T00:00:10.000Z",
+    "source": {
+      "adapterId": "feishu",
+      "accountRef": "acct-01",
+      "eventType": "im.message.receive_v1",
+      "eventId": "cancel-event-003",
+      "messageId": "cancel-message-003"
+    },
+    "actor": {
+      "provider": "feishu",
+      "tenantRef": "tenant-01",
+      "externalId": "user-01",
+      "provenance": "verified_channel_actor"
+    },
+    "mode": "cooperative",
+    "reason": "user_requested"
+  },
+  "contextSnapshot": {
+    "schemaVersion": 1,
+    "type": "ContextSnapshot",
+    "snapshotId": "ctx:req-001:1",
+    "requestId": "req-001",
+    "turnId": "turn:req-001:1",
+    "traceId": "trace:req-001",
+    "conversationLaneKey": "feishu:acct-01:group:chat-01:reply:root-01",
+    "asOfLaneSequence": 42,
+    "contentHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "items": [
+      {
+        "kind": "source_message",
+        "ref": "opaque:chat-01:msg-001"
+      },
+      {
+        "kind": "quoted_message",
+        "ref": "opaque:chat-01:parent-01"
+      },
+      {
+        "kind": "memory",
+        "ref": "memory:user-01:decision-context"
+      }
+    ],
+    "truncation": {
+      "strategy": "deterministic_budget_v1",
+      "inputTokens": 1200,
+      "keptTokens": 1200,
+      "droppedItemRefs": []
+    },
+    "retryPolicy": "reuse_same_snapshot"
+  },
+  "runtimeEventStreams": [
+    {
+      "name": "answer-completed",
+      "events": [
+        {
+          "schemaVersion": 1,
+          "type": "RunAccepted",
+          "eventId": "evt:req-001:1",
+          "idempotencyKey": "run:req-001:accepted",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 1,
+          "traceId": "trace:req-001",
+          "causationId": "cmd:feishu:evt-001",
+          "producer": "core:message-intake",
+          "payload": {}
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunQueued",
+          "eventId": "evt:req-001:2",
+          "idempotencyKey": "run:req-001:queued",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 2,
+          "traceId": "trace:req-001",
+          "causationId": "evt:req-001:1",
+          "producer": "core:runtime-pending-queue",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunStarted",
+          "eventId": "evt:req-001:3",
+          "idempotencyKey": "run:req-001:started:g1",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 3,
+          "traceId": "trace:req-001",
+          "causationId": "evt:req-001:2",
+          "producer": "core:runtime-lane",
+          "payload": {
+            "runtimeLaneId": "runtime:shared",
+            "contextSnapshotId": "ctx:req-001:1",
+            "contextSnapshotHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "ProgressUpdated",
+          "eventId": "evt:req-001:4",
+          "idempotencyKey": "run:req-001:progress:1",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 4,
+          "traceId": "trace:req-001",
+          "causationId": "evt:req-001:3",
+          "producer": "runtime:shared",
+          "payload": {
+            "stage": "working"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "OutputDelta",
+          "eventId": "evt:req-001:5",
+          "idempotencyKey": "run:req-001:delta:1",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 5,
+          "traceId": "trace:req-001",
+          "causationId": "evt:req-001:4",
+          "producer": "runtime:shared",
+          "payload": {
+            "deltaIndex": 1,
+            "text": "The decision is approved."
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunCompleted",
+          "eventId": "evt:req-001:6",
+          "idempotencyKey": "run:req-001:completed",
+          "requestId": "req-001",
+          "turnId": "turn:req-001:1",
+          "generation": 1,
+          "sequence": 6,
+          "traceId": "trace:req-001",
+          "causationId": "evt:req-001:5",
+          "producer": "runtime:shared",
+          "payload": {
+            "outcomeId": "outcome:req-001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "run-failed",
+      "events": [
+        {
+          "schemaVersion": 1,
+          "type": "RunAccepted",
+          "eventId": "evt:req-002:1",
+          "idempotencyKey": "run:req-002:accepted",
+          "requestId": "req-002",
+          "turnId": "turn:req-002:1",
+          "generation": 1,
+          "sequence": 1,
+          "traceId": "trace:req-002",
+          "causationId": "cmd:hxa:evt-002",
+          "producer": "core:message-intake",
+          "payload": {}
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunQueued",
+          "eventId": "evt:req-002:2",
+          "idempotencyKey": "run:req-002:queued",
+          "requestId": "req-002",
+          "turnId": "turn:req-002:1",
+          "generation": 1,
+          "sequence": 2,
+          "traceId": "trace:req-002",
+          "causationId": "evt:req-002:1",
+          "producer": "core:runtime-pending-queue",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunStarted",
+          "eventId": "evt:req-002:3",
+          "idempotencyKey": "run:req-002:started:g1",
+          "requestId": "req-002",
+          "turnId": "turn:req-002:1",
+          "generation": 1,
+          "sequence": 3,
+          "traceId": "trace:req-002",
+          "causationId": "evt:req-002:2",
+          "producer": "core:runtime-lane",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunFailed",
+          "eventId": "evt:req-002:4",
+          "idempotencyKey": "run:req-002:failed",
+          "requestId": "req-002",
+          "turnId": "turn:req-002:1",
+          "generation": 1,
+          "sequence": 4,
+          "traceId": "trace:req-002",
+          "causationId": "evt:req-002:3",
+          "producer": "runtime:shared",
+          "payload": {
+            "outcomeId": "outcome:req-002",
+            "code": "RUNTIME_FAILURE",
+            "retryable": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "run-cancelled",
+      "events": [
+        {
+          "schemaVersion": 1,
+          "type": "RunAccepted",
+          "eventId": "evt:req-003:1",
+          "idempotencyKey": "run:req-003:accepted",
+          "requestId": "req-003",
+          "turnId": "turn:req-003:1",
+          "generation": 1,
+          "sequence": 1,
+          "traceId": "trace:req-003",
+          "causationId": "cmd:feishu:evt-003",
+          "producer": "core:message-intake",
+          "payload": {}
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunQueued",
+          "eventId": "evt:req-003:2",
+          "idempotencyKey": "run:req-003:queued",
+          "requestId": "req-003",
+          "turnId": "turn:req-003:1",
+          "generation": 1,
+          "sequence": 2,
+          "traceId": "trace:req-003",
+          "causationId": "evt:req-003:1",
+          "producer": "core:runtime-pending-queue",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunCancelled",
+          "eventId": "evt:req-003:3",
+          "idempotencyKey": "run:req-003:cancelled",
+          "requestId": "req-003",
+          "turnId": "turn:req-003:1",
+          "generation": 1,
+          "sequence": 3,
+          "traceId": "trace:req-003",
+          "causationId": "cancel:req-003:user-01",
+          "producer": "core:runtime-lane",
+          "payload": {
+            "mode": "queued"
+          }
+        }
+      ]
+    },
+    {
+      "name": "silent-completed",
+      "events": [
+        {
+          "schemaVersion": 1,
+          "type": "RunAccepted",
+          "eventId": "evt:req-004:1",
+          "idempotencyKey": "run:req-004:accepted",
+          "requestId": "req-004",
+          "turnId": "turn:req-004:1",
+          "generation": 1,
+          "sequence": 1,
+          "traceId": "trace:req-004",
+          "causationId": "cmd:feishu:evt-004",
+          "producer": "core:message-intake",
+          "payload": {}
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunQueued",
+          "eventId": "evt:req-004:2",
+          "idempotencyKey": "run:req-004:queued",
+          "requestId": "req-004",
+          "turnId": "turn:req-004:1",
+          "generation": 1,
+          "sequence": 2,
+          "traceId": "trace:req-004",
+          "causationId": "evt:req-004:1",
+          "producer": "core:runtime-pending-queue",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunStarted",
+          "eventId": "evt:req-004:3",
+          "idempotencyKey": "run:req-004:started:g1",
+          "requestId": "req-004",
+          "turnId": "turn:req-004:1",
+          "generation": 1,
+          "sequence": 3,
+          "traceId": "trace:req-004",
+          "causationId": "evt:req-004:2",
+          "producer": "core:runtime-lane",
+          "payload": {
+            "runtimeLaneId": "runtime:shared"
+          }
+        },
+        {
+          "schemaVersion": 1,
+          "type": "RunCompleted",
+          "eventId": "evt:req-004:4",
+          "idempotencyKey": "run:req-004:completed",
+          "requestId": "req-004",
+          "turnId": "turn:req-004:1",
+          "generation": 1,
+          "sequence": 4,
+          "traceId": "trace:req-004",
+          "causationId": "evt:req-004:3",
+          "producer": "runtime:shared",
+          "payload": {
+            "outcomeId": "outcome:req-004"
+          }
+        }
+      ]
+    }
+  ],
+  "replyOutcomes": {
+    "answer": {
+      "schemaVersion": 1,
+      "type": "ReplyOutcome",
+      "outcomeId": "outcome:req-001",
+      "requestId": "req-001",
+      "turnId": "turn:req-001:1",
+      "traceId": "trace:req-001",
+      "kind": "answer",
+      "content": {
+        "format": "text",
+        "text": "The decision is approved."
+      }
+    },
+    "silent": {
+      "schemaVersion": 1,
+      "type": "ReplyOutcome",
+      "outcomeId": "outcome:req-004",
+      "requestId": "req-004",
+      "turnId": "turn:req-004:1",
+      "traceId": "trace:req-004",
+      "kind": "silent",
+      "explicit": true,
+      "reason": "no_user_visible_reply_required"
+    },
+    "failure": {
+      "schemaVersion": 1,
+      "type": "ReplyOutcome",
+      "outcomeId": "outcome:req-002",
+      "requestId": "req-002",
+      "turnId": "turn:req-002:1",
+      "traceId": "trace:req-002",
+      "kind": "failure",
+      "code": "RUNTIME_FAILURE",
+      "retryable": true
+    },
+    "invalidEmptyAnswer": {
+      "schemaVersion": 1,
+      "type": "ReplyOutcome",
+      "outcomeId": "outcome:req-005",
+      "requestId": "req-005",
+      "turnId": "turn:req-005:1",
+      "traceId": "trace:req-005",
+      "kind": "answer",
+      "content": {
+        "format": "text",
+        "text": ""
+      },
+      "expectedError": "MISSING_OUTPUT"
+    }
+  },
+  "replyIntents": {
+    "answer": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:req-001:route-a",
+      "requestId": "req-001",
+      "traceId": "trace:req-001",
+      "cause": {
+        "kind": "run_terminal",
+        "eventId": "evt:req-001:6"
+      },
+      "route": {
+        "adapterId": "feishu",
+        "targetRef": "opaque:chat-01:parent-01"
+      },
+      "disposition": "send",
+      "payload": {
+        "format": "text",
+        "text": "The decision is approved."
+      },
+      "contentHash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "idempotencyKey": "reply:req-001:route-a"
+    },
+    "failureNotice": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:req-002:route-a",
+      "requestId": "req-002",
+      "traceId": "trace:req-002",
+      "cause": {
+        "kind": "run_terminal",
+        "eventId": "evt:req-002:4"
+      },
+      "route": {
+        "adapterId": "hxa-connect",
+        "targetRef": "opaque:hxa-thread-002"
+      },
+      "disposition": "failure_notice",
+      "payload": {
+        "format": "text",
+        "text": "The assistant could not complete this request."
+      },
+      "contentHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "idempotencyKey": "reply:req-002:route-a"
+    },
+    "taskReceipt": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:task-effect-001:route-a",
+      "requestId": "req-task-001",
+      "traceId": "trace:req-task-001",
+      "cause": {
+        "kind": "task_effect",
+        "eventId": "task-effect-applied-001"
+      },
+      "route": {
+        "adapterId": "feishu",
+        "targetRef": "opaque:chat-01:msg-task-001"
+      },
+      "disposition": "task_receipt",
+      "payload": {
+        "format": "text",
+        "text": "Task created."
+      },
+      "contentHash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "idempotencyKey": "reply:task-effect-001:route-a"
+    }
+  },
+  "deliveryReceipts": {
+    "platformAccepted": {
+      "schemaVersion": 1,
+      "type": "DeliveryReceipt",
+      "receiptId": "receipt:delivery:req-001:attempt-1",
+      "intentId": "reply:req-001:route-a",
+      "deliveryId": "delivery:reply:req-001:route-a",
+      "requestId": "req-001",
+      "attemptId": "attempt:delivery:req-001:1",
+      "traceId": "trace:req-001",
+      "adapterId": "feishu",
+      "outcome": "platform_accepted",
+      "externalRef": "opaque:platform-message-001",
+      "observedAt": "2026-09-01T00:00:05.000Z"
+    },
+    "unknown": {
+      "schemaVersion": 1,
+      "type": "DeliveryReceipt",
+      "receiptId": "receipt:delivery:req-001:attempt-2",
+      "intentId": "reply:req-001:route-a",
+      "deliveryId": "delivery:reply:req-001:route-a",
+      "requestId": "req-001",
+      "attemptId": "attempt:delivery:req-001:2",
+      "traceId": "trace:req-001",
+      "adapterId": "feishu",
+      "outcome": "unknown",
+      "externalRef": null,
+      "observedAt": "2026-09-01T00:01:00.000Z",
+      "nextAction": "reconcile_before_retry"
+    },
+    "reconciled": {
+      "schemaVersion": 1,
+      "type": "DeliveryReceipt",
+      "receiptId": "receipt:delivery:req-001:reconcile-1",
+      "intentId": "reply:req-001:route-a",
+      "deliveryId": "delivery:reply:req-001:route-a",
+      "requestId": "req-001",
+      "attemptId": "attempt:delivery:req-001:2",
+      "traceId": "trace:req-001",
+      "adapterId": "feishu",
+      "outcome": "reconciled",
+      "externalRef": "opaque:platform-message-001",
+      "observedAt": "2026-09-01T00:02:00.000Z"
+    },
+    "rejected": {
+      "schemaVersion": 1,
+      "type": "DeliveryReceipt",
+      "receiptId": "receipt:delivery:req-002:attempt-1",
+      "intentId": "reply:req-002:route-a",
+      "deliveryId": "delivery:reply:req-002:route-a",
+      "requestId": "req-002",
+      "attemptId": "attempt:delivery:req-002:1",
+      "traceId": "trace:req-002",
+      "adapterId": "hxa-connect",
+      "outcome": "rejected",
+      "externalRef": null,
+      "observedAt": "2026-09-01T00:03:00.000Z",
+      "errorCode": "PLATFORM_REJECTED",
+      "retryable": true
+    }
+  },
+  "deliverySettlements": {
+    "accepted": {
+      "schemaVersion": 1,
+      "type": "DeliverySettlement",
+      "settlementId": "settlement:delivery:req-001:accepted",
+      "intentId": "reply:req-001:route-a",
+      "deliveryId": "delivery:reply:req-001:route-a",
+      "requestId": "req-001",
+      "traceId": "trace:req-001",
+      "adapterId": "feishu",
+      "state": "accepted",
+      "basis": "platform_accepted",
+      "presented": true
+    },
+    "reconciled": {
+      "schemaVersion": 1,
+      "type": "DeliverySettlement",
+      "settlementId": "settlement:delivery:req-001:reconciled",
+      "intentId": "reply:req-001:route-a",
+      "deliveryId": "delivery:reply:req-001:route-a",
+      "requestId": "req-001",
+      "traceId": "trace:req-001",
+      "adapterId": "feishu",
+      "state": "accepted",
+      "basis": "reconciled",
+      "presented": true
+    },
+    "unpresentable": {
+      "schemaVersion": 1,
+      "type": "DeliverySettlement",
+      "settlementId": "settlement:delivery:req-002:unpresentable",
+      "intentId": "reply:req-002:route-a",
+      "deliveryId": "delivery:reply:req-002:route-a",
+      "requestId": "req-002",
+      "traceId": "trace:req-002",
+      "adapterId": "hxa-connect",
+      "state": "unpresentable",
+      "basis": "retry_exhausted",
+      "presented": false
+    }
+  },
+  "taskCommand": {
+    "command": {
+      "schemaVersion": 1,
+      "type": "TaskCommand",
+      "commandId": "task-command-001",
+      "idempotencyKey": "task:task-001:submit-review:v7",
+      "requestId": "req-task-001",
+      "turnId": "turn:req-task-001:1",
+      "traceId": "trace:req-task-001",
+      "source": {
+        "adapterId": "feishu",
+        "accountRef": "acct-01",
+        "eventType": "task.status.changed_v1",
+        "eventId": "task-event-001",
+        "messageId": "msg-task-001"
+      },
+      "actor": {
+        "provider": "feishu",
+        "tenantRef": "tenant-01",
+        "externalId": "user-01",
+        "provenance": "verified_channel_actor"
+      },
+      "taskId": "task-001",
+      "command": "SubmitForReview",
+      "capability": "task.submit_for_review",
+      "expectedVersion": 7,
+      "aiMayConstructActor": false,
+      "aiMayWriteDatabase": false
+    },
+    "authorizationDecision": {
+      "schemaVersion": 1,
+      "type": "AuthorizationDecision",
+      "decisionId": "authz:task-command-001",
+      "commandId": "task-command-001",
+      "enforcedBy": "TaskCore",
+      "decision": "allow",
+      "checked": [
+        "actor_role",
+        "capability",
+        "task_state",
+        "expected_version"
+      ]
+    }
+  }
+}

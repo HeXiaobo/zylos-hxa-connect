@@ -15,18 +15,29 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getRuntimePaths } from './config-path.js';
 
 export const GUARD_FILENAME = 'outbound-guard.json';
 export const CONFIRM_ENV = 'HXA_CONFIRM_ORG';
 
 /**
  * Resolve the guard config path.
+ *
+ * Follows the SAME runtime path seam as the rest of the component (upstream
+ * 1.7.7), so a host that selects its runtime with ZYLOS_DIR reads the guard
+ * that sits next to its actual config.json. Hardcoding $HOME/zylos here would
+ * silently DISABLE the guard on such a host — the file would simply not be
+ * found at the old location and `loadGuardConfig()` would return
+ * `{ enabled: false }`, i.e. "not opted in". A stale file at the old location
+ * would apply a stale policy instead. Fail-closed beats either.
+ *
  * Exported so tests can point at a fixture directory instead of the real
  * component data dir.
  */
-export function resolveGuardPath({ home = process.env.HOME } = {}) {
-  if (!home) throw new Error('HOME is not set — cannot resolve outbound guard path');
-  return path.join(home, 'zylos/components/hxa-connect', GUARD_FILENAME);
+export function resolveGuardPath({ home } = {}) {
+  // An explicit `home` is the test seam and keeps its old meaning.
+  if (home) return path.join(home, 'zylos/components/hxa-connect', GUARD_FILENAME);
+  return path.join(getRuntimePaths().dataDir, GUARD_FILENAME);
 }
 
 /**

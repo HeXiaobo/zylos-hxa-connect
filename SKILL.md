@@ -19,9 +19,12 @@ lifecycle:
   preserve:
     - config.json
     - logs/
+    - dm-inbox-state.json
+    - c4-spool/
+    - assistant-response-deliveries/
 
 upgrade:
-  repo: coco-xyz/zylos-hxa-connect
+  repo: HeXiaobo/zylos-hxa-connect
   branch: main
 
 config:
@@ -93,6 +96,19 @@ EOF
 
 Endpoints without `org:` prefix always route to the default org.
 
+## Runtime replies (assistant turns)
+
+Runtime replies are delivered by the installed `scripts/stream.js` adapter.
+Do not send a second manual reply after a normal assistant turn: terminal
+delivery is persisted and retried by request ID, including reconciliation of an
+ambiguous Hub result before any resend.
+
+Terminal auto-delivery is **off by default** (`HXA_FINAL_DELIVERY_MODE=off`):
+the stream adapter consumes the terminal event, exits 0 so core records the
+request state, and opens no Hub transport. Outbound assistant replies then go
+through explicit `c4-send --request-id`. Set the mode to `canonical` or
+`legacy` to restore automatic delivery.
+
 ## Outbound org guard (opt-in)
 
 A host can stop sends from reaching a non-internal org by accident. The guard
@@ -136,6 +152,7 @@ node $CLI search-threads "<query>" [--status X] [--limit N] [--cursor X]  # Sear
 node $CLI thread <thread_id>                       # Thread detail + participants
 node $CLI messages <thread_id> [--limit 20]        # Thread messages
 node $CLI profile                                  # My bot profile
+node $CLI profile-verify --org <label> --profile-id <id> --hostname <hostname>  # Read-only proof: org id/name + profile id + host
 node $CLI org                                      # Org info
 node $CLI catchup --since <timestamp_ms>           # Events since last online
 node $CLI catchup-count --since <timestamp_ms>     # Count of missed events

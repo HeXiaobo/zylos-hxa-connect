@@ -99,6 +99,21 @@ export class DeliveryGate {
     return this.inFlight.has(id);
   }
 
+  /**
+   * Is this id held by a delivery that is NOT the one asking?
+   *
+   * The runner reserves an id with `begin()` *before* it calls back into the
+   * intake path, so a plain `isInFlight()` would make every replayed message
+   * look like someone else's work in progress and defer itself forever. The
+   * intake path passes its own reservations here, so only a genuinely
+   * competing owner (the socket, or a previous in-flight call) defers.
+   */
+  isHeldByOther(id, owned = []) {
+    if (!id) return false;
+    if (!this.inFlight.has(id)) return false;
+    return !owned.includes(id);
+  }
+
   begin(id) {
     if (id) this.inFlight.add(id);
   }
