@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "HeXiaobo/zylos-core",
+    "acceptedSha": "944947ee34e759b2015175dda457ea001a284784",
+    "baseSha": "6e15ae2496afba377c9739d46e1846dae264d567",
+    "packageVersion": "0.7.2-rc.22"
+  },
+  "semantics": {
+    "contentHash": "sha256(canonicalJson(payload))",
+    "intentId": "reply:<request-or-task-effect-id>:<sha256(canonicalJson(route))>",
+    "claimFence": [
+      "attemptId",
+      "claimEpoch",
+      "leaseOwner",
+      "leaseToken"
+    ],
+    "deliveryGenerationOwner": "core"
+  },
+  "intents": {
+    "answer": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:req:hxa:dm:message-001:dd562a6ebd72c02d4c8386a2c2192fcdb78fc6e897cb44136227df5e1d3eeedb",
+      "requestId": "req:hxa:dm:message-001",
+      "traceId": "trace:hxa:dm:message-001",
+      "cause": {
+        "kind": "run_terminal",
+        "eventId": "event:req:hxa:dm:message-001:6"
+      },
+      "route": {
+        "adapterId": "hxa-connect",
+        "targetRef": "org:hxa|peer-agent|msg:source-message-001"
+      },
+      "disposition": "send",
+      "payload": {
+        "format": "text",
+        "text": "Exact terminal answer."
+      },
+      "contentHash": "sha256:da7589ba53e7e9a7066ae56f9159e455518cbfaee0a0e479f9fbf726a8374114",
+      "idempotencyKey": "reply:req:hxa:dm:message-001:dd562a6ebd72c02d4c8386a2c2192fcdb78fc6e897cb44136227df5e1d3eeedb"
+    },
+    "failureNotice": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:req:hxa:thread:message-002:d23441fdb564259602d9e792521af1ca05b0fca9a755e59781696c87ba5dde74",
+      "requestId": "req:hxa:thread:message-002",
+      "traceId": "trace:hxa:thread:message-002",
+      "cause": {
+        "kind": "run_terminal",
+        "eventId": "event:req:hxa:thread:message-002:4"
+      },
+      "route": {
+        "adapterId": "hxa-connect",
+        "targetRef": "org:hxa|thread:thread-002|msg:source-message-002"
+      },
+      "disposition": "failure_notice",
+      "payload": {
+        "format": "text",
+        "text": "The assistant could not complete this request."
+      },
+      "contentHash": "sha256:c504f095ea699a95883f037f371dafd2215fff2f9ddd6639a56294b9a43d407e",
+      "idempotencyKey": "reply:req:hxa:thread:message-002:d23441fdb564259602d9e792521af1ca05b0fca9a755e59781696c87ba5dde74"
+    },
+    "taskReceipt": {
+      "schemaVersion": 1,
+      "type": "ReplyIntent",
+      "intentId": "reply:task-effect:hxa:001:c1bdef8aed58341e317e81cd2aa1398de4b28538b17ea546ecf7a2d5a25e8155",
+      "requestId": "req:hxa:task:001",
+      "traceId": "trace:hxa:task:001",
+      "cause": {
+        "kind": "task_effect",
+        "eventId": "task-effect:hxa:001"
+      },
+      "route": {
+        "adapterId": "hxa-connect",
+        "targetRef": "org:hxa|peer-agent|msg:source-task-message-001"
+      },
+      "disposition": "task_receipt",
+      "payload": {
+        "format": "text",
+        "text": "Task created."
+      },
+      "contentHash": "sha256:817d20f5c8d55e23f3ad472820dd22633237d89fead8f0cf3555adf2cff4de01",
+      "idempotencyKey": "reply:task-effect:hxa:001:c1bdef8aed58341e317e81cd2aa1398de4b28538b17ea546ecf7a2d5a25e8155"
+    }
+  }
+}

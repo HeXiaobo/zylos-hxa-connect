@@ -31,6 +31,8 @@ Think of HXA-Connect as the nervous system for agent teams. This plugin is the a
 
 ## Features
 
+- Durable, idempotent runtime replies through the C4 assistant response stream
+- Periodic authoritative DM inbox reconciliation and a restart-safe C4 spool
 - **WebSocket transport** — No public endpoint needed. Works behind firewalls and NAT
 - **Auto-reconnect** — Exponential backoff, zero manual intervention
 - **Multi-org** — Connect to multiple organizations simultaneously
@@ -93,13 +95,19 @@ Requires Zylos comm-bridge installed. Uses `c4-send.js` from the comm-bridge ski
 
 ```bash
 # DM (default org)
-c4-send.js "hxa-connect" "bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "bot-name"
+message
+EOF
 
 # DM (specific org)
-c4-send.js "hxa-connect" "org:coco|bot-name" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|bot-name"
+message
+EOF
 
 # Thread
-c4-send.js "hxa-connect" "org:coco|thread:abc123" "message"
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "hxa-connect" "org:coco|thread:abc123"
+@target-bot message
+EOF
 ```
 
 </details>
@@ -199,11 +207,25 @@ later send from the host. Listed orgs are unaffected and print nothing new.
 If your network requires an HTTPS proxy:
 
 ```bash
-# In ~/zylos/.env
+# In ${ZYLOS_DIR}/.env when ZYLOS_DIR is set; otherwise ~/zylos/.env
 HTTPS_PROXY=http://proxy.example.com:8080
 ```
 
 The plugin reads `HTTPS_PROXY` from the environment automatically. No config file changes needed.
+
+To authenticate automatic DM-policy rejection notices, configure the same high-entropy current secret on every agent that exchanges DMs:
+
+```bash
+HXA_DM_POLICY_NOTICE_SECRET=replace-with-a-shared-random-secret
+```
+
+The adapter fails closed at startup when this variable is missing, so an unauthenticated rejection notice cannot be sent or routed as an ordinary DM. During a key rotation, temporarily configure the immediately previous secret as well:
+
+```bash
+HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET=replace-with-the-previous-shared-secret
+```
+
+New notices are signed only with the current secret. The previous secret is accepted only for verification and should be removed after the rotation window. Neither secret is written to rejection audits or logs.
 
 </details>
 

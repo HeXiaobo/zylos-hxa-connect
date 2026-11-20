@@ -21,9 +21,14 @@ import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
 // zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
 import { redactSecrets } from '../src/lib/redact.js';
 import { cameFromEnvFile, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
 } from '../src/lib/outbound-guard.js';
+import {
+  AssistantResponseDeliveryStore,
+  createAssistantResponseSender,
+} from '../src/lib/assistant-response-delivery.js';
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 
@@ -59,8 +64,12 @@ if (args.length < 2) {
 const rawEndpoint = args[0];
 const message = args.slice(1).join(' ');
 
-// [SKIP] check helper — used by sendAsThread to filter smart-mode no-ops
+// Exact smart-mode no-ops are silent on every outbound route.
 const isSkipResponse = /^\s*\[SKIP\]\s*$/i.test(message);
+
+// Silent assistant responses must not initialize a client, invoke a transport,
+// or leave a delivery log behind. Core records the terminal request state.
+if (isSkipResponse) process.exit(0);
 
 const { orgLabel: endpointOrg, target: rawTarget } = parseEndpoint(rawEndpoint);
 
@@ -72,6 +81,7 @@ const target = msgMatch ? rawTarget.slice(0, msgMatch.index) : rawTarget;
 
 const config = migrateConfig();
 const resolved = resolveOrgs(config);
+const { assistantResponseDir } = getRuntimePaths();
 const orgLabels = Object.keys(resolved.orgs);
 
 const effectiveLabel = orgOverride || endpointOrg || (resolved.orgs.default ? 'default' : orgLabels[0]);
@@ -126,14 +136,46 @@ const client = new HxaConnectClient({
   ...(org.orgId && { orgId: org.orgId }),
 });
 
+const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+// Make the invocation mode visible: when the runtime intends an assistant
+// response but no longer passes C4_ASSISTANT_REQUEST_ID, the streamed-reply
+// branch is silently skipped and this shows up as mode=explicit instead.
+console.log(assistantRequestId
+  ? `[hxa-connect] send mode=assistant-response requestId=${assistantRequestId} endpoint=${rawEndpoint}`
+  : `[hxa-connect] send mode=explicit endpoint=${rawEndpoint}`);
+if (assistantRequestId) {
+  const store = new AssistantResponseDeliveryStore({
+    directory: assistantResponseDir,
+  });
+  const sender = createAssistantResponseSender({
+    store,
+    defaultOrgLabel: effectiveLabel,
+    resolveOrg: async label => {
+      if (label !== effectiveLabel) {
+        throw new Error(`HXA response org mismatch: ${label}`);
+      }
+      return { client, agentId: org.agentId, agentName: org.agentName };
+    },
+  });
+  try {
+    const result = await sender.send({
+      requestId: assistantRequestId,
+      endpointId: rawEndpoint,
+      content: message,
+      suppressSkip: true,
+    });
+    if (result.status === 'suppressed') process.exit(0);
+    console.log(`Sent assistant response to ${target} (${result.status}${result.replayed ? ', replay' : ''})`);
+    process.exit(0);
+  } catch (error) {
+    console.error(`Error sending assistant response to ${target}: ${redactSecrets(error.message)}`);
+    process.exit(1);
+  }
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function sendAsThread(threadId) {
-  // Filter [SKIP] responses from smart mode — only for confirmed thread sends
-  if (isSkipResponse) {
-    console.log(`[hxa-connect] [SKIP] response filtered — not sending to thread ${threadId}`);
-    return;
-  }
   const opts = replyToId ? { reply_to: replyToId } : undefined;
   let usedReplyTo = !!replyToId;
   try {

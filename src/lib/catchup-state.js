@@ -33,6 +33,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getRuntimePaths } from './config-path.js';
 
 export const CATCHUP_STATE_VERSION = 3;
 export const DEFAULT_MAX_RECENT_IDS = 5000;
@@ -45,9 +46,15 @@ export const MAX_WINDOW_IDS = 50000;
 
 export const CATCHUP_STATE_FILENAME = 'catchup-state.json';
 
-export function resolveCatchupStatePath({ home = process.env.HOME } = {}) {
-  if (!home) throw new Error('HOME is not set — cannot resolve catchup state path');
-  return path.join(home, 'zylos/components/hxa-connect', CATCHUP_STATE_FILENAME);
+/**
+ * Where the catch-up state file lives.
+ *
+ * Resolved through the shared runtime path seam (upstream 1.7.7) so a host that
+ * selects its runtime with ZYLOS_DIR keeps the state next to the rest of its
+ * component data. Nothing here reads HOME directly any more.
+ */
+export function resolveCatchupStatePath() {
+  return path.join(getRuntimePaths().dataDir, CATCHUP_STATE_FILENAME);
 }
 
 function emptyOrg() {

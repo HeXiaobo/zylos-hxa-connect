@@ -10,12 +10,14 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
-import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
-import { MEDIA_BASE_DIR, generateFilename } from '../src/lib/media.js';
+import { loadConfig, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { getMediaBaseDir, generateFilename } from '../src/lib/media.js';
 import { CatchupRunner } from '../src/lib/catchup.js';
 import { CatchupStateStore, resolveCatchupStatePath } from '../src/lib/catchup-state.js';
+import { verifyOrgScopedProfile } from '../src/lib/profile-verification.js';
 
 const args = process.argv.slice(2);
 
@@ -40,7 +42,9 @@ function fail(msg) {
 
 let config, resolved, orgLabels;
 try {
-  config = migrateConfig();
+  // Release identity probes are read-only. A legacy config must be migrated by
+  // an explicit setup action instead of being rewritten during verification.
+  config = args.includes('profile-verify') ? loadConfig() : migrateConfig();
   resolved = resolveOrgs(config);
   orgLabels = Object.keys(resolved.orgs);
 } catch (err) {
@@ -61,7 +65,7 @@ const client = new HxaConnectClient({
 });
 
 // Flags that take a value (skip next arg when encountered before command)
-const VALUE_FLAGS = new Set(['org']);
+const VALUE_FLAGS = new Set(['org', 'profile-id', 'hostname']);
 
 // Find command: first positional arg (skip --flags and their values)
 let command, commandIdx;
@@ -143,6 +147,31 @@ try {
     case 'profile': {
       const profile = await client.getProfile();
       out(profile);
+      break;
+    }
+
+    case 'profile-verify': {
+      if (!getFlag('org')) {
+        fail('Usage: cli.js profile-verify --org <label> --profile-id <id> --hostname <hostname>');
+      }
+      const expectedProfileId = getFlag('profile-id');
+      const expectedHostname = getFlag('hostname');
+      if (!expectedProfileId || !expectedHostname) {
+        fail('Usage: cli.js profile-verify --org <label> --profile-id <id> --hostname <hostname>');
+      }
+      const profile = await client.getProfile();
+      const report = verifyOrgScopedProfile({
+        orgLabel,
+        expectedOrgId: org.orgId,
+        expectedProfileId,
+        expectedProfileName: org.agentName,
+        expectedHostname,
+        actualHostname: os.hostname(),
+        observedAt: new Date().toISOString(),
+        profile,
+      });
+      out(report);
+      if (report.status !== 'PASS') process.exitCode = 2;
       break;
     }
 
@@ -518,7 +547,7 @@ try {
         savedPath = path.resolve(outPath);
         await fs.promises.mkdir(path.dirname(savedPath), { recursive: true });
       } else {
-        const orgDir = path.join(MEDIA_BASE_DIR, orgLabel);
+        const orgDir = path.join(getMediaBaseDir(), orgLabel);
         await fs.promises.mkdir(orgDir, { recursive: true });
         savedPath = path.join(orgDir, generateFilename(fileId, result.contentType));
       }
@@ -559,6 +588,7 @@ try {
             thread: 'Thread detail <thread_id>',
             messages: 'Thread messages <thread_id> [--limit N] [--since TS] [--before TS]',
             profile: 'My profile',
+            'profile-verify': '--org <label> --profile-id <id> --hostname <hostname>',
             org: 'Org info',
             catchup: 'Offline events --since <timestamp_ms> [--cursor X] [--limit N]',
             'catchup-count': 'Count missed events --since <timestamp_ms>',
@@ -592,7 +622,7 @@ try {
             'rotate-secret': 'Rotate org secret',
           },
         },
-        note: 'Message sending goes through C4: c4-send.js "hxa-connect" "[org:<label>|]<bot|thread:id>" "msg"',
+        note: 'Message sending goes through C4: pipe the message body via stdin to c4-send.js "hxa-connect" "[org:<label>|]<bot|thread:id>"',
       });
       break;
     }
