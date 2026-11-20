@@ -146,6 +146,67 @@ function logPrefix(label) {
   return `[hxa-connect:${label}]`;
 }
 
+function createConnectionDiagnostics(client, label) {
+  const org = /^[a-z0-9][a-z0-9-]*$/.test(label) ? label : 'unknown';
+  let connectedAt = null;
+  let lastReceivedAt = null;
+  let lastPongAt = null;
+  let connectCount = 0;
+  let reconnectCount = 0;
+  let reconnectAttemptCount = 0;
+  const numberOrNull = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const iso = value => value === null ? null : new Date(value).toISOString();
+
+  function record(event, fields = {}) {
+    const now = Date.now();
+    console.log(`[hxa-connect:${org}] Connection ${JSON.stringify({
+      event,
+      org,
+      at: iso(now),
+      connectedAt: iso(connectedAt),
+      connectionAgeMs: connectedAt === null ? null : Math.max(0, now - connectedAt),
+      lastReceivedAt: iso(lastReceivedAt),
+      lastReceivedAgeMs: lastReceivedAt === null ? null : Math.max(0, now - lastReceivedAt),
+      lastPongAt: iso(lastPongAt),
+      lastPongAgeMs: lastPongAt === null ? null : Math.max(0, now - lastPongAt),
+      connectCount,
+      reconnectCount,
+      reconnectAttemptCount,
+      ...fields,
+    })}`);
+  }
+
+  function connected(event) {
+    connectedAt = Date.now();
+    lastReceivedAt = null;
+    lastPongAt = null;
+    connectCount++;
+    if (event === 'reconnected') reconnectCount++;
+    record(event);
+  }
+
+  // SDK '*' observes parsed application frames, not transport control frames.
+  client.on('*', () => { lastReceivedAt = Date.now(); });
+  client.on('pong', () => {
+    lastPongAt = Date.now();
+    lastReceivedAt = lastPongAt;
+    record('pong');
+  });
+  client.on('close', ({ code } = {}) => {
+    record('close', { code: numberOrNull(code) });
+  });
+  client.on('reconnecting', ({ attempt, delay } = {}) => {
+    reconnectAttemptCount++;
+    record('reconnecting', { attempt: numberOrNull(attempt), delayMs: numberOrNull(delay) });
+  });
+  client.on('reconnected', () => { connected('reconnected'); });
+  client.on('reconnect_failed', ({ attempts } = {}) => {
+    record('reconnect_failed', { attempts: numberOrNull(attempts) });
+  });
+
+  return { connected: () => connected('connected') };
+}
+
 function escapeXml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -460,6 +521,11 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       backoffFactor: 1.5,
     },
   });
+
+  // Diagnostic-only observer (allowlisted fields only; never sends traffic and
+  // never changes the SDK's recovery behaviour). Hosts use these lines to tell
+  // "socket alive but silent" apart from "socket gone".
+  const diagnostics = createConnectionDiagnostics(client, label);
 
   const isSelf = (id, metadata) => {
     if (!org.agentId || id !== org.agentId) return false;
@@ -1049,6 +1115,7 @@ async function connectOrg(label, { client, threadCtx, catchup, dmReconciler, con
     try {
       await client.connect();
       console.log(`${lp} WebSocket connected`);
+      diagnostics.connected();
       await threadCtx.start();
       console.log(`${lp} ThreadContext started (mention filter for @${org.agentName})`);
       // First connection: the catch-up run establishes the baseline (or resumes

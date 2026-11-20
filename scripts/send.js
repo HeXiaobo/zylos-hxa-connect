@@ -6,6 +6,14 @@
  *   node send.js <endpoint> "<message>"              — Send (org resolved from endpoint)
  *   node send.js --org coco <endpoint> "<message>"   — Send via specific org (debug override)
  *
+ * Media (same convention as the feishu send.js):
+ *   node send.js <endpoint> "[MEDIA:image]/abs/path/pic.png"
+ *   node send.js <endpoint> "[MEDIA:file]/abs/path/report.pdf"
+ *   node send.js <endpoint> "[MEDIA:image]/abs/path/pic.png\noptional caption"
+ *   — the first line is the absolute path, everything after the first newline
+ *     is the caption. Bad type / relative path / missing file exit 1 and never
+ *     fall back to sending the path as text.
+ *
  * Called by C4 comm-bridge to send outbound messages via HXA-Connect SDK.
  *
  * Endpoint encoding (set by bot.js):
@@ -29,6 +37,12 @@ import {
   AssistantResponseDeliveryStore,
   createAssistantResponseSender,
 } from '../src/lib/assistant-response-delivery.js';
+import {
+  MediaMessageError,
+  deliverMessage,
+  parseMediaMessage,
+  uploadMedia,
+} from '../src/lib/media-send.js';
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 
@@ -63,6 +77,26 @@ if (args.length < 2) {
 
 const rawEndpoint = args[0];
 const message = args.slice(1).join(' ');
+
+// Parse the [MEDIA:...] prefix before any network work so a bad attachment
+// fails loudly instead of leaking the path into the chat as text.
+let mediaRequest = null;
+try {
+  mediaRequest = parseMediaMessage(message);
+} catch (err) {
+  if (err instanceof MediaMessageError) {
+    console.error(`Error: ${redactSecrets(err.message)}`);
+    process.exit(1);
+  }
+  throw err;
+}
+
+// Uploaded attachment (set once, before the send; reused by the reply_to retry)
+let attachment = null;
+
+// Content goes into the message body: caption for media (undefined when empty,
+// matching the verified reference call), the whole message for plain text.
+const outboundContent = mediaRequest ? (mediaRequest.text || undefined) : message;
 
 // Exact smart-mode no-ops are silent on every outbound route.
 const isSkipResponse = /^\s*\[SKIP\]\s*$/i.test(message);
@@ -136,7 +170,9 @@ const client = new HxaConnectClient({
   ...(org.orgId && { orgId: org.orgId }),
 });
 
-const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+// A media send is an explicit send by definition; it carries no assistant
+// terminal event, so it must not enter the assistant-response branch.
+const assistantRequestId = mediaRequest ? null : (process.env.C4_ASSISTANT_REQUEST_ID || null);
 // Make the invocation mode visible: when the runtime intends an assistant
 // response but no longer passes C4_ASSISTANT_REQUEST_ID, the streamed-reply
 // branch is silently skipped and this shows up as mode=explicit instead.
@@ -173,32 +209,59 @@ if (assistantRequestId) {
   }
 }
 
+/**
+ * C4 reply receipt — lets core bind this Hub message id to the reply it asked
+ * for. Printed on stdout as one machine-readable line; the token is supplied by
+ * the caller and is never logged on its own.
+ */
+function emitReplyReceipt(result) {
+  if (isSkipResponse || !process.env.ZYLOS_REPLY_RECEIPT_TOKEN ||
+      typeof result?.id !== 'string' || !result.id.trim()) return;
+  console.log('C4_RECEIPT ' + JSON.stringify({ platformMessageId: result.id, receiptToken: process.env.ZYLOS_REPLY_RECEIPT_TOKEN }));
+}
+
+/** Upload the attachment once, before the send (the reply_to retry reuses it). */
+async function prepareAttachment() {
+  if (!mediaRequest || attachment) return;
+  attachment = await uploadMedia(client, mediaRequest);
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function sendAsThread(threadId) {
-  const opts = replyToId ? { reply_to: replyToId } : undefined;
-  let usedReplyTo = !!replyToId;
-  try {
-    await client.sendThreadMessage(threadId, message, opts);
-  } catch (err) {
-    // If reply_to fails (message deleted), retry without it
-    if (replyToId && (err?.status === 400 || err?.body?.code === 'NOT_FOUND')) {
-      console.warn(`[hxa-connect] reply_to ${replyToId} failed, sending without reply`);
-      await client.sendThreadMessage(threadId, message);
-      usedReplyTo = false;
-    } else {
-      throw err;
-    }
+  const result = await deliverMessage(
+    client,
+    { kind: 'thread', threadId },
+    outboundContent,
+    attachment ? attachment.parts : undefined,
+    replyToId,
+    emitReplyReceipt,
+  );
+  if (attachment) {
+    console.log(`Sent ${mediaRequest.type} to thread ${threadId}${result.usedReplyTo ? ` (reply_to: ${replyToId})` : ''}: ${attachment.name} (${attachment.size} bytes, file ${attachment.fileId})`);
+  } else {
+    console.log(`Sent to thread ${threadId}${result.usedReplyTo ? ` (reply_to: ${replyToId})` : ''}: ${message.substring(0, 50)}...`);
   }
-  console.log(`Sent to thread ${threadId}${usedReplyTo ? ` (reply_to: ${replyToId})` : ''}: ${message.substring(0, 50)}...`);
 }
 
 async function sendAsDM(to) {
-  await client.send(to, message);
-  console.log(`Sent to ${to}: ${message.substring(0, 50)}...`);
+  const result = await deliverMessage(
+    client,
+    { kind: 'dm', to },
+    outboundContent,
+    attachment ? attachment.parts : undefined,
+    null,
+    emitReplyReceipt,
+  );
+  if (attachment) {
+    console.log(`Sent ${mediaRequest.type} to ${to}: ${attachment.name} (${attachment.size} bytes, file ${attachment.fileId})`);
+  } else {
+    console.log(`Sent to ${to}: ${message.substring(0, 50)}...`);
+  }
 }
 
 try {
+  await prepareAttachment();
   if (target.startsWith('channel:')) {
     console.error(`Error: Cannot reply to group channel directly (HXA-Connect API limitation).`);
     console.error(`Use a bot name for DM or thread:<id> for thread messages.`);
