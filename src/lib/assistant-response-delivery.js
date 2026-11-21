@@ -364,28 +364,92 @@ function singleReconcileMatch(messages, predicate) {
   return matches[0] || null;
 }
 
-async function reconcileDm({ client, org, target, sourceMessageId, content, startedAt }) {
-  const messages = await client.inbox(Math.max(0, startedAt - 5_000));
-  if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
-  const expectedChannels = new Set();
-  for (const message of messages) {
-    if (sourceMessageId && message?.id === sourceMessageId && message.channel_id) {
-      expectedChannels.add(message.channel_id);
+/**
+ * Read the reply window of one DM channel, or of every channel when the
+ * channel is not known yet.
+ *
+ * A channel id is always read through `getMessages(channelId)`, never through
+ * `inbox()`: `inbox(since)` lists the messages that ARRIVED here, so the reply
+ * this process sent is not part of it. The channel listing is also the only
+ * way to look at a channel whose source message is older than the window.
+ */
+async function readDmWindow({ client, channelId, since }) {
+  if (channelId) {
+    const messages = await client.getMessages(channelId, { since });
+    if (!Array.isArray(messages)) {
+      throw new TypeError('Hub channel messages response must be an array');
     }
-    if (!sourceMessageId && message?.sender_name === target && message.channel_id) {
-      expectedChannels.add(message.channel_id);
-    }
+    return messages;
   }
-  if (sourceMessageId && expectedChannels.size === 0) {
+  const messages = await client.inbox(since);
+  if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
+  return messages;
+}
+
+/**
+ * How far back the source-message lookup may reach. `startedAt` is the moment
+ * this process started sending, which is normally seconds or minutes AFTER the
+ * inbound DM; the DM channel is immutable, so a wide lookback is safe and keeps
+ * records written before the channel was persisted recoverable.
+ */
+export const DEFAULT_SOURCE_LOOKBACK_MS = 24 * 60 * 60_000;
+
+export async function resolveDmSourceChannel({ client, availableSince, target, sourceMessageId }) {
+  const messages = await client.inbox(Math.max(0, availableSince));
+  if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
+  const candidates = sourceMessageId
+    ? messages.filter(message => message?.id === sourceMessageId)
+    : messages.filter(message => message?.sender_name === target);
+  const withChannel = candidates.filter(message => message?.channel_id);
+  if (withChannel.length > 1) {
+    const error = new Error('multiple HXA messages match the delivery identity');
+    error.code = 'HXA_RECONCILE_RESULT_AMBIGUOUS';
+    throw error;
+  }
+  const match = withChannel[0] || null;
+  if (!match) {
     const error = new Error('HXA source-scoped DM channel could not be resolved');
     error.code = 'HXA_RECONCILE_ROUTE_UNKNOWN';
     throw error;
   }
+  return match.channel_id;
+}
+
+async function reconcileDm({
+  client,
+  org,
+  target,
+  sourceMessageId,
+  content,
+  startedAt,
+  channelId,
+  learnedChannel,
+  persistChannelId = async () => {},
+}) {
+  const replySince = Math.max(0, startedAt - 5_000);
+  let resolvedChannelId = channelId || learnedChannel || null;
+  let messages = await readDmWindow({ client, channelId: resolvedChannelId, since: replySince });
+  if (!resolvedChannelId) {
+    // Only a record written before the channel was persisted gets here. Keep
+    // the inbox fallback for exactly that case, but resolve the route from a
+    // window that contains the source message, then read the reply in that one
+    // channel. The DM channel is immutable, so this is still exact.
+    resolvedChannelId = await resolveDmSourceChannel({
+      client,
+      availableSince: Math.max(0, startedAt - DEFAULT_SOURCE_LOOKBACK_MS),
+      target,
+      sourceMessageId,
+    });
+    await persistChannelId(resolvedChannelId);
+    messages = await readDmWindow({ client, channelId: resolvedChannelId, since: replySince });
+  }
+  // Exact channel check: a reply found in any other DM channel is not ours.
+  const expectedChannels = new Set([resolvedChannelId]);
   return singleReconcileMatch(messages, message => (
     isSelfMessage(message, org)
     && message.content === content
-    && Number(message.created_at) >= startedAt - 5_000
-    && (expectedChannels.size === 0 || expectedChannels.has(message.channel_id))
+    && Number(message.created_at) >= replySince
+    && expectedChannels.has(message.channel_id)
   ));
 }
 
@@ -422,7 +486,16 @@ async function resolveCompatibleRoute(parsed, client) {
   }
 }
 
-export async function reconcileHxaResponse({ parsed, client, org, content, startedAt }) {
+export async function reconcileHxaResponse({
+  parsed,
+  client,
+  org,
+  content,
+  startedAt,
+  channelId = null,
+  learnedChannel = null,
+  persistChannelId,
+}) {
   const route = await resolveCompatibleRoute(parsed, client);
   if (route.kind === 'thread') {
     return reconcileThread({ client, org, threadId: route.threadId, content, startedAt });
@@ -434,6 +507,9 @@ export async function reconcileHxaResponse({ parsed, client, org, content, start
     sourceMessageId: route.sourceMessageId,
     content,
     startedAt,
+    channelId,
+    learnedChannel,
+    persistChannelId,
   });
 }
 
@@ -498,6 +574,30 @@ export function createAssistantResponseSender({
 
         const org = requireRecord(await resolveOrg(parsed.orgLabel), 'HXA response org');
         const client = requireRecord(org.client, 'HXA response client');
+        // The DM channel is fixed by the source message and never changes, so
+        // it is learned once — before the first send — and persisted with the
+        // delivery record. A retry therefore reconciles against that exact
+        // channel instead of searching an inbox window for the source message.
+        const learnSourceChannel = async () => {
+          if (parsed.kind !== 'dm' || !parsed.sourceMessageId) return;
+          const channelId = await resolveDmSourceChannel({
+            client,
+            availableSince: Math.max(0, record.startedAt - DEFAULT_SOURCE_LOOKBACK_MS),
+            target: parsed.target,
+            sourceMessageId: parsed.sourceMessageId,
+          });
+          record = await store.update(record, { channelId });
+        };
+        if (!record.channelId) {
+          // Best effort: a source message outside the lookback window must not
+          // block a send that would otherwise succeed. The reconcile path keeps
+          // its own lookup for that case.
+          try {
+            await learnSourceChannel();
+          } catch (error) {
+            logger.warn?.(`[hxa-connect] Could not learn the DM channel for ${record.deliveryId}: ${error?.code || error?.message || error}`);
+          }
+        }
 
         if (record.attempts > 0) {
           const existing = await reconcileHxaResponse({
@@ -506,6 +606,10 @@ export function createAssistantResponseSender({
             org,
             content: safeContent,
             startedAt: record.startedAt,
+            channelId: record.channelId,
+            persistChannelId: async channelId => {
+              record = await store.update(record, { channelId });
+            },
           });
           if (existing) {
             const receipt = normalizeHxaTransportReceipt(existing);

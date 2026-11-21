@@ -106,6 +106,14 @@ test('composition preserves unknown then reconcile-first recovery across restart
           { id: 'source-message-001', sender_id: 'peer-agent', sender_name: 'peer-agent', content: 'request', channel_id: 'dm-1', created_at: now - 1 },
           { id: 'hub-after-restart', sender_id: 'self', sender_name: 'agent', content: source.payload.text, channel_id: 'dm-1', created_at: now + 1 },
         ]; },
+        // The reply window of a known DM channel is read from that channel.
+        async getMessages(channelId, opts = {}) {
+          const since = opts.since ?? 0;
+          return [
+            { id: 'source-message-001', sender_id: 'peer-agent', sender_name: 'peer-agent', content: 'request', channel_id: 'dm-1', created_at: now - 1 },
+            { id: 'hub-after-restart', sender_id: 'self', sender_name: 'agent', content: source.payload.text, channel_id: 'dm-1', created_at: now + 1 },
+          ].filter(message => message.channel_id === channelId && message.created_at >= since);
+        },
       },
       agentId: 'self', agentName: 'agent',
     }),

@@ -60,6 +60,25 @@ async function createStore(directory = null) {
   return new AssistantResponseDeliveryStore({ directory: target, clock: () => NOW });
 }
 
+/**
+ * The reply window of a known DM channel is read with `getMessages(channelId)`,
+ * so a fake hub that answers `inbox()` for the source DM must answer the
+ * channel listing too. The filters mirror the hub: `since` is inclusive.
+ */
+function withChannelMessages(client) {
+  if (typeof client.getMessages === 'function') return client;
+  return {
+    ...client,
+    async getMessages(channelId, opts = {}) {
+      const since = opts.since ?? 0;
+      const messages = await client.inbox(since);
+      return messages.filter(message => (
+        message.channel_id === channelId && Number(message.created_at) >= since
+      ));
+    },
+  };
+}
+
 function createAdapter({ store, client, resolveOrg, logger, clock = () => NOW } = {}) {
   return createHxaFinalDeliveryAdapter({
     store,
@@ -67,7 +86,7 @@ function createAdapter({ store, client, resolveOrg, logger, clock = () => NOW } 
     clock,
     resolveOrg: resolveOrg || (async label => {
       assert.equal(label, 'hxa');
-      return { client, agentId: 'self-agent-id', agentName: 'self-agent' };
+      return { client: withChannelMessages(client), agentId: 'self-agent-id', agentName: 'self-agent' };
     }),
     logger: logger || { warn() {}, error() {} },
   });

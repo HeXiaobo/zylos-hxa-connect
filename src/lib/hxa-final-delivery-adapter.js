@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto';
 
 import {
   AssistantResponseDeliveryStore,
+  DEFAULT_SOURCE_LOOKBACK_MS,
   normalizeHxaTransportReceipt,
   parseHxaResponseEndpoint,
   reconcileHxaResponse,
+  resolveDmSourceChannel,
   sendHxaResponse,
 } from './assistant-response-delivery.js';
 
@@ -572,6 +574,9 @@ function buildHxaFinalDeliveryAdapter({
           throw new TypeError('HXA response org must provide a client');
         }
       } catch (error) {
+        // A guard block is not a route mismatch: it must stay a hard, visible
+        // refusal instead of being settled as a rejected delivery.
+        if (error?.code === 'HXA_OUTBOUND_GUARD_BLOCKED') throw error;
         const receipt = makeReceipt({
           record,
           attemptId: context.attemptId,
@@ -586,6 +591,20 @@ function buildHxaFinalDeliveryAdapter({
       }
 
       try {
+        if (!record.channelId && normalized.parsed.kind === 'dm') {
+          try {
+            const channelId = await resolveDmSourceChannel({
+              client: org.client,
+              availableSince: Math.max(0, attemptStartedAt(record, context.attemptId) - DEFAULT_SOURCE_LOOKBACK_MS),
+              target: normalized.parsed.target,
+              sourceMessageId: normalized.parsed.sourceMessageId,
+            });
+            record = await store.update(record, { channelId });
+          } catch (error) {
+            // Best effort. A missing channel is retried by the reconcile path.
+            logger.warn?.(`[hxa-connect] Could not learn the DM channel for ${record.deliveryId}: ${error?.code || error?.message || error}`);
+          }
+        }
         const result = await sendHxaResponse({
           parsed: normalized.parsed,
           client: org.client,
@@ -710,6 +729,10 @@ function buildHxaFinalDeliveryAdapter({
           org,
           content: normalized.text,
           startedAt: reconcileStartedAt,
+          channelId: record.channelId,
+          persistChannelId: async channelId => {
+            record = await store.update(record, { channelId });
+          },
         });
         if (existing) {
           const externalRef = acceptedExternalRef(existing);

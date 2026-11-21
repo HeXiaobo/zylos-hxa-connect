@@ -235,6 +235,12 @@ describe('HXA assistant response delivery', () => {
         throw new Error('response socket closed');
       },
       async inbox() { return inbox; },
+      // The reply window of a known DM channel is read from the channel.
+      async getMessages(channelId, opts = {}) {
+        assert.equal(channelId, 'channel-1');
+        const since = opts.since ?? 0;
+        return inbox.filter(message => message.created_at >= since);
+      },
     };
     const adapter = createAssistantResponseDelivery({
       store,
@@ -272,6 +278,11 @@ describe('HXA assistant response delivery', () => {
           content: 'request',
           created_at: now - 100,
         }];
+      },
+      async getMessages(channelId, opts = {}) {
+        assert.equal(channelId, 'channel-1');
+        const since = opts.since ?? 0;
+        return [];
       },
     };
     const adapter = createAssistantResponseDelivery({

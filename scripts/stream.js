@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
 import { HxaConnectClient } from '@coco-xyz/hxa-connect-sdk';
-import { migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
+import { cameFromEnvFile, migrateConfig, resolveOrgs, setupFetchProxy } from '../src/env.js';
 import { getRuntimePaths } from '../src/lib/config-path.js';
+import {
+  CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
+} from '../src/lib/outbound-guard.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseDelivery,
@@ -24,6 +27,36 @@ function readStdin() {
   });
 }
 
+/**
+ * Refuse to build a client for an org the outbound guard blocks.
+ *
+ * The terminal auto-delivery path is a real outbound send, so it obeys exactly
+ * the rule `scripts/send.js` applies: an org outside `internal_labels` needs
+ * `HXA_CONFIRM_ORG` on THIS invocation, and a value that came from
+ * ~/zylos/.env never counts. A blocked call throws before a client exists and
+ * therefore never returns a success receipt — the caller gets a non-zero exit
+ * and an explicit "not delivered" line.
+ */
+function enforceOutboundGuard({ guard, label }) {
+  const decision = evaluateSend({
+    effectiveLabel: label,
+    target: label,
+    guard,
+    confirmOrg: process.env[CONFIRM_ENV],
+    confirmFromEnvFile: cameFromEnvFile(CONFIRM_ENV),
+  });
+  if (decision.action === 'allow') return;
+  const line = formatGuardMessage(decision);
+  if (decision.action === 'confirm') {
+    console.error(line);
+    return;
+  }
+  const error = new Error(`${line}\n[hxa-connect] not delivered: blocked by the outbound org guard`);
+  error.code = 'HXA_OUTBOUND_GUARD_BLOCKED';
+  error.delivered = false;
+  throw error;
+}
+
 async function main() {
   try {
     const mode = resolveFinalDeliveryMode(process.env);
@@ -42,6 +75,9 @@ async function main() {
     await setupFetchProxy();
     const resolved = resolveOrgs(migrateConfig());
     const { assistantResponseDir } = getRuntimePaths();
+    // Fail closed before anything is created: a malformed guard stops the run
+    // instead of silently allowing every org through.
+    const guard = loadGuardConfig();
     const labels = Object.keys(resolved.orgs);
     const defaultOrgLabel = resolved.orgs.default ? 'default' : labels[0];
     const clients = new Map();
@@ -49,6 +85,7 @@ async function main() {
       const org = resolved.orgs[label];
       if (!org) throw new Error(`HXA response org not found: ${label}`);
       if (!org.hubUrl) throw new Error(`HXA response org has no hub URL: ${label}`);
+      enforceOutboundGuard({ guard, label });
       if (!clients.has(label)) {
         clients.set(label, new HxaConnectClient({
           url: org.hubUrl,
