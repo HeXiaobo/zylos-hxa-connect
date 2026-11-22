@@ -520,6 +520,31 @@ function buildHxaFinalDeliveryAdapter({
     throw new TypeError('HXA final delivery requires an org resolver');
   }
 
+  /**
+   * Resolve the org BEFORE any record is written.
+   *
+   * `scripts/stream.js` refuses a non-internal org by throwing
+   * `HXA_OUTBOUND_GUARD_BLOCKED` from its org resolver. That refusal says the
+   * message was never attempted, so it is re-thrown untouched and never becomes
+   * a delivery result (rejected / route mismatch / unknown): the caller needs
+   * the code, `ok:false` and a non-zero exit.
+   *
+   * A genuine routing failure is returned instead of thrown so the caller keeps
+   * the pre-existing `rejected / HXA_ROUTE_MISMATCH` receipt behaviour.
+   */
+  async function preflightOrg(label) {
+    try {
+      const org = await resolveOrg(label);
+      if (!org?.client || typeof org.client !== 'object') {
+        throw new TypeError('HXA response org must provide a client');
+      }
+      return { org };
+    } catch (error) {
+      if (error?.code === 'HXA_OUTBOUND_GUARD_BLOCKED') throw error;
+      return { routeError: error };
+    }
+  }
+
   async function deliver(input, attemptContext) {
     const normalized = normalizeIntent(input, defaultOrgLabel);
     if (normalized.result) return normalized.result;
@@ -553,6 +578,12 @@ function buildHxaFinalDeliveryAdapter({
       ));
       if (terminal) return terminal;
 
+      // Guard BEFORE the sending claim is persisted (and before the replay
+      // branch, so a refused org is never reported as an interrupted send). A
+      // refusal means nothing was attempted: it propagates untouched as
+      // HXA_OUTBOUND_GUARD_BLOCKED, leaving the record at attempts=0.
+      const preflight = await preflightOrg(normalized.parsed.orgLabel);
+
       assertClaimActive(context, clock);
 
       if (record.status === 'sending' || record.status === 'reconciling') {
@@ -567,16 +598,7 @@ function buildHxaFinalDeliveryAdapter({
       }
 
       record = await claim(store, record, context, lockToken, 'send', clock);
-      let org;
-      try {
-        org = await resolveOrg(normalized.parsed.orgLabel);
-        if (!org?.client || typeof org.client !== 'object') {
-          throw new TypeError('HXA response org must provide a client');
-        }
-      } catch (error) {
-        // A guard block is not a route mismatch: it must stay a hard, visible
-        // refusal instead of being settled as a rejected delivery.
-        if (error?.code === 'HXA_OUTBOUND_GUARD_BLOCKED') throw error;
+      if (preflight.routeError) {
         const receipt = makeReceipt({
           record,
           attemptId: context.attemptId,
@@ -586,9 +608,10 @@ function buildHxaFinalDeliveryAdapter({
           errorCode: 'HXA_ROUTE_MISMATCH',
           retryable: false,
         });
-        await settle(store, record, receipt, 'rejected', lockToken, String(error?.message || error));
+        await settle(store, record, receipt, 'rejected', lockToken, String(preflight.routeError?.message || preflight.routeError));
         return receipt;
       }
+      const org = preflight.org;
 
       try {
         if (!record.channelId && normalized.parsed.kind === 'dm') {
@@ -681,6 +704,11 @@ function buildHxaFinalDeliveryAdapter({
       ));
       if (terminal) return terminal;
 
+      // Same rule as the send path: the guard runs before the reconcile claim
+      // and before the interrupted-send recovery, so a refusal can never be
+      // reported as an unknown result or a route mismatch.
+      const preflight = await preflightOrg(normalized.parsed.orgLabel);
+
       if (record.status === 'sending' || record.status === 'reconciling') {
         record = (await recoverInterruptedAttempt(store, record, clock)).record;
       }
@@ -702,13 +730,7 @@ function buildHxaFinalDeliveryAdapter({
       assertClaimActive(context, clock);
       const reconcileStartedAt = attemptStartedAt(record, unknown.attemptId);
       record = await claim(store, record, reconcileContext, lockToken, 'reconcile', clock);
-      let org;
-      try {
-        org = await resolveOrg(normalized.parsed.orgLabel);
-        if (!org?.client || typeof org.client !== 'object') {
-          throw new TypeError('HXA response org must provide a client');
-        }
-      } catch (error) {
+      if (preflight.routeError) {
         const receipt = makeReceipt({
           record,
           attemptId: unknown.attemptId,
@@ -718,9 +740,10 @@ function buildHxaFinalDeliveryAdapter({
           errorCode: 'HXA_ROUTE_MISMATCH',
           retryable: false,
         });
-        await settle(store, record, receipt, 'rejected', lockToken, String(error?.message || error));
+        await settle(store, record, receipt, 'rejected', lockToken, String(preflight.routeError?.message || preflight.routeError));
         return receipt;
       }
+      const org = preflight.org;
 
       try {
         const existing = await reconcileHxaResponse({

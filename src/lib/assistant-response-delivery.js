@@ -394,25 +394,38 @@ async function readDmWindow({ client, channelId, since }) {
  */
 export const DEFAULT_SOURCE_LOOKBACK_MS = 24 * 60 * 60_000;
 
+/**
+ * Resolve the one DM channel the source message belongs to.
+ *
+ * Ambiguity is about the CHANNEL, not about how many messages matched. A
+ * compatibility endpoint without `|msg:<id>` (`org:hxa|peer`) matches every
+ * message from that peer, and a DM channel is immutable — several of those
+ * messages are the same route, so they must resolve to one channel id. Two
+ * DIFFERENT channels for the same identity stay an error: picking one would
+ * risk replying into the wrong conversation.
+ */
 export async function resolveDmSourceChannel({ client, availableSince, target, sourceMessageId }) {
   const messages = await client.inbox(Math.max(0, availableSince));
   if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
   const candidates = sourceMessageId
     ? messages.filter(message => message?.id === sourceMessageId)
     : messages.filter(message => message?.sender_name === target);
-  const withChannel = candidates.filter(message => message?.channel_id);
-  if (withChannel.length > 1) {
-    const error = new Error('multiple HXA messages match the delivery identity');
+  const channelIds = [];
+  for (const message of candidates) {
+    if (!message?.channel_id || channelIds.includes(message.channel_id)) continue;
+    channelIds.push(message.channel_id);
+  }
+  if (channelIds.length > 1) {
+    const error = new Error('multiple HXA DM channels match the delivery identity');
     error.code = 'HXA_RECONCILE_RESULT_AMBIGUOUS';
     throw error;
   }
-  const match = withChannel[0] || null;
-  if (!match) {
+  if (channelIds.length === 0) {
     const error = new Error('HXA source-scoped DM channel could not be resolved');
     error.code = 'HXA_RECONCILE_ROUTE_UNKNOWN';
     throw error;
   }
-  return match.channel_id;
+  return channelIds[0];
 }
 
 async function reconcileDm({

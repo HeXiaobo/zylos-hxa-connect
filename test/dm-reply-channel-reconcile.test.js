@@ -250,3 +250,197 @@ describe('DM reply delivery when the source DM is older than the send', () => {
     assert.equal(hub.calls.send, 1, 'reconcile must not send a second message');
   });
 });
+
+/**
+ * The compatibility endpoint `org:hxa|peer` carries no `|msg:<id>`, so the
+ * source lookup matches EVERY message from that peer. Two arrivals in the same
+ * conversational channel are one route, not two: the resolver must pick that
+ * single channel. Judging ambiguity by message count made a first send failure
+ * permanent — every retry threw HXA_RECONCILE_RESULT_AMBIGUOUS.
+ */
+describe('compatibility DM endpoint with several arrivals in one channel', () => {
+  function hubWithTwoArrivals() {
+    const arrivals = [
+      {
+        id: 'source-message-1',
+        channel_id: CHANNEL_ID,
+        sender_id: 'peer-agent-id',
+        sender_name: 'peer-agent',
+        content: 'first request',
+        created_at: NOW - SOURCE_AGE_MS - 5_000,
+      },
+      {
+        id: 'source-message-2',
+        channel_id: CHANNEL_ID,
+        sender_id: 'peer-agent-id',
+        sender_name: 'peer-agent',
+        content: 'second request',
+        created_at: NOW - SOURCE_AGE_MS,
+      },
+    ];
+    const delivered = [];
+    const calls = { send: 0, inbox: 0, getMessages: 0 };
+    return {
+      calls,
+      delivered,
+      client: {
+        async send(_target, content) {
+          calls.send += 1;
+          const error = new Error('connect ECONNREFUSED 127.0.0.1:443');
+          error.code = 'ECONNREFUSED';
+          throw error;
+        },
+        async inbox(since) {
+          calls.inbox += 1;
+          return arrivals.filter(message => message.created_at >= since);
+        },
+        async getMessages(channelId, opts = {}) {
+          calls.getMessages += 1;
+          assert.equal(channelId, CHANNEL_ID);
+          const since = opts.since ?? 0;
+          return [...arrivals, ...delivered]
+            .filter(message => message.created_at >= since)
+            .sort((left, right) => left.created_at - right.created_at);
+        },
+      },
+    };
+  }
+
+  function compatibleDelivery() {
+    const payload = {
+      schemaVersion: 1,
+      requestId: 'hxa.dm.request-compatible',
+      // No |msg:<id>: the documented org-scoped peer endpoint.
+      route: { channel: 'hxa-connect', endpointId: 'org:hxa|peer-agent' },
+      events: [{
+        requestId: 'hxa.dm.request-compatible',
+        type: 'RunCompleted',
+        sequence: 5,
+        payload: { output: 'the answer' },
+      }],
+    };
+    return payload;
+  }
+
+  it('legacy path: two arrivals in one channel do not wedge the retry', async () => {
+    const store = await createStore();
+    const hub = hubWithTwoArrivals();
+    let failure = true;
+    const client = {
+      ...hub.client,
+      send: async (target, content) => {
+        hub.calls.send += 1;
+        if (failure) {
+          const error = new Error('connect ECONNREFUSED 127.0.0.1:443');
+          error.code = 'ECONNREFUSED';
+          throw error;
+        }
+        const message = {
+          id: `outbound-${hub.delivered.length + 1}`,
+          channel_id: CHANNEL_ID,
+          sender_id: SELF.agentId,
+          sender_name: SELF.agentName,
+          content,
+          created_at: NOW + hub.delivered.length + 1,
+        };
+        hub.delivered.push(message);
+        return { channel_id: CHANNEL_ID, message };
+      },
+    };
+    const adapter = createAssistantResponseDelivery({
+      store,
+      defaultOrgLabel: 'hxa',
+      resolveOrg: async () => ({ client, ...SELF }),
+      logger: { warn() {} },
+    });
+
+    await assert.rejects(adapter.deliver(compatibleDelivery()), /ECONNREFUSED/);
+    const record = await readOnlyRecord(store);
+    assert.equal(record.status, 'uncertain');
+
+    // Second call: the retry must either send again or say why, never repeat
+    // HXA_RECONCILE_RESULT_AMBIGUOUS for a channel that is not ambiguous.
+    failure = false;
+    let second;
+    try {
+      second = await adapter.deliver(compatibleDelivery());
+    } catch (error) {
+      assert.notEqual(error.code, 'HXA_RECONCILE_RESULT_AMBIGUOUS',
+        `the same channel must not be treated as two routes: ${error.message}`);
+      throw error;
+    }
+    assert.equal(second.status, 'delivered');
+    assert.equal(hub.calls.send, 2);
+  });
+
+  it('legacy path: the single matched channel is persisted, not a channel list', async () => {
+    const store = await createStore();
+    const hub = hubWithTwoArrivals();
+    const adapter = createAssistantResponseDelivery({
+      store,
+      defaultOrgLabel: 'hxa',
+      resolveOrg: async () => ({ client: hub.client, ...SELF }),
+      logger: { warn() {} },
+    });
+
+    await assert.rejects(adapter.deliver(compatibleDelivery()), /ECONNREFUSED/);
+    // The channel cannot be learned before the first send without a source id,
+    // so it is learned on the first retry and then persisted once.
+    const record = await readOnlyRecord(store);
+    assert.equal(record.channelId, null);
+    assert.equal(record.attempts, 1);
+  });
+
+  it('canonical path: reconcile resolves the one channel for a compatible endpoint', async () => {
+    const store = await createStore();
+    const hub = hubWithTwoArrivals();
+    const client = {
+      ...hub.client,
+      send: async (_target, content) => {
+        hub.calls.send += 1;
+        hub.delivered.push({
+          id: `outbound-canonical-${hub.delivered.length + 1}`,
+          channel_id: CHANNEL_ID,
+          sender_id: SELF.agentId,
+          sender_name: SELF.agentName,
+          content,
+          created_at: NOW + 1,
+        });
+        throw new Error('socket hang up');
+      },
+    };
+    const adapter = createHxaFinalDeliveryAdapter({
+      store,
+      defaultOrgLabel: 'hxa',
+      clock: () => NOW,
+      resolveOrg: async () => ({ client, ...SELF }),
+      logger: { warn() {}, error() {} },
+    });
+
+    const route = { adapterId: 'hxa-connect', targetRef: 'org:hxa|peer-agent' };
+    const payload = { format: 'text', text: 'the canonical answer' };
+    const intentId = `reply:request-compatible:${createHash('sha256').update(canonicalJson(route)).digest('hex')}`;
+    const intent = {
+      schemaVersion: 1,
+      type: 'ReplyIntent',
+      intentId,
+      requestId: 'request-compatible',
+      traceId: 'trace-compatible',
+      cause: { kind: 'run_terminal', eventId: 'event-compatible-6' },
+      route,
+      disposition: 'send',
+      payload,
+      contentHash: `sha256:${createHash('sha256').update(canonicalJson(payload)).digest('hex')}`,
+      idempotencyKey: intentId,
+    };
+    const attempt = { attemptId: 'attempt:compatible:1', ownerId: 'owner-1' };
+
+    const sent = await adapter.deliver(intent, attempt);
+    assert.equal(sent.outcome, 'unknown');
+
+    const settled = await adapter.reconcile(intent, attempt);
+    assert.equal(settled.outcome, 'reconciled');
+    assert.equal(settled.externalRef, 'opaque:outbound-canonical-1');
+    assert.equal(hub.calls.send, 1);
+  });
+});

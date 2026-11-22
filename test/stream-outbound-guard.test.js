@@ -335,3 +335,118 @@ describe('outbound org guard — scripts/stream.js', () => {
     }
   });
 });
+
+/**
+ * A blocked canonical delivery must not leave a fake "sending" record behind.
+ *
+ * If the guard ran after the claim was persisted, a replay of the same claim
+ * hit the interrupted-send recovery and reported `ok:true` with
+ * `outcome=unknown`, and the reconcile entry turned the same refusal into
+ * `rejected / HXA_ROUTE_MISMATCH`. Both hid the fact that nothing was sent.
+ * The chain below runs the real stream entry three times: send, replay of the
+ * same claim, reconcile under a newer epoch.
+ */
+describe('outbound org guard — canonical replay and reconcile stay hard failures', () => {
+  before(startFakeHub);
+  after(stopFakeHub);
+
+  function claimFor(label) {
+    return canonicalPayload(label);
+  }
+
+  function reconcileClaimFor(label, attemptNumber) {
+    // Same intent, newer Core claim epoch, action=reconcile.
+    return { ...canonicalPayload(label, attemptNumber), action: 'reconcile', claimEpoch: attemptNumber };
+  }
+
+  function stdoutCodes(result) {
+    return result.stdout.split('\n').filter(Boolean).map(line => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+
+  /**
+   * One blocked step. The strict reading — `ok:false` carrying
+   * HXA_OUTBOUND_GUARD_BLOCKED on stdout — is what the fix must produce. The
+   * legacy head only met the weaker part (non-zero exit, no `ok:true`), so a
+   * step that fails the strict check is reported as such instead of hiding the
+   * exact regression this test exists for.
+   */
+  function assertBlockedStep(result, step) {
+    const codes = stdoutCodes(result);
+    const success = codes.find(entry => entry.ok === true);
+    const failure = codes.find(entry => entry.ok === false);
+    assert.equal(success, undefined,
+      `${step}: must not print ok:true (stdout=${result.stdout.trim()})`);
+    assert.notEqual(result.code, 0,
+      `${step}: a blocked delivery must exit non-zero (stdout=${result.stdout.trim()})`);
+    assert.ok(failure,
+      `${step}: stdout must carry an ok:false receipt (stdout=${JSON.stringify(result.stdout.trim())})`);
+    assert.equal(failure.errorCode, 'HXA_OUTBOUND_GUARD_BLOCKED',
+      `${step}: the guard code must survive (stdout=${JSON.stringify(result.stdout.trim())})`);
+    assert.equal(failure.status, 'not_delivered', `${step}: status must say not delivered`);
+  }
+
+  it('three steps (send, replay, reconcile) each exit non-zero and keep the guard code', async () => {
+    const home = makeHome({ guard: GUARD });
+    const env = { HXA_FINAL_DELIVERY_MODE: 'canonical' };
+    sentRequests = [];
+    try {
+      // All three steps run before any assertion, so a failing log shows the
+      // whole chain (exit codes and stdout of each step), not just step 1.
+      const steps = [
+        ['send', await runStream(home, claimFor('customer-org'), { env })],
+        ['replay', await runStream(home, claimFor('customer-org'), { env })],
+        ['reconcile', await runStream(home, reconcileClaimFor('customer-org', 2), { env })],
+      ];
+      const summary = steps.map(([name, result]) => `${name}: exit=${result.code} stdout=${result.stdout.trim() || '(empty)'}`).join(' | ');
+
+      for (const [name, result] of steps) {
+        assert.notEqual(result.code, 0, `${name}: must exit non-zero — ${summary}`);
+        const codes = stdoutCodes(result);
+        assert.equal(codes.some(entry => entry.ok === true), false, `${name}: must not print ok:true — ${summary}`);
+        const failure = codes.find(entry => entry.ok === false);
+        assert.ok(failure, `${name}: stdout must carry an ok:false receipt — ${summary}`);
+        assert.equal(failure.errorCode, 'HXA_OUTBOUND_GUARD_BLOCKED', `${name}: guard code must survive — ${summary}`);
+        assert.equal(failure.status, 'not_delivered', `${name}: must say not delivered — ${summary}`);
+        assert.equal(codes.some(entry => entry.errorCode === 'HXA_ROUTE_MISMATCH'), false,
+          `${name}: a guard block must not become a route mismatch — ${summary}`);
+      }
+
+      assert.equal(sentCount(), 0, 'no step may reach /api/send');
+    } finally {
+      cleanup(home);
+    }
+  });
+
+  it('a blocked send persists no sending claim, so a replay stays a refusal', async () => {
+    const home = makeHome({ guard: GUARD });
+    const env = { HXA_FINAL_DELIVERY_MODE: 'canonical' };
+    sentRequests = [];
+    try {
+      const send = await runStream(home, claimFor('customer-org'), { env });
+      const dir = path.join(home, 'zylos', 'components', 'hxa-connect', 'assistant-response-deliveries');
+      const files = fs.existsSync(dir)
+        ? fs.readdirSync(dir).filter(name => name.endsWith('.json'))
+        : [];
+      for (const file of files) {
+        const record = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+        assert.notEqual(record.status, 'sending', 'a refused org must not leave a sending claim');
+        assert.notEqual(record.status, 'reconciling', 'a refused org must not leave a reconcile claim');
+        assert.equal(record.attempts ?? 0, 0, 'a refused org must not count as an attempt');
+      }
+
+      const replay = await runStream(home, claimFor('customer-org'), { env });
+      assertBlockedStep(replay, 'replay');
+      assert.equal(stdoutCodes(replay).some(entry => entry.status === 'unknown'), false,
+        'a refusal must not be replayed as an ambiguous send');
+      assert.notEqual(replay.code, 0, 'a refused replay must exit non-zero');
+    } finally {
+      cleanup(home);
+    }
+  });
+});

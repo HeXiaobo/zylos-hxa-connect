@@ -6,6 +6,7 @@ import { getRuntimePaths } from '../src/lib/config-path.js';
 import {
   CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
 } from '../src/lib/outbound-guard.js';
+import { redactSecrets } from '../src/lib/redact.js';
 import {
   AssistantResponseDeliveryStore,
   createAssistantResponseDelivery,
@@ -108,9 +109,20 @@ async function main() {
     const result = mode === 'legacy' || !isCanonicalHxaDelivery(input)
       ? await legacyDelivery.deliver(input)
       : await delivery.deliver(input);
+    // A delivery receipt is not a delivery: the `ok` flag here only says the
+    // adapter ran. `status`/`outcome` carry whether the message actually left.
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
   } catch (error) {
-    process.stderr.write(`[hxa-connect] Assistant response stream delivery failed: ${error.message}\n`);
+    // A failure never looks like a delivery. The receipt shape stays the same
+    // (one JSON line on stdout) so a caller that parses it sees ok:false, and
+    // the machine-readable code survives — HXA_OUTBOUND_GUARD_BLOCKED must not
+    // degrade into a generic send error.
+    process.stderr.write(`[hxa-connect] Assistant response stream delivery failed: ${redactSecrets(String(error?.message || error))}\n`);
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      status: 'not_delivered',
+      errorCode: typeof error?.code === 'string' ? error.code : 'HXA_STREAM_DELIVERY_FAILED',
+    })}\n`);
     process.exitCode = 1;
   }
 }
