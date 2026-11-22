@@ -566,6 +566,14 @@ function buildHxaFinalDeliveryAdapter({
       normalized.identity.deliveryId,
     );
 
+    // The guard runs before the record is read, so a refused org fails even
+    // when this claim already carries a historical receipt (an `unknown` or a
+    // route-rejected one left by an older build): such a replay is still not a
+    // delivery and must not be wrapped as success. A refusal means nothing was
+    // attempted, so it propagates untouched as HXA_OUTBOUND_GUARD_BLOCKED and
+    // writes no record at all.
+    const preflight = await preflightOrg(normalized.parsed.orgLabel);
+
     return store.withLock(normalized.identity.deliveryId, async ({ lockToken }) => {
       let record = await ensureRecord(store, normalized);
       const historical = receiptForClaim(record, context, 'send');
@@ -577,12 +585,6 @@ function buildHxaFinalDeliveryAdapter({
         || (!context.coreFenced && receipt.outcome === 'rejected' && receipt.retryable === false)
       ));
       if (terminal) return terminal;
-
-      // Guard BEFORE the sending claim is persisted (and before the replay
-      // branch, so a refused org is never reported as an interrupted send). A
-      // refusal means nothing was attempted: it propagates untouched as
-      // HXA_OUTBOUND_GUARD_BLOCKED, leaving the record at attempts=0.
-      const preflight = await preflightOrg(normalized.parsed.orgLabel);
 
       assertClaimActive(context, clock);
 
@@ -692,6 +694,10 @@ function buildHxaFinalDeliveryAdapter({
       normalized.identity.deliveryId,
     );
 
+    // Same rule as the send path, and for the same reason: a historical
+    // receipt must not answer for a blocked org. The refusal wins over replay.
+    const preflight = await preflightOrg(normalized.parsed.orgLabel);
+
     return store.withLock(normalized.identity.deliveryId, async ({ lockToken }) => {
       let record = await ensureRecord(store, normalized);
       const historical = receiptForClaim(record, context, 'reconcile');
@@ -703,11 +709,6 @@ function buildHxaFinalDeliveryAdapter({
         || (!context.coreFenced && receipt.outcome === 'rejected' && receipt.retryable === false)
       ));
       if (terminal) return terminal;
-
-      // Same rule as the send path: the guard runs before the reconcile claim
-      // and before the interrupted-send recovery, so a refusal can never be
-      // reported as an unknown result or a route mismatch.
-      const preflight = await preflightOrg(normalized.parsed.orgLabel);
 
       if (record.status === 'sending' || record.status === 'reconciling') {
         record = (await recoverInterruptedAttempt(store, record, clock)).record;
