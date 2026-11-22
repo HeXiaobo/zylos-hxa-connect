@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.7.15-3ai] - 2026-11-22
+
+### Fixed
+- **DM replies no longer wedge after a first send failure, and the stream entry
+  obeys the outbound org guard.** Three review rounds on PR #46 closed the same
+  two holes from different sides:
+  - the DM reply channel is learned before the first send and persisted, so a
+    retry reconciles in that exact channel instead of searching an inbox window
+    for a source message that may be older than the send;
+  - channel ambiguity is judged per channel id, so the compatibility endpoint
+    `org:<label>|<peer>` (no `|msg:<id>`) resolves several arrivals in one DM
+    channel to one route;
+  - `scripts/stream.js` applies the same outbound guard as `scripts/send.js`
+    (`internal_labels` + a confirmation from this invocation only), and a
+    refused org fails hard on every entry — fresh send, replay of a historical
+    receipt, and reconcile — with `HXA_OUTBOUND_GUARD_BLOCKED`, exit 1 and
+    `ok:false` on stdout, never `ok:true`.
+
+  A genuine routing failure still reports `rejected / HXA_ROUTE_MISMATCH`.
+
 ## [Unreleased]
 
 ### Merged from upstream (v1.7.4 – v1.7.10, 32 commits)
