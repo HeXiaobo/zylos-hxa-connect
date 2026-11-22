@@ -473,9 +473,13 @@ describe('r3 blocker 8 — the runner/bot callback field names', () => {
     const end = BOT_SOURCE.indexOf('\n    },', from) + 6;
 
     const calls = [];
+    // The callback now hands a replayed DM to `processDm(message, 'catchup')`
+    // (the same intake seam as the socket path, so the DM policy gate and the
+    // stable C4 identity apply on replay too). The field-name contract this
+    // test pins is unchanged: the scanned channel id still has to arrive.
     const ctx = vm.createContext({
       deliverThread: async () => {},
-      deliverDm: async x => calls.push({ channelId: x.channelId }),
+      processDm: async (message, source) => calls.push({ channelId: message.channel_id, source }),
     });
     vm.runInContext(`globalThis.callback = ${BOT_SOURCE.slice(from, end)}`, ctx);
 
@@ -496,6 +500,7 @@ describe('r3 blocker 8 — the runner/bot callback field names', () => {
     await runner.run();
     runner.dispose();
 
-    assert.deepEqual(calls, [{ channelId: 'dm-real' }], `the scanned channel id must reach the callback: ${JSON.stringify(calls)}`);
+    assert.deepEqual(calls, [{ channelId: 'dm-real', source: 'catchup' }],
+      `the scanned channel id must reach the callback, via the catch-up intake path: ${JSON.stringify(calls)}`);
   });
 });

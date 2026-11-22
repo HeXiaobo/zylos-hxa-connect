@@ -8,7 +8,7 @@
  */
 
 import * as hxaSdk from '@coco-xyz/hxa-connect-sdk';
-import { execFile } from 'child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -19,16 +19,82 @@ import {
   REJECT as POLICY_REJECT, DELIVER as POLICY_DELIVER,
   DELIVERED as DELIVERY_OK, SKIP as DELIVERY_SKIP,
 } from './lib/delivery.js';
-import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
+import { getMediaBaseDir, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
 import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
 import { buildDmContent, buildThreadHeader } from './lib/format.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 // zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
 import { redactSecrets } from './lib/redact.js';
+// Upstream 1.7.4+: durable C4 spool, DM inbox reconciliation, signed DM-policy
+// rejection notices, stable assistant-response identities.
+import { C4DeliveryQueue } from './lib/c4-delivery-queue.js';
+import { DmInboxReconciler, DmInboxState } from './lib/dm-inbox-reconciler.js';
+import {
+  DmPolicyRejectionStore,
+  createDmPolicyGate,
+  createDmPolicyRejectionHandler,
+  requireCurrentNoticeSecret,
+} from './lib/dm-policy-rejection.js';
+import { resolveFinalDeliveryMode } from './lib/assistant-response-delivery.js';
+import { newestDeliveryAgeMs } from './lib/delivery-health.js';
+import { getRuntimePaths } from './lib/config-path.js';
 
-const HOME = process.env.HOME;
-const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const {
+  c4ReceivePath: C4_RECEIVE,
+  c4SpoolDir: C4_SPOOL_DIR,
+  dmInboxStatePath: DM_INBOX_STATE_PATH,
+  dmPolicyRejectionDir: DM_POLICY_REJECTION_DIR,
+  assistantResponseDir: ASSISTANT_RESPONSE_DIR,
+} = getRuntimePaths();
+const configuredDmReconcileInterval = Number.parseInt(process.env.HXA_DM_RECONCILE_INTERVAL_MS || '15000', 10);
+const DM_POLICY_NOTICE_SECRET = process.env.HXA_DM_POLICY_NOTICE_SECRET;
+const DM_POLICY_NOTICE_PREVIOUS_SECRET = process.env.HXA_DM_POLICY_NOTICE_PREVIOUS_SECRET;
+const DM_POLICY_NOTICE_SECRETS = {
+  current: DM_POLICY_NOTICE_SECRET,
+  previous: DM_POLICY_NOTICE_PREVIOUS_SECRET ? [DM_POLICY_NOTICE_PREVIOUS_SECRET] : [],
+};
+
+// Fail fast before any connection setup. The per-org DM policy gate below
+// requires this secret; if it is missing the gate throws mid-setup and the
+// process previously kept running (PM2 still "online") with no WebSockets
+// established — an invisible half-dead state. Exit loudly instead.
+try {
+  requireCurrentNoticeSecret(DM_POLICY_NOTICE_SECRET);
+} catch (error) {
+  console.error(
+    `[hxa-connect] ${redactSecrets(error.message)}. ` +
+    'Add HXA_DM_POLICY_NOTICE_SECRET to the zylos .env file, then run `pm2 restart` on the HXA service. Exiting.',
+  );
+  process.exit(1);
+}
+
+// Startup self-check: surface a stale assistant-response delivery store.
+// A store that stops receiving writes is the first sign of streamed-reply
+// delivery silently stopping (issue #26). With terminal auto-delivery off
+// (the default) a quiet ledger is expected, so the check is skipped. This
+// is diagnostic only and must never take the service down.
+const ASSISTANT_DELIVERY_STALE_WARN_MS = 60 * 60 * 1000; // 1 hour
+if (resolveFinalDeliveryMode(process.env) !== 'off') {
+  try {
+    const deliveryHealth = newestDeliveryAgeMs({ directory: ASSISTANT_RESPONSE_DIR });
+    if (deliveryHealth.hasRecords && deliveryHealth.ageMs > ASSISTANT_DELIVERY_STALE_WARN_MS) {
+      console.warn(
+        `[hxa-connect] Assistant-response delivery store is stale: newest record is ` +
+        `${Math.round(deliveryHealth.ageMs / 60_000)} minutes old. ` +
+        'If outbound assistant replies are expected, verify C4_ASSISTANT_REQUEST_ID is still being passed ' +
+        'to scripts/send.js and scripts/stream.js is still being invoked.',
+      );
+    }
+  } catch (error) {
+    console.warn(`[hxa-connect] Assistant-response delivery health check failed: ${redactSecrets(error.message)}`);
+  }
+}
+
+const DM_RECONCILE_INTERVAL_MS = Number.isInteger(configuredDmReconcileInterval)
+  && configuredDmReconcileInterval >= 5_000
+  ? configuredDmReconcileInterval
+  : 15_000;
 
 const config = migrateConfig();
 const resolved = resolveOrgs(config);
@@ -78,6 +144,67 @@ function displayPrefix(label) {
 function logPrefix(label) {
   if (!isMultiOrg) return '[hxa-connect]';
   return `[hxa-connect:${label}]`;
+}
+
+function createConnectionDiagnostics(client, label) {
+  const org = /^[a-z0-9][a-z0-9-]*$/.test(label) ? label : 'unknown';
+  let connectedAt = null;
+  let lastReceivedAt = null;
+  let lastPongAt = null;
+  let connectCount = 0;
+  let reconnectCount = 0;
+  let reconnectAttemptCount = 0;
+  const numberOrNull = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const iso = value => value === null ? null : new Date(value).toISOString();
+
+  function record(event, fields = {}) {
+    const now = Date.now();
+    console.log(`[hxa-connect:${org}] Connection ${JSON.stringify({
+      event,
+      org,
+      at: iso(now),
+      connectedAt: iso(connectedAt),
+      connectionAgeMs: connectedAt === null ? null : Math.max(0, now - connectedAt),
+      lastReceivedAt: iso(lastReceivedAt),
+      lastReceivedAgeMs: lastReceivedAt === null ? null : Math.max(0, now - lastReceivedAt),
+      lastPongAt: iso(lastPongAt),
+      lastPongAgeMs: lastPongAt === null ? null : Math.max(0, now - lastPongAt),
+      connectCount,
+      reconnectCount,
+      reconnectAttemptCount,
+      ...fields,
+    })}`);
+  }
+
+  function connected(event) {
+    connectedAt = Date.now();
+    lastReceivedAt = null;
+    lastPongAt = null;
+    connectCount++;
+    if (event === 'reconnected') reconnectCount++;
+    record(event);
+  }
+
+  // SDK '*' observes parsed application frames, not transport control frames.
+  client.on('*', () => { lastReceivedAt = Date.now(); });
+  client.on('pong', () => {
+    lastPongAt = Date.now();
+    lastReceivedAt = lastPongAt;
+    record('pong');
+  });
+  client.on('close', ({ code } = {}) => {
+    record('close', { code: numberOrNull(code) });
+  });
+  client.on('reconnecting', ({ attempt, delay } = {}) => {
+    reconnectAttemptCount++;
+    record('reconnecting', { attempt: numberOrNull(attempt), delayMs: numberOrNull(delay) });
+  });
+  client.on('reconnected', () => { connected('reconnected'); });
+  client.on('reconnect_failed', ({ attempts } = {}) => {
+    record('reconnect_failed', { attempts: numberOrNull(attempts) });
+  });
+
+  return { connected: () => connected('connected') };
 }
 
 function escapeXml(str) {
@@ -166,12 +293,12 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
   if (!parts || !parts.length) return {};
 
   const localPaths = {};
-  const orgDir = path.join(MEDIA_BASE_DIR, orgLabel);
+  const orgDir = path.join(getMediaBaseDir(), orgLabel);
 
   try {
     await fs.promises.mkdir(orgDir, { recursive: true });
   } catch (err) {
-    console.warn(`${lp} Failed to create media dir ${orgDir}: ${err.message}`);
+    console.warn(`${lp} Failed to create media dir ${orgDir}: ${redactSecrets(err.message)}`);
     return localPaths;
   }
 
@@ -197,7 +324,7 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
       localPaths[part.url] = localPath;
       console.log(`${lp} Media saved: ${localPath} (${formatBytes(result.size)})`);
     } catch (err) {
-      console.warn(`${lp} Media download error for ${part.url}: ${err.message}`);
+      console.warn(`${lp} Media download error for ${part.url}: ${redactSecrets(err.message)}`);
     }
   }
 
@@ -205,6 +332,26 @@ async function downloadMediaParts(parts, client, orgLabel, lp) {
 }
 
 await setupFetchProxy();
+
+const c4ReceiveSource = (() => {
+  try {
+    return fs.readFileSync(C4_RECEIVE, 'utf8');
+  } catch {
+    return '';
+  }
+})();
+const supportsAssistantResponseStream = c4ReceiveSource.includes('--assistant-request-id')
+  && c4ReceiveSource.includes('--assistant-source-id');
+const c4Queue = new C4DeliveryQueue({
+  spoolDir: C4_SPOOL_DIR,
+  c4ReceivePath: C4_RECEIVE,
+});
+const dmInboxState = new DmInboxState({ filePath: DM_INBOX_STATE_PATH });
+const dmPolicyRejectionStore = new DmPolicyRejectionStore({
+  directory: DM_POLICY_REJECTION_DIR,
+});
+await c4Queue.start();
+await dmInboxState.load();
 
 const MAX_WS_PAYLOAD = 1048576; // 1 MB
 const MAX_CONTENT_LENGTH = 51200; // 50 KB
@@ -249,11 +396,6 @@ function getRateLimiter(key) {
   return bucket;
 }
 
-// ─── C4 Concurrency Cap (M-07) ──────────────────────────
-
-const MAX_CONCURRENT_C4 = 10;
-let _activeC4Calls = 0;
-
 const wsOptions = {
   maxPayload: MAX_WS_PAYLOAD,
   ...(PROXY_URL ? { agent: new HttpsProxyAgent(PROXY_URL) } : {}),
@@ -261,64 +403,67 @@ const wsOptions = {
 
 // ─── C4 Bridge ─────────────────────────────────────────────
 
-function executeC4(c4Args) {
-  return new Promise((resolve, reject) => {
-    execFile('node', c4Args, { encoding: 'utf8' }, (error, stdout) => {
-      if (!error) return resolve(stdout);
-      try {
-        const response = JSON.parse(error.stdout || stdout || '{}');
-        if (response.ok === false && response.error?.message) {
-          // Definitive rejection — retrying will not help.
-          return reject(Object.assign(new Error(response.error.message), { c4Rejected: true }));
-        }
-      } catch {}
-      reject(new Error(error.message));
-    });
+function stableC4Identity(label, kind, sourceId) {
+  const digest = createHash('sha256').update(`${label}\0${kind}\0${sourceId}`).digest('hex');
+  return {
+    requestId: `hxa.${kind}.${digest}`,
+    sourceId: `hxa:${kind}:${digest}`,
+  };
+}
+
+/**
+ * The one way a message leaves this process.
+ *
+ * Upstream 1.7.4 replaced the old in-process `execFile` + 2s retry with a
+ * disk-backed spool: the record survives a PM2 restart, a busy C4, or a crash,
+ * and an id that is already spooled is never enqueued twice.
+ *
+ * Returns the queue receipt; the queue owns retries, so a caller that must know
+ * "did C4 take it" uses the awaited form below.
+ */
+async function sendToC4(channel, endpoint, content, {
+  deliveryId = `hxa:generated:${randomUUID()}`,
+  assistantIdentity = null,
+} = {}) {
+  if (!content) return { queued: false, replayed: false };
+  const args = ['--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
+  if (supportsAssistantResponseStream && assistantIdentity) {
+    args.push(
+      '--assistant-request-id', assistantIdentity.requestId,
+      '--assistant-source-id', assistantIdentity.sourceId,
+    );
+  }
+  return c4Queue.enqueue({
+    id: deliveryId,
+    args,
+    preview: content.substring(0, 80),
   });
+}
+
+/**
+ * Awaited variant used by message delivery (live *and* replayed): the catch-up
+ * watermark may only move past a message once C4 accepted it, otherwise a
+ * failed replay would be lost. Throws on failure so the runner stops and
+ * retries on the next reconnect.
+ *
+ * The spool makes the write durable before this returns; "accepted" here means
+ * "durably queued", which is the strongest promise available at this point and
+ * the one the watermark needs.
+ */
+async function sendToC4Awaited(channel, endpoint, content, options) {
+  if (!content) return null;
+  return sendToC4(channel, endpoint, content, options);
 }
 
 /**
  * Fire-and-forget C4 send for notifications that carry no delivery guarantee
- * (admin notices, lifecycle chatter). Message delivery uses sendToC4Awaited().
+ * (admin notices, lifecycle chatter) or whose caller only logs the failure.
  */
-function sendToC4(channel, endpoint, content) {
+function sendToC4Notice(channel, endpoint, content, options) {
   if (!content) return;
-  sendToC4Awaited(channel, endpoint, content).catch(err => {
+  sendToC4Awaited(channel, endpoint, content, options).catch(err => {
     console.warn(`[hxa-connect] C4 notice dropped: ${redactSecrets(err?.message || err)}`);
   });
-}
-
-/**
- * Awaited variant used by catch-up: the watermark may only move past a message
- * once C4 actually accepted it, otherwise a failed replay would be lost.
- * Throws on rejection so the runner stops and retries on the next reconnect.
- */
-async function sendToC4Awaited(channel, endpoint, content) {
-  if (!content) return;
-  const c4Args = [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--json', '--content', content];
-  const capExceeded = () => {
-    const err = new Error(`C4 concurrency cap reached (${MAX_CONCURRENT_C4})`);
-    err.retryable = true;
-    return err;
-  };
-
-  if (_activeC4Calls >= MAX_CONCURRENT_C4) throw capExceeded();
-  _activeC4Calls++;
-  try {
-    try {
-      await executeC4(c4Args);
-      console.log(`[hxa-connect] -> C4: ${content.substring(0, 80)}...`);
-      return;
-    } catch (err) {
-      if (err.c4Rejected) throw err; // policy rejection: retrying will not help
-      console.warn(`[hxa-connect] C4 send failed, retrying: ${redactSecrets(err.message)}`);
-    }
-    await new Promise(r => setTimeout(r, 2000));
-    await executeC4(c4Args);
-    console.log(`[hxa-connect] -> C4 (retry): ${content.substring(0, 80)}...`);
-  } finally {
-    _activeC4Calls--;
-  }
 }
 
 // ─── Constants ──────────────────────────────────────────────
@@ -336,7 +481,7 @@ const MAX_CONNECT_ATTEMPTS = 20;
 
 // ─── Catch-up State (one file for all orgs, atomic writes) ──
 
-const CATCHUP_STATE_PATH = resolveCatchupStatePath({ home: HOME });
+const CATCHUP_STATE_PATH = resolveCatchupStatePath();
 const catchupState = new CatchupStateStore({
   filePath: process.env.HXA_CATCHUP_STATE_PATH || CATCHUP_STATE_PATH,
   log: (msg) => console.warn(`[hxa-connect] ${msg}`),
@@ -377,6 +522,11 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     },
   });
 
+  // Diagnostic-only observer (allowlisted fields only; never sends traffic and
+  // never changes the SDK's recovery behaviour). Hosts use these lines to tell
+  // "socket alive but silent" apart from "socket gone".
+  const diagnostics = createConnectionDiagnostics(client, label);
+
   const isSelf = (id, metadata) => {
     if (!org.agentId || id !== org.agentId) return false;
     // Human-authored messages via Web UI should not be treated as self-echo
@@ -395,20 +545,43 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   // boundary moves. No boundary yet ⇒ the first run only baselines.
   if (catchupState.getEventsSince(label)) catchupState.markGap(label);
 
+  // Upstream 1.7.9: a DM policy rejection is answered with a signed notice so
+  // the sender learns why, and a notice that arrives back at us is recognised
+  // instead of being treated as a new message.
+  const dmPolicyGate = createDmPolicyGate({
+    agentId: org.agentId,
+    noticeSecrets: DM_POLICY_NOTICE_SECRETS,
+    rejectionHandler: createDmPolicyRejectionHandler({
+      label,
+      store: dmPolicyRejectionStore,
+      client,
+      agentId: org.agentId,
+      noticeSecrets: DM_POLICY_NOTICE_SECRETS,
+    }),
+  });
+
   /**
    * Single delivery pipeline for one DM message.
-   * Used by both the realtime 'message' handler and catch-up, so policy,
-   * attachment handling and C4 formatting stay identical.
+   * Used by both the realtime path and catch-up, so attachment handling, C4
+   * formatting and the rate limit stay identical on both.
    * Throw on failure so catch-up can retry the message on the next reconnect.
+   *
+   * `skipRateLimit` is for the realtime caller that already consumed a token.
    */
-  const deliverDm = async ({ message, sender_name: senderName, parts, catchup = false }) => {
+  const deliverDm = async ({
+    message, sender_name: senderName, parts, catchup = false, skipRateLimit = false,
+    // Optional C4 delivery identity. Realtime passes the stable request id (see
+    // `stableC4Identity`) so a replay cannot open a second assistant turn; a
+    // catch-up replay is a new turn by design and passes none.
+    delivery = null,
+  }) => {
     const sender = senderName || message.sender_name || 'unknown';
     const content = message.content || '';
     // Return codes (the same constants the shared policy/settle helpers use):
     // DELIVERY_OK (C4 accepted), POLICY_REJECT (final policy no),
     // DELIVERY_SKIP (self / duplicate / rate-limited). Anything else throws.
     const decision = decideDmDelivery({
-      access: org.access, isSelf, message, sender, catchup,
+      access: org.access, isSelf, message, sender, catchup: catchup || skipRateLimit,
       takeRateToken: () => getRateLimiter(`${label}:dm:${message.sender_id || sender}`).consume(),
     });
     if (decision.verdict === POLICY_REJECT) {
@@ -434,40 +607,148 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const formatted = buildDmContent({ displayPrefix: dp, sender, content, attachments, catchup });
     // Awaited for BOTH live and replay: a message only counts as delivered once
     // C4 accepted it. A live failure therefore stays deliverable by catch-up.
-    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, sender), formatted);
+    await sendToC4Awaited(
+      C4_CHANNEL,
+      // The endpoint carries the hub message id (upstream `dmResponseEndpoint`,
+      // same org-prefix rule) so the reply anchors to the right DM.
+      c4Endpoint(label, message.id ? `${sender}|msg:${message.id}` : sender),
+      formatted,
+      delivery || undefined,
+    );
     return DELIVERY_OK;
   };
 
-  // ─── Event Handlers ───────────────────────────────────
+  // ─── DM intake: one message, one decision ─────────────
 
-  client.on('message', async (msg) => {
-    try {
-      const wire = msg.message || {};
-      const at = Number(wire.created_at) || Date.now();
-      // Catch-up may already have delivered this id (and vice versa).
-      if (gate.isSeen(wire.id)) {
-        console.log(`${lp} DM ${wire.id} already handled, skipping realtime duplicate`);
-        return;
+  const dmInFlight = new Map();
+
+  function normalizeDm(raw) {
+    const message = raw?.message || raw || {};
+    return {
+      id: message.id || raw?.id || null,
+      channel_id: message.channel_id || raw?.channel_id || null,
+      sender_id: message.sender_id || raw?.sender_id || null,
+      sender_name: message.sender_name || raw?.sender_name || 'unknown',
+      content: message.content || raw?.content || '',
+      content_type: message.content_type || raw?.content_type || 'text',
+      parts: message.parts || raw?.parts || [],
+      metadata: message.metadata || raw?.metadata || null,
+      created_at: message.created_at || raw?.created_at || Date.now(),
+    };
+  }
+
+  /**
+   * One inbound DM, from either the socket or the inbox reconciliation poll.
+   *
+   * The policy question and the signed rejection notice belong to the upstream
+   * gate; the delivery itself stays on `deliverDm`. Every accepted or finally
+   * rejected id is written into the catch-up state, so a replay of the same id
+   * is skipped — that is the seam between the two recovery mechanisms.
+   */
+  async function processDm(raw, source, { ownReservations = [] } = {}) {
+    const message = normalizeDm(raw);
+    if (!message.id) {
+      console.warn(`${lp} DM discarded source=${source} reason=missing_message_id sender=${message.sender_name}`);
+      return { action: 'discarded', reason: 'missing_message_id' };
+    }
+    if (dmInFlight.has(message.id)) return dmInFlight.get(message.id);
+    const promise = (async () => {
+      const sender = message.sender_name;
+      if (isSelf(message.sender_id, message.metadata)) {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} reason=self_message`);
+        return { action: 'discarded', reason: 'self_message' };
       }
-      gate.begin(wire.id);
-      // Only a C4 acknowledgement (or a final policy rejection) is recorded.
-      // A transport failure opens a gap and stays replayable (blocker 4).
+      // The catch-up replay and the inbox poll read the same hub history from
+      // two different stores. Whichever path delivered this id first wins; the
+      // other must not deliver it again. An id still IN FLIGHT elsewhere is not
+      // a final answer either — defer rather than enqueue a second delivery
+      // under a different spool id.
+      if (gate.isDelivered(message.id)) {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} reason=already_delivered`);
+        return { action: 'discarded', reason: 'already_delivered' };
+      }
+      // A reservation held by THIS delivery (the catch-up runner reserves an id
+      // before calling back in) is not a conflict; only another owner's is.
+      if (gate.isHeldByOther(message.id, ownReservations)) {
+        console.log(`${lp} DM deferred id=${message.id} source=${source} reason=in_flight_elsewhere`);
+        return { action: 'retry', reason: 'in_flight_elsewhere' };
+      }
+      const policyResult = await dmPolicyGate.evaluate(message, {
+        source,
+        access: org.access,
+      });
+      if (policyResult.action !== 'continue') {
+        console.log(`${lp} DM discarded id=${message.id} source=${source} sender=${sender} reason=${policyResult.reason}${policyResult.notificationStatus ? ` notification=${policyResult.notificationStatus}` : ''}`);
+        // A policy rejection is final for this id: remember it so catch-up does
+        // not replay it, but do not let a rate-limited notice retry forever.
+        if (policyResult.reason === 'dm_policy_rejection_notice'
+            || policyResult.notificationStatus !== 'retry_wait') {
+          gate.mark(message.id, Number(message.created_at) || Date.now());
+          catchupState.scheduleSave();
+        }
+        return policyResult;
+      }
+
+      // Rate limiting is a REALTIME throttle (a burst on the socket). A replay
+      // is already paced by the runner's batches, and deferring it here would
+      // strand a finite backlog until tokens refill — or throw and end the run.
+      // Same rule `decideDmDelivery()` applies via its `catchup` flag.
+      if (source === 'websocket') {
+        const rlKey = `${label}:dm:${message.sender_id || sender}`;
+        if (!getRateLimiter(rlKey).consume()) {
+          // Not a final answer: leave the id unremembered so a later replay or
+          // inbox poll can still deliver it.
+          console.warn(`${lp} DM deferred id=${message.id} source=${source} sender=${sender} reason=rate_limit`);
+          return { action: 'retry', reason: 'rate_limit' };
+        }
+      }
+
+      gate.begin(message.id);
       let outcome;
       let error;
       try {
-        outcome = await deliverDm({ message: wire, sender_name: msg.sender_name, parts: msg.parts, catchup: false });
+        outcome = await deliverDm({
+          message,
+          sender_name: sender,
+          parts: message.parts,
+          catchup: source !== 'websocket',
+          skipRateLimit: true,
+          delivery: {
+            deliveryId: `hxa:${label}:dm:${message.id}`,
+            assistantIdentity: stableC4Identity(label, 'dm', message.id),
+          },
+        });
       } catch (err) {
         error = err;
       }
       settleLiveDelivery({
-        outcome, error, id: wire.id, at, gate,
+        outcome, error, id: message.id, at: Number(message.created_at) || Date.now(), gate,
         markGap: () => catchupState.markGap(label),
         save: () => catchupState.scheduleSave(),
       });
       if (error) throw error;
-    } catch (err) {
-      console.error(`${lp} DM handler error: ${redactSecrets(err.message)}`);
-    }
+      if (outcome === DELIVERY_OK) return { action: 'accepted' };
+      if (outcome === POLICY_REJECT) return { action: 'discarded', reason: 'dm_policy' };
+      return { action: 'skipped' };
+    })().finally(() => dmInFlight.delete(message.id));
+    dmInFlight.set(message.id, promise);
+    return promise;
+  }
+
+  const dmReconciler = new DmInboxReconciler({
+    label,
+    client,
+    state: dmInboxState,
+    processMessage: processDm,
+    intervalMs: DM_RECONCILE_INTERVAL_MS,
+  });
+
+  // ─── Event Handlers ───────────────────────────────────
+
+  client.on('message', (msg) => {
+    dmReconciler.observeLive(normalizeDm(msg)).catch(err => {
+      console.error(`${lp} DM handler error: ${redactSecrets(err?.message || err)}`);
+    });
   });
 
   // channel_message handler removed — channels are DMs, group channels no longer exist.
@@ -616,8 +897,17 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       console.log(`${lp} Thread ${threadId} lifecycle delivery (${reason})`);
     }
     // Awaited for BOTH live and replay: only a C4 acknowledgement makes this
-    // message "delivered" (see the handler's gate.mark()).
-    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''));
+    // message "delivered" (see the handler's gate.mark()). The delivery id is
+    // stable per (thread, message) so the C4 spool and `--request-id` treat a
+    // replay as the same delivery, while a lifecycle notice gets a fresh one.
+    await sendToC4Awaited(C4_CHANNEL, c4Endpoint(label, `thread:${threadId}${msgIdSuffix}`), parts.join(''), {
+      deliveryId: hasCurrentMessage
+        ? `hxa:${label}:thread:${threadId}:${message.id}`
+        : `hxa:${label}:thread-lifecycle:${threadId}:${randomUUID()}`,
+      assistantIdentity: hasCurrentMessage
+        ? stableC4Identity(label, 'thread', `${threadId}:${message.id}`)
+        : null,
+    });
     return DELIVERY_OK;
   }
 
@@ -650,7 +940,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       });
       if (error) throw error;
     } catch (err) {
-      console.error(`${lp} Thread handler error: ${redactSecrets(err.message)}`);
+      console.error(`${lp} Thread handler error: ${redactSecrets(err?.message || err)}`);
     }
   });
 
@@ -706,7 +996,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botId = msg.bot?.id || 'unknown';
     console.log(`${lp} Bot join request: ${botName} (awaiting approval)`);
     const formatted = `[${dp}] [priority:high] [action:notify-owner] Bot "${botName}" (id: ${botId}) is requesting to join the org (pending admin approval)`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted, {
+      deliveryId: `hxa:${label}:bot-join:${msg.bot?.id || randomUUID()}`,
+    }).catch(err => console.error(`${lp} Bot join C4 queue error: ${redactSecrets(err?.message || err)}`));
   });
 
   client.on('bot_status_changed', (msg) => {
@@ -714,7 +1006,9 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botName = msg.name || msg.bot_id || 'unknown';
     console.log(`${lp} Bot status changed: ${botName} → ${status}`);
     const formatted = `[${dp}] Bot "${botName}" status changed to ${status}${msg.reason ? ` (reason: ${msg.reason})` : ''}`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted, {
+      deliveryId: `hxa:${label}:bot-status:${msg.bot_id || msg.name || randomUUID()}:${msg.join_status || 'unknown'}`,
+    }).catch(err => console.error(`${lp} Bot status C4 queue error: ${redactSecrets(err?.message || err)}`));
   });
 
   // ─── Connection Lifecycle ──────────────────────────────
@@ -739,13 +1033,45 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         await deliverThread({ threadId, message, snapshot, reason: 'message', catchup: true });
         return;
       }
-      await deliverDm({ message, parts: message.parts, catchup: true, channelId });
+      // Same intake seam as the socket: the policy gate (including its signed
+      // rejection notice), the in-flight guard and the stable C4 delivery
+      // identity must all apply to a replayed DM exactly as they do live.
+      // `deliverDm` alone would skip the gate, so a replayed denial would be
+      // silently accepted and a pending notice could never retry.
+      // The runner knows the channel id it scanned; the message row may not
+      // carry one. Keep it on the normalized message so `processDm` addresses
+      // the same target the scan did.
+      const outcome = await processDm(
+        { ...message, channel_id: message?.channel_id || channelId },
+        'catchup',
+        // The runner reserved this id before calling back; tell the intake
+        // seam that reservation is ours so it does not defer itself.
+        { ownReservations: message?.id ? [message.id] : [] },
+      );
+      // A `retry` verdict (pending rejection notice, or a competing in-flight
+      // delivery) is not a final answer, but it must NOT abort the whole run:
+      // the runner's catch would end message scanning, so a later deliverable
+      // thread in the same replay would never be visited, and the same row
+      // would be picked first next time. Leaving the id unmarked is enough —
+      // the inbox poll retries the notice and the runner rescans the row.
+      if (outcome?.action === 'retry') {
+        console.log(`${lp} catch-up DM ${message?.id} left unresolved (${outcome.reason}) — retried later, run continues`);
+        return;
+      }
     },
 
     // One notice line before a large replay. Goes to the same channel as the
     // messages themselves (admin endpoint) so it shows up in context.
     deliverSummary: async (text) => {
-      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      // Best effort: a summary line is an aid, not a guarantee. Await it so a
+      // spool failure is LOGGED here instead of escaping as an unhandled
+      // rejection (which can take the process down), but never let it stop the
+      // replay itself.
+      try {
+        await sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      } catch (err) {
+        console.warn(`${lp} Catch-up summary not delivered: ${redactSecrets(err?.message || err)}`);
+      }
     },
 
     // Invites / status changes that happened while offline: reuse the realtime
@@ -761,7 +1087,11 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
       if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
-        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        try {
+          await sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        } catch (err) {
+          console.warn(`${lp} Catch-up event notice not delivered: ${redactSecrets(err?.message || err)}`);
+        }
       } else {
         console.log(`${lp} catch-up event: ${text}`);
       }
@@ -781,10 +1111,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
 
   client.on('reconnected', ({ attempts }) => {
     console.log(`${lp} Reconnected after ${attempts} attempt(s)`);
-    // Fire and forget: catch-up is serialised internally and never blocks
-    // realtime event handling.
+    // Two independent recovery paths, both fire-and-forget so realtime event
+    // handling is never blocked: catch-up replays the hub event log from the
+    // watermark, and the inbox poll asks the hub for anything the socket
+    // missed while it looked healthy. Both de-duplicate on message id.
     catchup.run('reconnected').catch(err => {
       console.error(`${lp} Catch-up run error: ${redactSecrets(err?.message || err)}`);
+    });
+    dmReconciler.pollOnce().catch(err => {
+      console.warn(`${lp} Immediate DM reconciliation after reconnect failed: ${redactSecrets(err?.message || err)}`);
     });
   });
 
@@ -808,14 +1143,14 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     }
   });
 
-  connections.set(label, { client, threadCtx, config: org, catchup });
+  connections.set(label, { client, threadCtx, config: org, catchup, dmReconciler, diagnostics });
 }
 
 // ─── Start All Connections ─────────────────────────────────
 
 console.log(`[hxa-connect] Starting ${connections.size} org connection(s): ${orgLabels.join(', ')}`);
 
-async function connectOrg(label, { client, threadCtx, catchup, config: org }) {
+async function connectOrg(label, { client, threadCtx, catchup, dmReconciler, diagnostics, config: org }) {
   const lp = logPrefix(label);
   const INITIAL_DELAY = 3000;
   const MAX_DELAY = 60000;
@@ -828,13 +1163,18 @@ async function connectOrg(label, { client, threadCtx, catchup, config: org }) {
     try {
       await client.connect();
       console.log(`${lp} WebSocket connected`);
+      diagnostics.connected();
       await threadCtx.start();
       console.log(`${lp} ThreadContext started (mention filter for @${org.agentName})`);
-      // First connection: establishes the baseline (or resumes an unfinished
-      // replay). Serialised with the reconnect trigger inside the runner.
+      // First connection: the catch-up run establishes the baseline (or resumes
+      // an unfinished replay) and is serialised with the reconnect trigger
+      // inside the runner. The inbox reconciler starts polling on the same
+      // boundary, so a DM that never arrived over the socket is still found.
       catchup.run('connected').catch(err => {
         console.error(`${lp} Catch-up run error: ${redactSecrets(err?.message || err)}`);
       });
+      await dmReconciler.start();
+      console.log(`${lp} Durable DM inbox reconciliation started (interval=${DM_RECONCILE_INTERVAL_MS}ms)`);
       return;
     } catch (err) {
       try { client.disconnect(); } catch {}
@@ -864,15 +1204,19 @@ if (connections.size === 0) {
 
 console.log(`[hxa-connect] ${connections.size} org(s) connected`);
 console.log(`[hxa-connect] Proxy: ${PROXY_URL || 'none'}`);
+console.log(`[hxa-connect] C4 durable spool: ${C4_SPOOL_DIR}`);
+console.log(`[hxa-connect] C4 assistant response stream: ${supportsAssistantResponseStream ? 'enabled' : 'legacy fallback'}`);
 
 // Graceful shutdown
 function shutdown() {
   console.log('[hxa-connect] Shutting down...');
-  for (const { client, threadCtx, catchup } of connections.values()) {
+  for (const { client, threadCtx, catchup, dmReconciler } of connections.values()) {
     catchup?.dispose?.();
+    dmReconciler?.stop();
     threadCtx.stop();
     client.disconnect();
   }
+  c4Queue.stop();
   try { catchupState.flush(); } catch {}
   process.exit(0);
 }

@@ -1,0 +1,724 @@
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
+const MSG_SUFFIX_RE = /\|msg:([A-Za-z0-9-]+)$/;
+const TERMINAL_EVENTS = new Set(['RunCompleted', 'RunFailed']);
+const INVISIBLE_FORMAT_CHARACTERS = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function requireRecord(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${field} must be an object`);
+  }
+  return value;
+}
+
+function requireText(value, field) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new TypeError(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+export function normalizeHxaTransportReceipt(receipt) {
+  const message = receipt?.message || receipt || {};
+  return {
+    hubMessageId: typeof message.id === 'string' ? message.id : null,
+    channelId: typeof receipt?.channel_id === 'string'
+      ? receipt.channel_id
+      : (typeof message.channel_id === 'string' ? message.channel_id : null),
+  };
+}
+
+function processAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function writeAtomic(filePath, value) {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tempPath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
+  try {
+    await fs.promises.writeFile(tempPath, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+    await fs.promises.rename(tempPath, filePath);
+  } finally {
+    await fs.promises.unlink(tempPath).catch(() => {});
+  }
+}
+
+export function parseHxaResponseEndpoint(endpointId, defaultOrgLabel = 'default') {
+  let endpoint = requireText(endpointId, 'HXA response endpointId');
+  let orgLabel = defaultOrgLabel;
+  const orgMatch = endpoint.match(ORG_PREFIX_RE);
+  if (orgMatch) {
+    orgLabel = orgMatch[1];
+    endpoint = orgMatch[2];
+  }
+
+  let sourceMessageId = null;
+  const messageMatch = endpoint.match(MSG_SUFFIX_RE);
+  if (messageMatch) {
+    sourceMessageId = messageMatch[1];
+    endpoint = endpoint.slice(0, messageMatch.index);
+  }
+
+  if (endpoint.startsWith('thread:')) {
+    const threadId = requireText(endpoint.slice('thread:'.length), 'HXA response threadId');
+    return Object.freeze({
+      kind: 'thread',
+      orgLabel,
+      threadId,
+      replyToId: sourceMessageId,
+      endpointId,
+    });
+  }
+  if (endpoint.startsWith('channel:')) {
+    throw new TypeError('HXA response cannot target a legacy group channel');
+  }
+  return Object.freeze({
+    kind: 'dm',
+    orgLabel,
+    target: requireText(endpoint, 'HXA response DM target'),
+    sourceMessageId,
+    endpointId,
+  });
+}
+
+export function dmResponseEndpoint(label, sender, messageId, { multiOrg = true } = {}) {
+  const target = `${requireText(sender, 'HXA DM sender')}|msg:${requireText(messageId, 'HXA DM messageId')}`;
+  if (!multiOrg && label === 'default') return target;
+  return `org:${requireText(label, 'HXA org label')}|${target}`;
+}
+
+function terminalFromDelivery(input) {
+  const delivery = requireRecord(input, 'C4 assistant response delivery');
+  if (delivery.schemaVersion !== 1) {
+    throw new TypeError('C4 assistant response delivery schemaVersion must be 1');
+  }
+  const requestId = requireText(delivery.requestId, 'C4 assistant response requestId');
+  const route = requireRecord(delivery.route, 'C4 assistant response route');
+  if (route.channel !== 'hxa-connect') {
+    throw new TypeError('C4 assistant response route channel must be hxa-connect');
+  }
+  requireText(route.endpointId, 'C4 assistant response route endpointId');
+  if (!Array.isArray(delivery.events) || delivery.events.length === 0) {
+    throw new TypeError('C4 assistant response delivery events must be non-empty');
+  }
+  const terminals = delivery.events.filter(event => TERMINAL_EVENTS.has(event?.type));
+  if (terminals.length === 0) return { requestId, route, terminal: null };
+  if (terminals.length !== 1) {
+    throw new TypeError('C4 assistant response delivery must contain one terminal event');
+  }
+  const terminal = requireRecord(terminals[0], 'C4 assistant response terminal event');
+  if (terminal.requestId !== requestId) {
+    throw new TypeError('C4 assistant response terminal event requestId mismatch');
+  }
+  if (!Number.isSafeInteger(terminal.sequence) || terminal.sequence < 1) {
+    throw new TypeError('C4 assistant response terminal sequence must be positive');
+  }
+  const payload = requireRecord(terminal.payload, 'C4 assistant response terminal payload');
+  if (terminal.type === 'RunCompleted' && typeof payload.output !== 'string') {
+    throw new TypeError('RunCompleted output must be a string');
+  }
+  if (terminal.type === 'RunFailed' && typeof payload.retryable !== 'boolean') {
+    throw new TypeError('RunFailed retryable must be a boolean');
+  }
+  return { requestId, route, terminal };
+}
+
+function publicCompletedContent(terminal) {
+  const output = terminal.payload.output;
+  if (output.replace(INVISIBLE_FORMAT_CHARACTERS, '').trim() === '') {
+    const error = new Error('visible HXA reply output is missing');
+    error.code = 'MISSING_OUTPUT';
+    throw error;
+  }
+  return output;
+}
+
+function canonicalEndpointKey(parsed) {
+  return parsed.kind === 'thread'
+    ? `${parsed.orgLabel}\0thread\0${parsed.threadId}`
+    : `${parsed.orgLabel}\0dm\0${parsed.target}`;
+}
+
+function responseIdentity({ requestId, parsed, content }) {
+  const deliveryId = `hxa.response.${sha256(requestId)}`;
+  const identity = {
+    deliveryId,
+    requestId,
+    endpointKey: canonicalEndpointKey(parsed),
+    contentHash: sha256(content),
+  };
+  return { ...identity, identityHash: sha256(JSON.stringify(identity)) };
+}
+
+const RESPONSE_IDENTITY_FIELDS = Object.freeze([
+  'deliveryId',
+  'requestId',
+  'endpointKey',
+  'contentHash',
+]);
+const FINAL_DELIVERY_IDENTITY_FIELDS = Object.freeze([
+  'deliveryId',
+  'intentId',
+  'requestId',
+  'traceId',
+  'idempotencyKey',
+  'disposition',
+  'contentHash',
+  'endpointKey',
+  'targetRef',
+]);
+
+function identityConflict() {
+  const error = new Error('assistant response delivery identity collision');
+  error.code = 'IDEMPOTENCY_CONFLICT';
+  return error;
+}
+
+function canonicalIdentity(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw identityConflict();
+  const fields = Object.hasOwn(record, 'intentId')
+    ? FINAL_DELIVERY_IDENTITY_FIELDS
+    : RESPONSE_IDENTITY_FIELDS;
+  const identity = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(record, field)) throw identityConflict();
+    identity[field] = record[field];
+  }
+  return identity;
+}
+
+function validateIdentity(record, expectedDeliveryId = record?.deliveryId) {
+  const identity = canonicalIdentity(record);
+  if (identity.deliveryId !== expectedDeliveryId) throw identityConflict();
+  if (record.identityHash !== sha256(JSON.stringify(identity))) throw identityConflict();
+  return identity;
+}
+
+function assertSameIdentity(left, right) {
+  if (JSON.stringify(canonicalIdentity(left)) !== JSON.stringify(canonicalIdentity(right))) {
+    throw identityConflict();
+  }
+}
+
+export class AssistantResponseDeliveryStore {
+  constructor({ directory, clock = () => Date.now() }) {
+    this.directory = requireText(directory, 'assistant response delivery directory');
+    this.clock = clock;
+  }
+
+  filePath(deliveryId) {
+    return path.join(this.directory, `${sha256(deliveryId)}.json`);
+  }
+
+  async read(deliveryId) {
+    try {
+      const record = JSON.parse(await fs.promises.readFile(this.filePath(deliveryId), 'utf8'));
+      validateIdentity(record, deliveryId);
+      return record;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async withLock(deliveryId, callback, { timeoutMs = 5_000 } = {}) {
+    await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const lockPath = `${this.filePath(deliveryId)}.lock`;
+    const token = randomUUID();
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      try {
+        const handle = await fs.promises.open(lockPath, 'wx', 0o600);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, token })}\n`);
+        await handle.close();
+        break;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        try {
+          const owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'));
+          if (!processAlive(owner.pid)) {
+            await fs.promises.unlink(lockPath);
+            continue;
+          }
+        } catch (readError) {
+          if (readError.code === 'ENOENT') continue;
+          throw readError;
+        }
+        if (Date.now() >= deadline) {
+          const busy = new Error('assistant response delivery is busy');
+          busy.code = 'HXA_RESPONSE_DELIVERY_BUSY';
+          throw busy;
+        }
+        await sleep(25);
+      }
+    }
+
+    try {
+      return await callback(Object.freeze({ lockToken: token }));
+    } finally {
+      try {
+        const owner = JSON.parse(await fs.promises.readFile(lockPath, 'utf8'));
+        if (owner.token === token) await fs.promises.unlink(lockPath);
+      } catch {
+        // A missing lock is safe; the durable delivery record remains canonical.
+      }
+    }
+  }
+
+  async begin(identity, initial = {}) {
+    await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    validateIdentity(identity);
+    const filePath = this.filePath(identity.deliveryId);
+    try {
+      const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+      validateIdentity(existing, identity.deliveryId);
+      assertSameIdentity(existing, identity);
+      return existing;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    const now = this.clock();
+    const record = {
+      schemaVersion: 1,
+      ...identity,
+      status: 'prepared',
+      attempts: 0,
+      startedAt: now,
+      updatedAt: now,
+      lastError: null,
+      hubMessageId: null,
+      channelId: null,
+      ...initial,
+    };
+    validateIdentity(record, identity.deliveryId);
+    assertSameIdentity(record, identity);
+    const tempPath = `${filePath}.new.${process.pid}.${randomUUID()}`;
+    await fs.promises.writeFile(tempPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    try {
+      await fs.promises.link(tempPath, filePath);
+      return record;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const existing = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+      validateIdentity(existing, identity.deliveryId);
+      assertSameIdentity(existing, identity);
+      return existing;
+    } finally {
+      await fs.promises.unlink(tempPath).catch(() => {});
+    }
+  }
+
+  async update(record, changes, { expectedFence, expectedLeaseToken } = {}) {
+    validateIdentity(record);
+    const current = await this.read(record.deliveryId);
+    if (!current) throw identityConflict();
+    assertSameIdentity(current, record);
+    if (expectedFence !== undefined && (current.fence ?? 0) !== expectedFence) {
+      const error = new Error('assistant response delivery fence lost');
+      error.code = 'HXA_DELIVERY_FENCE_LOST';
+      throw error;
+    }
+    if (expectedLeaseToken !== undefined && current.activeLease?.token !== expectedLeaseToken) {
+      const error = new Error('assistant response delivery lease lost');
+      error.code = 'HXA_DELIVERY_LEASE_LOST';
+      throw error;
+    }
+    const next = { ...current, ...changes, updatedAt: this.clock() };
+    validateIdentity(next, current.deliveryId);
+    assertSameIdentity(current, next);
+    await writeAtomic(this.filePath(record.deliveryId), next);
+    return next;
+  }
+}
+
+function isSelfMessage(message, org) {
+  if (org.agentId) return message?.sender_id === org.agentId;
+  return Boolean(org.agentName && message?.sender_name === org.agentName);
+}
+
+function singleReconcileMatch(messages, predicate) {
+  const matches = messages.filter(predicate);
+  if (matches.length > 1) {
+    const error = new Error('multiple HXA messages match the delivery identity');
+    error.code = 'HXA_RECONCILE_RESULT_AMBIGUOUS';
+    throw error;
+  }
+  return matches[0] || null;
+}
+
+/**
+ * Read the reply window of one DM channel, or of every channel when the
+ * channel is not known yet.
+ *
+ * A channel id is always read through `getMessages(channelId)`, never through
+ * `inbox()`: `inbox(since)` lists the messages that ARRIVED here, so the reply
+ * this process sent is not part of it. The channel listing is also the only
+ * way to look at a channel whose source message is older than the window.
+ */
+async function readDmWindow({ client, channelId, since }) {
+  if (channelId) {
+    const messages = await client.getMessages(channelId, { since });
+    if (!Array.isArray(messages)) {
+      throw new TypeError('Hub channel messages response must be an array');
+    }
+    return messages;
+  }
+  const messages = await client.inbox(since);
+  if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
+  return messages;
+}
+
+/**
+ * How far back the source-message lookup may reach. `startedAt` is the moment
+ * this process started sending, which is normally seconds or minutes AFTER the
+ * inbound DM; the DM channel is immutable, so a wide lookback is safe and keeps
+ * records written before the channel was persisted recoverable.
+ */
+export const DEFAULT_SOURCE_LOOKBACK_MS = 24 * 60 * 60_000;
+
+/**
+ * Resolve the one DM channel the source message belongs to.
+ *
+ * Ambiguity is about the CHANNEL, not about how many messages matched. A
+ * compatibility endpoint without `|msg:<id>` (`org:hxa|peer`) matches every
+ * message from that peer, and a DM channel is immutable — several of those
+ * messages are the same route, so they must resolve to one channel id. Two
+ * DIFFERENT channels for the same identity stay an error: picking one would
+ * risk replying into the wrong conversation.
+ */
+export async function resolveDmSourceChannel({ client, availableSince, target, sourceMessageId }) {
+  const messages = await client.inbox(Math.max(0, availableSince));
+  if (!Array.isArray(messages)) throw new TypeError('Hub inbox response must be an array');
+  const candidates = sourceMessageId
+    ? messages.filter(message => message?.id === sourceMessageId)
+    : messages.filter(message => message?.sender_name === target);
+  const channelIds = [];
+  for (const message of candidates) {
+    if (!message?.channel_id || channelIds.includes(message.channel_id)) continue;
+    channelIds.push(message.channel_id);
+  }
+  if (channelIds.length > 1) {
+    const error = new Error('multiple HXA DM channels match the delivery identity');
+    error.code = 'HXA_RECONCILE_RESULT_AMBIGUOUS';
+    throw error;
+  }
+  if (channelIds.length === 0) {
+    const error = new Error('HXA source-scoped DM channel could not be resolved');
+    error.code = 'HXA_RECONCILE_ROUTE_UNKNOWN';
+    throw error;
+  }
+  return channelIds[0];
+}
+
+async function reconcileDm({
+  client,
+  org,
+  target,
+  sourceMessageId,
+  content,
+  startedAt,
+  channelId,
+  learnedChannel,
+  persistChannelId = async () => {},
+}) {
+  const replySince = Math.max(0, startedAt - 5_000);
+  let resolvedChannelId = channelId || learnedChannel || null;
+  let messages = await readDmWindow({ client, channelId: resolvedChannelId, since: replySince });
+  if (!resolvedChannelId) {
+    // Only a record written before the channel was persisted gets here. Keep
+    // the inbox fallback for exactly that case, but resolve the route from a
+    // window that contains the source message, then read the reply in that one
+    // channel. The DM channel is immutable, so this is still exact.
+    resolvedChannelId = await resolveDmSourceChannel({
+      client,
+      availableSince: Math.max(0, startedAt - DEFAULT_SOURCE_LOOKBACK_MS),
+      target,
+      sourceMessageId,
+    });
+    await persistChannelId(resolvedChannelId);
+    messages = await readDmWindow({ client, channelId: resolvedChannelId, since: replySince });
+  }
+  // Exact channel check: a reply found in any other DM channel is not ours.
+  const expectedChannels = new Set([resolvedChannelId]);
+  return singleReconcileMatch(messages, message => (
+    isSelfMessage(message, org)
+    && message.content === content
+    && Number(message.created_at) >= replySince
+    && expectedChannels.has(message.channel_id)
+  ));
+}
+
+async function reconcileThread({ client, org, threadId, content, startedAt }) {
+  const messages = await client.getThreadMessages(threadId, {
+    since: Math.max(0, startedAt - 5_000),
+  });
+  if (!Array.isArray(messages)) throw new TypeError('Hub thread messages response must be an array');
+  return singleReconcileMatch(messages, message => (
+    isSelfMessage(message, org)
+    && message.content === content
+    && Number(message.created_at) >= startedAt - 5_000
+  ));
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function resolveCompatibleRoute(parsed, client) {
+  if (parsed.kind !== 'dm' || !UUID_RE.test(parsed.target) || typeof client.getThread !== 'function') {
+    return parsed;
+  }
+  try {
+    await client.getThread(parsed.target);
+    return {
+      kind: 'thread',
+      orgLabel: parsed.orgLabel,
+      threadId: parsed.target,
+      replyToId: parsed.sourceMessageId,
+      endpointId: parsed.endpointId,
+    };
+  } catch (error) {
+    if (error?.body?.code === 'NOT_FOUND' || error?.status === 404) return parsed;
+    throw error;
+  }
+}
+
+export async function reconcileHxaResponse({
+  parsed,
+  client,
+  org,
+  content,
+  startedAt,
+  channelId = null,
+  learnedChannel = null,
+  persistChannelId,
+}) {
+  const route = await resolveCompatibleRoute(parsed, client);
+  if (route.kind === 'thread') {
+    return reconcileThread({ client, org, threadId: route.threadId, content, startedAt });
+  }
+  return reconcileDm({
+    client,
+    org,
+    target: route.target,
+    sourceMessageId: route.sourceMessageId,
+    content,
+    startedAt,
+    channelId,
+    learnedChannel,
+    persistChannelId,
+  });
+}
+
+export async function sendHxaResponse({ parsed, client, content }) {
+  const route = await resolveCompatibleRoute(parsed, client);
+  if (route.kind === 'thread') {
+    const options = route.replyToId ? { reply_to: route.replyToId } : undefined;
+    try {
+      return await client.sendThreadMessage(route.threadId, content, options);
+    } catch (error) {
+      if (route.replyToId && (error?.status === 400 || error?.body?.code === 'NOT_FOUND')) {
+        return client.sendThreadMessage(route.threadId, content);
+      }
+      throw error;
+    }
+  }
+  return client.send(route.target, content);
+}
+
+export function createAssistantResponseSender({
+  store,
+  resolveOrg,
+  defaultOrgLabel = 'default',
+  logger = console,
+} = {}) {
+  if (!(store instanceof AssistantResponseDeliveryStore)) {
+    throw new TypeError('assistant response delivery store is required');
+  }
+  if (typeof resolveOrg !== 'function') {
+    throw new TypeError('assistant response org resolver is required');
+  }
+
+  return Object.freeze({
+    async send({ requestId, endpointId, content, suppressSkip = false } = {}) {
+      const safeRequestId = requireText(requestId, 'HXA assistant response requestId');
+      const safeEndpointId = requireText(endpointId, 'HXA assistant response endpointId');
+      const safeContent = requireText(content, 'HXA assistant response content');
+      const parsed = parseHxaResponseEndpoint(safeEndpointId, defaultOrgLabel);
+      const identity = responseIdentity({
+        requestId: safeRequestId,
+        parsed,
+        content: safeContent,
+      });
+      return store.withLock(identity.deliveryId, async () => {
+        let record = await store.begin(identity);
+        if (record.status === 'delivered' || record.status === 'suppressed') {
+          // Carry the recorded Hub message id on the ordinary completed replay
+          // too, so the caller can emit the same C4 receipt it would have
+          // emitted on the first attempt (it missed the first one's stdout).
+          return {
+            handled: true,
+            replayed: true,
+            status: record.status,
+            hubMessageId: record.hubMessageId,
+          };
+        }
+
+        if (suppressSkip && /^\s*\[SKIP\]\s*$/i.test(safeContent)) {
+          record = await store.update(record, { status: 'suppressed', lastError: null });
+          return { handled: true, replayed: false, status: record.status };
+        }
+
+        const org = requireRecord(await resolveOrg(parsed.orgLabel), 'HXA response org');
+        const client = requireRecord(org.client, 'HXA response client');
+        // The DM channel is fixed by the source message and never changes, so
+        // it is learned once — before the first send — and persisted with the
+        // delivery record. A retry therefore reconciles against that exact
+        // channel instead of searching an inbox window for the source message.
+        const learnSourceChannel = async () => {
+          if (parsed.kind !== 'dm' || !parsed.sourceMessageId) return;
+          const channelId = await resolveDmSourceChannel({
+            client,
+            availableSince: Math.max(0, record.startedAt - DEFAULT_SOURCE_LOOKBACK_MS),
+            target: parsed.target,
+            sourceMessageId: parsed.sourceMessageId,
+          });
+          record = await store.update(record, { channelId });
+        };
+        if (!record.channelId) {
+          // Best effort: a source message outside the lookback window must not
+          // block a send that would otherwise succeed. The reconcile path keeps
+          // its own lookup for that case.
+          try {
+            await learnSourceChannel();
+          } catch (error) {
+            logger.warn?.(`[hxa-connect] Could not learn the DM channel for ${record.deliveryId}: ${error?.code || error?.message || error}`);
+          }
+        }
+
+        if (record.attempts > 0) {
+          const existing = await reconcileHxaResponse({
+            parsed,
+            client,
+            org,
+            content: safeContent,
+            startedAt: record.startedAt,
+            channelId: record.channelId,
+            persistChannelId: async channelId => {
+              record = await store.update(record, { channelId });
+            },
+          });
+          if (existing) {
+            const receipt = normalizeHxaTransportReceipt(existing);
+            record = await store.update(record, {
+              status: 'delivered',
+              lastError: null,
+              ...receipt,
+            });
+            logger.warn?.(`[hxa-connect] Reconciled ambiguous assistant response ${record.deliveryId}`);
+            return {
+              handled: true,
+              replayed: true,
+              status: record.status,
+              hubMessageId: record.hubMessageId,
+            };
+          }
+        }
+
+        record = await store.update(record, {
+          status: 'sending',
+          attempts: record.attempts + 1,
+          lastError: null,
+        });
+        try {
+          const receipt = normalizeHxaTransportReceipt(await sendHxaResponse({
+            parsed,
+            client,
+            content: safeContent,
+          }));
+          record = await store.update(record, {
+            status: 'delivered',
+            lastError: null,
+            ...receipt,
+          });
+        } catch (error) {
+          await store.update(record, {
+            status: 'uncertain',
+            lastError: String(error?.message || error).slice(0, 500),
+          });
+          throw error;
+        }
+        return {
+          handled: true,
+          replayed: false,
+          status: record.status,
+          hubMessageId: record.hubMessageId,
+        };
+      });
+    },
+  });
+}
+
+export function createAssistantResponseDelivery(options = {}) {
+  const sender = createAssistantResponseSender(options);
+  const logger = options.logger || console;
+  return Object.freeze({
+    async deliver(input) {
+      const { requestId, route, terminal } = terminalFromDelivery(input);
+      if (!terminal) return { handled: true, terminal: false };
+      if (terminal.type === 'RunFailed') {
+        const code = typeof terminal.payload.code === 'string' ? terminal.payload.code : null;
+        const failure = Object.freeze({ code, retryable: terminal.payload.retryable });
+        logger.warn?.('[hxa-connect] Suppressed outbound RunFailed terminal', {
+          requestId,
+          ...failure,
+        });
+        return {
+          handled: true,
+          terminal: true,
+          status: 'suppressed',
+          eventType: 'RunFailed',
+          failure,
+        };
+      }
+      const result = await sender.send({
+        requestId,
+        endpointId: route.endpointId,
+        content: publicCompletedContent(terminal),
+        suppressSkip: true,
+      });
+      return { ...result, terminal: true, eventType: 'RunCompleted' };
+    },
+  });
+}
+
+export const FINAL_DELIVERY_MODES = Object.freeze(['off', 'legacy', 'canonical']);
+
+/**
+ * Resolves the terminal auto-delivery mode. 'off' (the default) never sends
+ * assistant terminal events to the Hub: the stream adapter consumes the
+ * events and exits successfully so the supervisor acknowledges them and core
+ * records the terminal request state, while every outbound message must come
+ * from an explicit `c4-send --request-id` invocation. 'canonical' and
+ * 'legacy' restore automatic delivery from terminal events.
+ */
+export function resolveFinalDeliveryMode(env = process.env) {
+  const raw = env.HXA_FINAL_DELIVERY_MODE;
+  return FINAL_DELIVERY_MODES.includes(raw) ? raw : 'off';
+}

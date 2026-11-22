@@ -1,6 +1,88 @@
 # Changelog
 
+## [1.7.10-3ai.1] - 2026-11-22
+
+### Fixed
+- **DM replies no longer wedge after a first send failure, and the stream entry
+  obeys the outbound org guard.** Three review rounds on PR #46 closed the same
+  two holes from different sides:
+  - the DM reply channel is learned before the first send and persisted, so a
+    retry reconciles in that exact channel instead of searching an inbox window
+    for a source message that may be older than the send;
+  - channel ambiguity is judged per channel id, so the compatibility endpoint
+    `org:<label>|<peer>` (no `|msg:<id>`) resolves several arrivals in one DM
+    channel to one route;
+  - `scripts/stream.js` applies the same outbound guard as `scripts/send.js`
+    (`internal_labels` + a confirmation from this invocation only), and a
+    refused org fails hard on every entry — fresh send, replay of a historical
+    receipt, and reconcile — with `HXA_OUTBOUND_GUARD_BLOCKED`, exit 1 and
+    `ok:false` on stdout, never `ok:true`.
+
+  A genuine routing failure still reports `rejected / HXA_ROUTE_MISMATCH`.
+
 ## [Unreleased]
+
+### Merged from upstream (v1.7.4 – v1.7.10, 32 commits)
+
+The fork's 3ai patches and the upstream `zylos-hxa-connect` line were developed
+in parallel after v1.7.3: upstream released 1.7.4 – 1.7.10, the fork released
+1.7.11 – 1.7.14-3ai. This entry records how the two were reconciled.
+
+Most of the conflict surface was one architectural difference. Upstream routes
+every inbound message into a durable, idempotent C4 pipeline: a disk-backed
+spool (`c4-delivery-queue`), authoritative periodic DM-inbox reconciliation
+(`dm-inbox-reconciler`), a signed DM-policy rejection notifier
+(`dm-policy-rejection`), and stable C4 request identities so a replay cannot
+open a second turn. The fork answers the same "we lost a message" problem from
+the other side, by watermarking and replaying the hub event log
+(`catchup`, `catchup-state`, `delivery`).
+
+Both were kept. The fork's catch-up path stays the replay authority, and every
+delivery it makes — live or replayed — now goes through upstream's durable C4
+queue instead of the old in-process `execFile` + retry. Practically:
+
+- `sendToC4Awaited()` (the fork's "the watermark may only move once C4
+  accepted it" primitive) is now a thin awaited wrapper over
+  `c4Queue.enqueue()`. It still throws on failure, so a replay stays queued;
+  the queue adds restart safety and de-duplication on top.
+- DM policy is decided once, by upstream's `createDmPolicyGate` (which also
+  sends the signed rejection notice). The fork's `decideDmDelivery()` keeps the
+  self-echo and rate-limit decisions and takes the policy answer from the
+  gate's verdict, so live and replayed DMs cannot diverge.
+- Realtime DMs are observed by `DmInboxReconciler.observeLive()` and reconciled
+  by its periodic `inbox()` poll; the catch-up runner still covers gaps that
+  span a restart. Message ids are de-duplicated by the catch-up state store and
+  again by the inbox state store, so neither path delivers a message twice.
+- Threads keep the fork's single `deliverThread()` pipeline (catch-up and
+  realtime share it) and only take upstream's C4 identity + durable spool.
+
+### Upstream-only additions taken as-is
+- Org-scoped `profile-verify` CLI command (#7, 1.7.7) that binds identity
+  evidence to the configured org id/name and the exact runtime hostname.
+- `RunFailed` terminal events are acknowledged locally instead of being
+  delivered to peers as chat (#3, 1.7.6).
+- Silent assistant responses stay side-effect free on every outbound route
+  (#14, 1.7.8).
+- `HXA_FINAL_DELIVERY_MODE` defaults to `off` (1.7.10): terminal auto-delivery
+  is off unless a host opts into `canonical` or `legacy`.
+- `ZYLOS_DIR`-aware runtime paths (`config-path`), also adopted by
+  `ecosystem.config.cjs` and the install/upgrade hooks.
+- `undici` `^7.29.0`, `ws` `^8.21.3` (1.7.4 security update).
+
+### Fork patches preserved
+- `fix(send)`: opt-in outbound org guard for non-internal orgs (#41) —
+  including the env-file confirmation rule and the NUL-truncated env-key fix.
+- `fix(log)`: credential redaction (#44/#45) — extended to every error log the
+  merge brought in.
+- Catch-up on reconnect (#38) and its `catchup-state` / `catchup-pull` CLI.
+
+### Not merged
+- PR #42 (`fix/thread-mention-by-id`: count a hub mention by `bot_id`, not only
+  by `@agent_name` text) is a separate open fork PR and is **not** part of this
+  merge. Upstream 1.7.4 – 1.7.10 does not change the thread mention check, so
+  the fork's `mentionRe` / `extractText()` behaviour is unchanged here and the
+  patch still applies on top of this branch. Merging #42 here would mix two
+  unrelated reviews; it should land on `main` on its own.
 
 ## [1.7.14-3ai] - 2026-11-20
 
@@ -62,6 +144,100 @@
 - **CLI** — `catchup-state` prints the local watermark/gap flag; `catchup-pull`
   prints everything missed since the watermark as JSON (`--limit N`), read-only
   and without touching the running bot's state.
+
+## [1.7.10] - 2026-09-04
+
+### Changed
+- Assistant terminal auto-delivery is now disabled by default
+  (`HXA_FINAL_DELIVERY_MODE=off`): the stream adapter consumes terminal
+  events, exits successfully so core records the request state, and never
+  initializes a Hub transport — outbound assistant replies must go through
+  explicit `c4-send --request-id`. Set the mode to `canonical` or `legacy`
+  to restore automatic delivery.
+- Skip the startup delivery-staleness self-check while auto-delivery is
+  disabled, since a quiet delivery ledger is expected in that mode.
+
+## [1.7.9] - 2026-09-02
+
+### Added
+- Add a terminal-only final delivery adapter for assistant terminal events.
+- Preserve explicit `silent` and `[SKIP]` compatibility across delivery paths.
+
+### Fixed
+- Enforce an empty/invisible output boundary so non-deliverable responses do
+  not create outbound side effects.
+- Persist durable delivery identity, fence stale owners, and reconcile
+  ambiguous delivery outcomes safely.
+- Return actionable DM policy rejection feedback and harden recovery after
+  lock-owner death.
+
+### Verification
+- Converge main CI, `npm test`, and high-severity `npm audit` coverage for the
+  release path.
+
+## [1.7.8] - 2026-08-30
+
+### Fixed
+- Keep exact silent assistant responses side-effect free across every outbound
+  route, without transport or response-log writes.
+
+## [1.7.7] - 2026-08-29
+
+### Added
+- Add an org-scoped `profile-verify` command that binds release identity
+  evidence to the explicit org label and configured org ID/Agent name, plus
+  the expected profile ID, exact runtime hostname, and observation time. The
+  verification path is read-only and never merges, replaces, or migrates
+  profiles from any other org.
+
+### Fixed
+- Serialize overlapping C4 spool drain scans so one durable delivery cannot be
+  invoked multiple times when enqueue and drain scheduling race under load.
+
+## [1.7.6] - 2026-08-28
+
+### Fixed
+- `RunFailed` assistant terminal events are now acknowledged and reported
+  locally instead of being delivered to peers as ordinary chat messages. This
+  prevents stale-run placeholders from consuming peer turns or creating
+  bot-to-bot reply storms while preserving the failure code and retryability
+  for local diagnostics (#3).
+
+## [1.7.5] - 2026-08-27
+
+### Added
+- A native C4 assistant response-stream adapter for HXA DMs and threads. Runtime
+  terminal events now produce the actual Hub reply instead of closing the
+  assistant request without an outbound message.
+- A persistent terminal-delivery ledger. Core replays are idempotent, and an
+  ambiguous Hub transport result is reconciled against the authoritative inbox
+  or thread before any resend.
+
+### Fixed
+- DM response routes now retain the triggering Hub message ID, allowing
+  ambiguous delivery reconciliation to prove the exact direct channel instead
+  of matching only on bot name and text.
+
+## [1.7.4] - 2026-08-27
+
+### Added
+- Periodic authoritative DM inbox reconciliation with a persistent checkpoint,
+  overlap window, and message-ID deduplication. A DM missed by an otherwise
+  healthy WebSocket is recovered without waiting for a reconnect.
+- A bounded disk-backed C4 delivery spool. Accepted Hub events survive PM2
+  restarts and C4 outages, and retry with backoff instead of being dropped at
+  the old subprocess concurrency cap.
+
+### Fixed
+- DM rate-limit pressure now defers intake to inbox reconciliation instead of
+  permanently dropping the message. Every self, policy, size, and rate-limit
+  decision includes the Hub message ID and source in logs.
+- On compatible Core versions, HXA message IDs derive stable assistant request
+  and source IDs so overlap polls and crash replays cannot create a second turn.
+
+### Security
+- Update `undici` to `^7.29.0` and `ws` to `^8.21.3`; production dependency
+  audit reports zero known vulnerabilities.
 
 ## [1.7.3] - 2026-05-18
 

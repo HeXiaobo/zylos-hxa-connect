@@ -11,11 +11,9 @@
  */
 
 import fs from 'node:fs';
-import path from 'node:path';
+import { getConfigPath } from '../src/lib/config-path.js';
 
-const HOME = process.env.HOME;
-const DATA_DIR = path.join(HOME, 'zylos/components/hxa-connect');
-const configPath = path.join(DATA_DIR, 'config.json');
+const configPath = getConfigPath();
 
 console.log('[pre-upgrade] Running hxa-connect pre-upgrade checks...\n');
 

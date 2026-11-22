@@ -4,67 +4,30 @@
  */
 
 import fs from 'fs';
-import path from 'path';
-
-const HOME = process.env.HOME;
-const CONFIG_PATH = path.join(HOME, 'zylos/components/hxa-connect/config.json');
-const ENV_PATH = path.join(HOME, 'zylos/.env');
+import { getConfigPath, loadZylosEnv } from './lib/config-path.js';
 
 const LABEL_RE = /^[a-z0-9][a-z0-9-]*$/;
 const ACCESS_KEYS = ['dmPolicy', 'dmAllowFrom', 'groupPolicy', 'threads'];
 
-// Load .env into process.env (don't override existing vars)
-//
-// Keys filled in from this file are recorded, because a value that sits in
-// ~/zylos/.env is ambient configuration, not a per-send decision. The outbound
-// guard uses this to refuse a confirmation that came from the file.
-//
-// The key is normalised the way Node normalises it when assigning to
-// process.env (a NUL ends the name). Recording the raw slice instead would let
-// a line like "HXA_CONFIRM_ORG\0junk=customer-org" set the real variable while
-// the provenance Set held a different string — the value would then look like
-// it came from the caller.
-const NUL_RE = /\0/;
-const envFileKeys = new Set();
-if (fs.existsSync(ENV_PATH)) {
-  for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = normaliseEnvKey(trimmed.slice(0, eqIdx));
-    const val = trimmed.slice(eqIdx + 1);
-    if (!key) continue;
-    if (!process.env[key]) {
-      process.env[key] = val;
-      envFileKeys.add(key);
-    }
-  }
-}
+// Load .env before resolving proxy/config values (don't override process env).
+// The loader records which keys it filled in, so scripts/send.js can tell a
+// caller-supplied value from one that was sitting in the .env file.
+loadZylosEnv();
 
-/**
- * The key process.env will actually hold for a name read off disk.
- * Node truncates env names at NUL; we do the same so the Set and the
- * assignment can never disagree.
- */
-function normaliseEnvKey(key) {
-  const nul = key.search(NUL_RE);
-  return nul === -1 ? key : key.slice(0, nul);
-}
+export { cameFromEnvFile } from './lib/config-path.js';
 
-/** True when `key` was populated from ~/zylos/.env rather than the caller's env. */
-export function cameFromEnvFile(key) {
-  return envFileKeys.has(key);
-}
-
-export const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+export const PROXY_URL = process.env.HXA_CONNECT_PROXY
+  || process.env.HTTPS_PROXY
+  || process.env.HTTP_PROXY
+  || '';
 
 export function loadConfig() {
+  const configPath = getConfigPath();
   let raw;
   try {
-    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    raw = fs.readFileSync(configPath, 'utf8');
   } catch (err) {
-    console.error(`[hxa-connect] Cannot read config at ${CONFIG_PATH}: ${err.message}`);
+    console.error(`[hxa-connect] Cannot read config at ${configPath}: ${err.message}`);
     process.exit(1);
   }
   try {
@@ -87,6 +50,7 @@ function atomicWrite(filePath, data) {
  * 2. Global access → per-org access (top-level dmPolicy etc. → orgs.*.access)
  */
 export function migrateConfig() {
+  const configPath = getConfigPath();
   const config = loadConfig();
   let changed = false;
 
@@ -98,7 +62,7 @@ export function migrateConfig() {
 
     console.log('[hxa-connect] Migrating config from single-org to multi-org format');
 
-    const backupPath = CONFIG_PATH + '.bak';
+    const backupPath = configPath + '.bak';
     if (!fs.existsSync(backupPath)) {
       fs.writeFileSync(backupPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
       console.log(`[hxa-connect] Backup written to ${backupPath}`);
@@ -210,7 +174,7 @@ export function migrateConfig() {
   }
 
   if (changed) {
-    atomicWrite(CONFIG_PATH, config);
+    atomicWrite(configPath, config);
     console.log('[hxa-connect] Config migrated successfully');
   }
 
