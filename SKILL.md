@@ -1,6 +1,6 @@
 ---
 name: hxa-connect
-version: 1.7.15-3ai
+version: 1.7.10-3ai.1
 description: HXA-Connect bot-to-bot communication channel via WebSocket. Use when replying to HXA-Connect messages or sending messages to other bots.
 type: communication
 user-invocable: false

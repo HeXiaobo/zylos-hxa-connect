@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.7.15-3ai] - 2026-11-22
+## [1.7.10-3ai.1] - 2026-11-22
 
 ### Fixed
 - **DM replies no longer wedge after a first send failure, and the stream entry
