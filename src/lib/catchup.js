@@ -99,6 +99,7 @@ export class DeliveryGate {
     this.state = state;
     this.label = label;
     this.inFlight = new Set();
+    this._reserved = new Set();
     this._pendingAdvanceAt = 0;
     this._catchupRuns = 0;
   }
@@ -133,8 +134,36 @@ export class DeliveryGate {
     if (id) this.inFlight.add(id);
   }
 
+  /**
+   * Pre-register a live message id into `inFlight` before async SDK preparation
+   * (e.g., ThreadContext.triggerDelivery() awaiting getThread()). Prevents a
+   * concurrently completed newer message from advancing `eventsSince` past this
+   * message while it has not yet reached the delivery handler.
+   *
+   * Returns true if this call newly reserved the id, false if already seen.
+   */
+  reserve(id) {
+    if (!id || this.isSeen(id)) return false;
+    this.inFlight.add(id);
+    this._reserved.add(id);
+    return true;
+  }
+
+  /**
+   * Claim ownership of a pre-registered `inFlight` reservation inside the
+   * delivery callback so it is not misclassified as a duplicate by `isSeen()`.
+   */
+  claim(id) {
+    if (!id || !this._reserved.has(id)) return false;
+    this._reserved.delete(id);
+    return true;
+  }
+
   clear(id) {
-    if (id) this.inFlight.delete(id);
+    if (id) {
+      this.inFlight.delete(id);
+      this._reserved.delete(id);
+    }
     // An in-flight delivery ended without settling (failure or skip): drop any
     // buffered advance watermark so a concurrently completed newer message
     // cannot move `eventsSince` past this unsettled message.
@@ -155,6 +184,7 @@ export class DeliveryGate {
   mark(id, at, { kind, targetId, advanceCursor = !(kind && targetId) } = {}) {
     if (!id) return;
     this.inFlight.delete(id);
+    this._reserved.delete(id);
     this.state.remember(this.label, id, at);
     if (kind && targetId) this.state.addTargetId(this.label, kind, targetId, id, at);
     const ts = Number(at);
@@ -187,6 +217,7 @@ export class DeliveryGate {
   markSuppressed(id, at, { kind, targetId, reason = 'stale_cutoff', recordedAt } = {}) {
     if (!id) return;
     this.inFlight.delete(id);
+    this._reserved.delete(id);
     this.state.rememberSuppressed(this.label, id, { at, reason, recordedAt });
     if (kind && targetId) this.state.addTargetId(this.label, kind, targetId, id, at);
   }
@@ -415,7 +446,7 @@ export class CatchupRunner {
     const startedAt = this.now();
     // If a new gap appears while we work, we must not close it at the end.
     const epochAtStart = this.state.getGapEpoch(this.label);
-    const cutoffAt = Number.isFinite(this.maxAgeMs) ? (this.processStartedAt - this.maxAgeMs) : -Infinity;
+    const cutoffAt = Number.isFinite(this.maxAgeMs) ? (startedAt - this.maxAgeMs) : -Infinity;
 
     const eventsSince = this.state.getEventsSince(this.label);
     if (!eventsSince) {
@@ -431,7 +462,7 @@ export class CatchupRunner {
     }
 
     if (Number.isFinite(cutoffAt) && eventsSince < cutoffAt) {
-      // Gate 2 (stale cursor): cursor predates (processStartedAt - maxAgeMs) —
+      // Gate 2 (stale cursor): cursor predates (startedAt - maxAgeMs) —
       // advance directly to now and drop stale scan windows without replaying.
       this.state.setEventsSince(this.label, startedAt);
       this.state.setEventCursor(this.label, null);
@@ -719,7 +750,7 @@ export class CatchupRunner {
 
   /**
    * Gate 1 + cursor boundary check for one candidate catch-up message.
-   * Messages older than `(processStartedAt - maxAgeMs)` or strictly before
+   * Messages older than `(startedAt - maxAgeMs)` or strictly before
    * `eventsSince` are persisted as `not_delivered` and never enter C4/Agent.
    */
   _gateMessage(m, { kind, id, at, eventsSince, cutoffAt, counters, staleStats }) {

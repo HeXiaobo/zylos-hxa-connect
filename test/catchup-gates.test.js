@@ -2,18 +2,21 @@
  * Tests for the 2026-11-26 catch-up fixes on the 1.7.14-3ai line (Issue #50):
  *   1. Online live delivery advances `eventsSince` when clean (and holds back during gaps / in-flight).
  *   2. Dedup-bucket expiry never causes replay; new targets scan from cursor (never [1, hi]).
- *   3. Restart dual gates (`HXA_CATCHUP_MAX_AGE_MIN`, default 30m):
- *      - Gate 1 (message): only deliver messages >= max(eventsSince, processStartedAt - N min);
+ *   3. Rolling dual gates (`HXA_CATCHUP_MAX_AGE_MIN`, default 30m from catch-up run start):
+ *      - Gate 1 (message): only deliver messages >= max(eventsSince, runStartedAt - N min);
  *        older messages are persisted as `not_delivered` (distinguishable from `delivered`) and never enter C4/Agent.
  *      - Gate 2 (cursor): missing or stale cursor advances directly to `now` without replaying history.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 
+import { ThreadContext } from '@coco-xyz/hxa-connect-sdk';
 import {
   CatchupRunner,
   DeliveryGate,
@@ -22,6 +25,17 @@ import {
 } from '../src/lib/catchup.js';
 import { CatchupStateStore } from '../src/lib/catchup-state.js';
 import { settleLiveDelivery, DELIVERED, REJECT, SKIP } from '../src/lib/delivery.js';
+
+const ROOT = path.resolve(import.meta.dirname, '..');
+const BOT_SOURCE = fs.readFileSync(path.join(ROOT, 'src/bot.js'), 'utf8');
+
+function extractBotBlock(needle) {
+  const start = BOT_SOURCE.indexOf(needle);
+  assert.notEqual(start, -1, `src/bot.js missing expected handler: ${needle}`);
+  const end = BOT_SOURCE.indexOf('\n  });', start);
+  assert.notEqual(end, -1, `src/bot.js missing handler terminator for: ${needle}`);
+  return BOT_SOURCE.slice(start, end + 5);
+}
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -535,5 +549,489 @@ describe('3. restart dual gates (Gate 1 message cutoff + Gate 2 cursor cutoff)',
     assert.equal(resolveCatchupMaxAgeMs({ HXA_CATCHUP_MAX_AGE_MIN: '-5' }, m => logs.push(m)), 30 * MIN);
     assert.equal(resolveCatchupMaxAgeMs({ HXA_CATCHUP_MAX_AGE_MIN: 'not-a-num' }, m => logs.push(m)), 30 * MIN);
     assert.equal(logs.length, 2, 'invalid values must emit warning logs');
+  });
+});
+
+// ─── 4 · Round-1 review regressions (P1/R1 & P1/R2) ─────────────
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function wireRealBotHandlers({
+  client,
+  threadCtx,
+  gate,
+  state,
+  label = 'org-2',
+  org = { agentId: 'bot-self', agentName: 'adai', access: { groupPolicy: 'open' } },
+  deliverDm,
+  deliverThread,
+}) {
+  const isSelf = (id, metadata) => {
+    if (!org.agentId || id !== org.agentId) return false;
+    const meta = typeof metadata === 'string'
+      ? (() => { try { return JSON.parse(metadata); } catch { return null; } })()
+      : metadata;
+    if (meta?.provenance?.authored_by === 'human') return false;
+    return true;
+  };
+  const dmCode = extractBotBlock("client.on('message', async (msg) => {");
+  const mentionCode = extractBotBlock('threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {');
+  const rawThreadCode = extractBotBlock("client.on('thread_message', (msg) => {");
+
+  const ctx = vm.createContext({
+    client,
+    threadCtx,
+    gate,
+    catchupState: state,
+    label,
+    org,
+    isSelf,
+    lp: `[hxa-connect:${label}]`,
+    deliverDm,
+    deliverThread,
+    settleLiveDelivery,
+    redactSecrets: s => String(s),
+    console: { log() {}, warn() {}, error() {} },
+  });
+  // Register in the exact same order as src/bot.js (before threadCtx.start()).
+  vm.runInContext(`${dmCode}\n${mentionCode}\n${rawThreadCode}`, ctx);
+}
+
+describe('4. round-1 review P1/R1 — thread pre-flight inFlight guard during SDK getThread() await', () => {
+  it('holds eventsSince during SDK ThreadContext cache-miss getThread() await so a failed thread is recovered on catch-up', async () => {
+    const filePath = tmpFile('hxa-r1-fail-');
+    const state = new CatchupStateStore({ filePath }).load();
+    const T = BASE_NOW - 5 * MIN;
+    state.setEventsSince('org-2', T);
+    state.save();
+    assert.equal(state.isDirty('org-2'), false);
+
+    const gate = new DeliveryGate({ state, label: 'org-2' });
+    const getThreadGate = createDeferred();
+    const threadAttemptDone = createDeferred();
+    const dmDone = createDeferred();
+
+    const emitter = new EventEmitter();
+    const client = {
+      on: (ev, fn) => emitter.on(ev, fn),
+      off: (ev, fn) => emitter.off(ev, fn),
+      async getThread(threadId) {
+        return getThreadGate.promise;
+      },
+      async catchup({ since }) {
+        const events = [
+          { type: 'thread_message_summary', thread_id: 'thread-1', occurred_at: T + 1_000 },
+          { type: 'channel_message_summary', channel_id: 'dm-1', occurred_at: T + 5_000 },
+        ];
+        return { events: events.filter(e => e.occurred_at > since), has_more: false };
+      },
+      async getThreadMessages(id, opts) {
+        if (id !== 'thread-1') return [];
+        const all = [{
+          id: 't-old',
+          thread_id: 'thread-1',
+          sender_id: 'peer-1',
+          sender_name: 'peer-1',
+          content: '@adai please handle',
+          parts: [],
+          created_at: T + 1_000,
+        }];
+        return all.filter(m => m.created_at > (opts.since ?? -Infinity) && m.created_at < (opts.before ?? Infinity));
+      },
+      async getMessages(id, opts) {
+        if (id !== 'dm-1') return [];
+        const all = [mkMsg('dm-new', T + 5_000, 'dm-1')];
+        return all.filter(m => m.created_at > (opts.since ?? -Infinity) && m.created_at < (opts.before ?? Infinity));
+      },
+    };
+
+    const threadCtx = new ThreadContext(client, {
+      botNames: ['adai'],
+      botId: 'bot-self',
+      triggerPatterns: [/^/],
+    });
+
+    const liveThreadAttempts = [];
+    wireRealBotHandlers({
+      client,
+      threadCtx,
+      gate,
+      state,
+      deliverDm: async () => {
+        setTimeout(() => dmDone.resolve(), 0);
+        return DELIVERED;
+      },
+      deliverThread: async ({ message }) => {
+        liveThreadAttempts.push(message.id);
+        setTimeout(() => threadAttemptDone.resolve(), 0);
+        throw new Error('transient C4 failure');
+      },
+    });
+    await threadCtx.start();
+
+    // 1. Thread message arrives on an uncached thread: SDK awaits getThread().
+    emitter.emit('thread_message', {
+      type: 'thread_message',
+      thread_id: 'thread-1',
+      message: {
+        id: 't-old',
+        thread_id: 'thread-1',
+        sender_id: 'peer-1',
+        sender_name: 'peer-1',
+        content: '@adai please handle',
+        parts: [],
+        created_at: T + 1_000,
+      },
+    });
+
+    // 2. Newer DM arrives and completes while getThread('thread-1') is still pending.
+    emitter.emit('message', {
+      type: 'message',
+      sender_name: 'peer-2',
+      message: mkMsg('dm-new', T + 5_000, 'dm-1'),
+    });
+    await dmDone.promise;
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.equal(state.hasSeen('org-2', 'dm-new'), true, 'newer DM must be recorded delivered');
+    assert.equal(
+      state.getEventsSince('org-2'),
+      T,
+      'eventsSince must NOT jump past an older thread message awaiting SDK getThread()',
+    );
+
+    // 3. getThread() resolves, onMention runs, and C4 delivery fails.
+    getThreadGate.resolve({ id: 'thread-1', topic: 'urgent', participants: [] });
+    await threadAttemptDone.promise;
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.deepEqual(liveThreadAttempts, ['t-old']);
+    assert.equal(state.isDirty('org-2'), true, 'failed thread delivery must open a gap');
+    assert.equal(state.getEventsSince('org-2'), T, 'eventsSince must remain at T after thread failure');
+    assert.equal(gate.inFlight.size, 0, 'failed thread must not leak inFlight');
+
+    // 4. Catch-up recovers the failed thread message and skips the already-delivered DM.
+    const replayed = [];
+    const runner = new CatchupRunner({
+      client,
+      state,
+      gate,
+      label: 'org-2',
+      now: () => BASE_NOW,
+      limits: { batchDelayMs: 0 },
+      log: () => {},
+      deliverMessage: async ({ kind, message }) => replayed.push(`${kind}:${message.id}`),
+    });
+    await runner.run('reconnected');
+    runner.dispose();
+    threadCtx.stop();
+
+    assert.deepEqual(replayed, ['thread:t-old'], 'catch-up must recover t-old and skip dm-new');
+    assert.equal(state.isDirty('org-2'), false);
+  });
+
+  it('recovers an uncached thread message if the process exits/restarts while SDK getThread() is pending', async () => {
+    const filePath = tmpFile('hxa-r1-restart-');
+    const state = new CatchupStateStore({ filePath }).load();
+    const T = BASE_NOW - 5 * MIN;
+    state.setEventsSince('org-2', T);
+    state.save();
+
+    const gate = new DeliveryGate({ state, label: 'org-2' });
+    const neverResolves = createDeferred();
+    const dmDone = createDeferred();
+
+    const emitter = new EventEmitter();
+    const client = {
+      on: (ev, fn) => emitter.on(ev, fn),
+      off: (ev, fn) => emitter.off(ev, fn),
+      async getThread() { return neverResolves.promise; },
+    };
+    const threadCtx = new ThreadContext(client, {
+      botNames: ['adai'],
+      botId: 'bot-self',
+      triggerPatterns: [/^/],
+    });
+    wireRealBotHandlers({
+      client,
+      threadCtx,
+      gate,
+      state,
+      deliverDm: async () => {
+        setTimeout(() => dmDone.resolve(), 0);
+        return DELIVERED;
+      },
+      deliverThread: async () => DELIVERED,
+    });
+    await threadCtx.start();
+
+    // Thread arrives (stuck awaiting getThread), newer DM arrives & finishes & flushes to disk.
+    emitter.emit('thread_message', {
+      type: 'thread_message',
+      thread_id: 'thread-1',
+      message: {
+        id: 't-crash',
+        thread_id: 'thread-1',
+        sender_id: 'peer-1',
+        sender_name: 'peer-1',
+        content: '@adai before crash',
+        parts: [],
+        created_at: T + 1_000,
+      },
+    });
+    emitter.emit('message', {
+      type: 'message',
+      sender_name: 'peer-2',
+      message: mkMsg('dm-before-crash', T + 5_000, 'dm-1'),
+    });
+    await dmDone.promise;
+    await new Promise(r => setTimeout(r, 10));
+    state.flush();
+    threadCtx.stop();
+
+    // Simulate process restart: reload state from disk and markGap as bot.js does on boot.
+    const restarted = new CatchupStateStore({ filePath }).load();
+    assert.equal(restarted.getEventsSince('org-2'), T, 'flushed disk cursor must remain at T');
+    assert.equal(restarted.hasSeen('org-2', 'dm-before-crash'), true);
+    restarted.markGap('org-2');
+
+    const hub = fakeHub({
+      channels: { 'dm-1': [mkMsg('dm-before-crash', T + 5_000, 'dm-1')] },
+      threads: {
+        'thread-1': [{
+          id: 't-crash',
+          thread_id: 'thread-1',
+          sender_id: 'peer-1',
+          sender_name: 'peer-1',
+          content: '@adai before crash',
+          parts: [],
+          created_at: T + 1_000,
+        }],
+      },
+      events: [
+        { type: 'thread_message_summary', thread_id: 'thread-1', occurred_at: T + 1_000 },
+        { type: 'channel_message_summary', channel_id: 'dm-1', occurred_at: T + 5_000 },
+      ],
+    });
+    const replayed = [];
+    const runner = new CatchupRunner({
+      client: hub,
+      state: restarted,
+      label: 'org-2',
+      now: () => BASE_NOW,
+      limits: { batchDelayMs: 0 },
+      log: () => {},
+      deliverMessage: async ({ kind, message }) => replayed.push(`${kind}:${message.id}`),
+    });
+    await runner.run('connected');
+    runner.dispose();
+
+    assert.deepEqual(replayed, ['thread:t-crash']);
+  });
+
+  it('advances eventsSince cleanly once thread succeeds, deduplicates duplicate WS frames, and never leaks inFlight on disabled/skip', async () => {
+    const filePath = tmpFile('hxa-r1-clean-');
+    const state = new CatchupStateStore({ filePath }).load();
+    const T = BASE_NOW - 5 * MIN;
+    state.setEventsSince('org-2', T);
+    const gate = new DeliveryGate({ state, label: 'org-2' });
+
+    const getThreadGate = createDeferred();
+    const threadDone = createDeferred();
+    const dmDone = createDeferred();
+    const emitter = new EventEmitter();
+    const client = {
+      on: (ev, fn) => emitter.on(ev, fn),
+      off: (ev, fn) => emitter.off(ev, fn),
+      async getThread() { return getThreadGate.promise; },
+    };
+    const threadCtx = new ThreadContext(client, {
+      botNames: ['adai'],
+      botId: 'bot-self',
+      triggerPatterns: [/^/],
+    });
+    const deliveredThreads = [];
+    const org = { agentId: 'bot-self', agentName: 'adai', access: { groupPolicy: 'open' } };
+    wireRealBotHandlers({
+      client,
+      threadCtx,
+      gate,
+      state,
+      org,
+      deliverDm: async () => {
+        setTimeout(() => dmDone.resolve(), 0);
+        return DELIVERED;
+      },
+      deliverThread: async ({ message }) => {
+        deliveredThreads.push(message.id);
+        if (message.id === 't-skip') return SKIP;
+        setTimeout(() => threadDone.resolve(), 0);
+        return DELIVERED;
+      },
+    });
+    await threadCtx.start();
+
+    const frame = {
+      type: 'thread_message',
+      thread_id: 'thread-ok',
+      message: {
+        id: 't-ok',
+        thread_id: 'thread-ok',
+        sender_id: 'peer-1',
+        sender_name: 'peer-1',
+        content: '@adai hello',
+        parts: [],
+        created_at: T + 1_000,
+      },
+    };
+    // Emit duplicate frame while getThread is pending.
+    emitter.emit('thread_message', frame);
+    emitter.emit('thread_message', frame);
+
+    emitter.emit('message', {
+      type: 'message',
+      sender_name: 'peer-2',
+      message: mkMsg('dm-newer', T + 6_000, 'dm-1'),
+    });
+    await dmDone.promise;
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(state.getEventsSince('org-2'), T, 'still held until t-ok finishes');
+
+    getThreadGate.resolve({ id: 'thread-ok', topic: 'ok', participants: [] });
+    await threadDone.promise;
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.deepEqual(deliveredThreads, ['t-ok'], 'duplicate frame must not double-deliver');
+    assert.equal(gate.inFlight.size, 0);
+    assert.equal(state.getEventsSince('org-2'), T + 6_000, 'eventsSince must advance to max settled timestamp');
+
+    // SKIP (e.g. not-mentioned) must not leak inFlight.
+    emitter.emit('thread_message', {
+      type: 'thread_message',
+      thread_id: 'thread-ok',
+      message: {
+        id: 't-skip',
+        thread_id: 'thread-ok',
+        sender_id: 'peer-1',
+        sender_name: 'peer-1',
+        content: 'plain chatter',
+        parts: [],
+        created_at: T + 7_000,
+      },
+    });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(gate.inFlight.size, 0, 'SKIP thread message must clear inFlight');
+
+    // groupPolicy=disabled must not leak inFlight.
+    org.access.groupPolicy = 'disabled';
+    emitter.emit('thread_message', {
+      type: 'thread_message',
+      thread_id: 'thread-ok',
+      message: {
+        id: 't-disabled',
+        thread_id: 'thread-ok',
+        sender_id: 'peer-1',
+        sender_name: 'peer-1',
+        content: '@adai ignored',
+        parts: [],
+        created_at: T + 8_000,
+      },
+    });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(gate.inFlight.size, 0, 'disabled groupPolicy must not leak inFlight');
+    threadCtx.stop();
+  });
+});
+
+describe('5. round-1 review P1/R2 — rolling 30m cutoff anchored to catch-up run start time', () => {
+  it('blocks stale messages after a 2h disconnect on a process that has been running for 4h', async () => {
+    const filePath = tmpFile('hxa-r2-long-disconnect-');
+    const state = new CatchupStateStore({ filePath }).load();
+    const processStartedAt = BASE_NOW - 4 * HOUR;
+    const cursorAt = BASE_NOW - 2 * HOUR; // 2h ago, newer than processStartedAt - 30m!
+    state.setEventsSince('org-2', cursorAt);
+    state.markGap('org-2');
+
+    const stale90m = mkMsg('stale-90m', BASE_NOW - 90 * MIN, 'dm-internal');
+    const client = fakeHub({
+      channels: { 'dm-internal': [stale90m] },
+      events: [{ type: 'channel_message_summary', channel_id: 'dm-internal', occurred_at: stale90m.created_at }],
+    });
+
+    const delivered = [];
+    const runner = new CatchupRunner({
+      client,
+      state,
+      label: 'org-2',
+      now: () => BASE_NOW,
+      processStartedAt,
+      limits: { batchDelayMs: 0 },
+      log: () => {},
+      deliverMessage: async ({ message }) => delivered.push(message.id),
+    });
+
+    await runner.run('reconnected');
+    runner.dispose();
+
+    assert.deepEqual(delivered, [], '90m-old message must NOT be delivered after 2h disconnect on a 4h-old process');
+    assert.equal(runner.lastRun.skipped, 'stale_cursor');
+    assert.equal(state.getEventsSince('org-2'), BASE_NOW);
+    assert.equal(state.isDirty('org-2'), false);
+  });
+
+  it('suppresses messages and lifecycle events older than run-start minus 30m on both timestamp and byId scans even when process started 4h ago', async () => {
+    for (const useById of [false, true]) {
+      const filePath = tmpFile(`hxa-r2-gate-${useById ? 'byid' : 'ts'}-`);
+      const state = new CatchupStateStore({ filePath }).load();
+      const processStartedAt = BASE_NOW - 4 * HOUR;
+      const cursorAt = BASE_NOW - 15 * MIN; // within rolling 30m window
+      state.setEventsSince('org-2', cursorAt);
+      state.markGap('org-2');
+      // Open window spanning back 2h (still newer than processStartedAt - 30m).
+      state.extendTarget('org-2', 'channel', 'dm-1', BASE_NOW, BASE_NOW - 2 * HOUR);
+      if (useById) state.useIdScan('org-2', 'channel', 'dm-1', null, 0);
+
+      const stale90m = mkMsg('stale-90m', BASE_NOW - 90 * MIN, 'dm-1');
+      const fresh5m = mkMsg('fresh-5m', BASE_NOW - 5 * MIN, 'dm-1');
+      const client = fakeHub({
+        channels: { 'dm-1': [stale90m, fresh5m] },
+        events: [
+          { type: 'thread_invited', event_id: 'ev-stale-90m', thread_id: 't-stale', occurred_at: BASE_NOW - 90 * MIN },
+          { type: 'thread_invited', event_id: 'ev-fresh-5m', thread_id: 't-fresh', occurred_at: BASE_NOW - 5 * MIN },
+        ],
+      });
+
+      const delivered = [];
+      const deliveredEvents = [];
+      const runner = new CatchupRunner({
+        client,
+        state,
+        label: 'org-2',
+        now: () => BASE_NOW,
+        processStartedAt,
+        limits: { batchDelayMs: 0 },
+        log: () => {},
+        deliverMessage: async ({ message }) => delivered.push(message.id),
+        deliverEvent: async ev => deliveredEvents.push(ev.thread_id),
+      });
+
+      await runner.run('reconnected');
+      runner.dispose();
+
+      assert.deepEqual(delivered, ['fresh-5m'], `useById=${useById}: only fresh-5m may be delivered`);
+      assert.equal(state.getMessageStatus('org-2', 'stale-90m'), 'not_delivered');
+      assert.equal(state.getSuppressedRecord('org-2', 'stale-90m').reason, 'stale_cutoff');
+      assert.deepEqual(deliveredEvents, ['t-fresh'], `useById=${useById}: stale 90m lifecycle event must be suppressed`);
+      assert.equal(state.isSuppressed('org-2', 'event:ev-stale-90m'), true);
+      assert.equal(state.getSuppressedRecord('org-2', 'event:ev-stale-90m').reason, 'stale_cutoff');
+    }
   });
 });

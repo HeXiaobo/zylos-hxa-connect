@@ -106,12 +106,13 @@ function fakeHub({ channels = {}, threads = {}, events = [], catchupPages } = {}
   return client;
 }
 
-function runner({ client, state, delivered = [], summaries = [], events = [], limits = {}, deliverMessage, deliverEvent }) {
+function runner({ client, state, delivered = [], summaries = [], events = [], limits = {}, deliverMessage, deliverEvent, maxAgeMs }) {
   return new CatchupRunner({
     client,
     label: 'default',
     state,
     now: () => NOW,
+    maxAgeMs,
     limits: { batchDelayMs: 0, ...limits },
     log: () => {},
     deliverMessage: deliverMessage || (async item => { delivered.push(item.message.id); }),
@@ -559,9 +560,10 @@ describe('volume — nothing is discarded', () => {
     const delivered = [];
     const summaries = [];
     // 48h offline: above the 24h threshold, below the message threshold.
+    // Disable the 30m staleness gate here to exercise the 24h summary notice.
     const r = runner({
       client: fakeHub({ channels: { dm: messages }, events: [channelSummary('dm')] }),
-      state, delivered, summaries, limits: {},
+      state, delivered, summaries, limits: {}, maxAgeMs: Infinity,
     });
     r.now = () => T + 48 * 3600 * 1000;
     await r.run('reconnected');

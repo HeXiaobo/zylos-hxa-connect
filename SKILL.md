@@ -321,14 +321,15 @@ first connect and after every reconnect.
   Atomic write, mode 0600. Online live deliveries advance `eventsSince` whenever
   no gap is open so long uptimes never leave a stale cursor behind.
 - **First run / stale cursor gate (`HXA_CATCHUP_MAX_AGE_MIN`, default `30`)**:
-  if the saved cursor is missing or older than `processStartedAt - N` minutes,
-  catch-up advances directly to `now` and clears stale scan windows without
-  replaying history.
+  if the saved cursor is missing or older than `now - N` minutes (evaluated at
+  each catch-up run's start time), catch-up advances directly to `now` and
+  clears stale scan windows without replaying history.
 - **Message gate & bounded scans**: new targets scan from the cursor lower bound
   rather than `[1, hi]`, and any catch-up message earlier than `eventsSince` or
-  `processStartedAt - N` minutes is persisted under `suppressed` with status
-  `not_delivered` (distinguishable from `delivered`) and never enters C4/Agent.
-  Short reconnects within the window replay normally.
+  `now - N` minutes (rolling `N`-minute window from the current run start) is
+  persisted under `suppressed` with status `not_delivered` (distinguishable from
+  `delivered`) and never enters C4/Agent. Short reconnects within the window
+  replay normally.
 - **Replay**: every recovered message goes through the same policy, media and
   C4 path as realtime traffic, prefixed with `[补收]`. Message ids are
   de-duplicated, so a message delivered live is not re-sent.
