@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.7.10-3ai.2] - 2026-11-26
+
+### Fixed
+- **Catch-up staleness gates (`HXA_CATCHUP_MAX_AGE_MIN`, default `30`).** Prevents
+  container rebuilds or restarts with an old `catchup-state.json` cursor from
+  replaying days-old historical messages into C4 / AI turns:
+  - **Cursor gate**: when the saved watermark is missing or older than
+    `processStartedAt - HXA_CATCHUP_MAX_AGE_MIN` minutes, the watermark advances
+    directly to `now` (and stale pending target windows are cleared) without
+    replaying history.
+  - **Message gate**: any catch-up message or offline lifecycle event older than
+    `processStartedAt - HXA_CATCHUP_MAX_AGE_MIN` minutes is recorded in
+    `catchup-state.json` as non-deliverable (never forwarded to C4) and logged
+    in one summary line (count, earliest/latest timestamps).
+  - Short disconnects within the same process or within the configured window
+    continue to catch up and deliver normally.
+
 ## [1.7.10-3ai.1] - 2026-11-22
 
 ### Fixed

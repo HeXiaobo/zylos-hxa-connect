@@ -332,6 +332,11 @@ first connect and after every reconnect.
   Delete the file only if you want to reset the bot's "since" boundary.
 - **First run** with no state file records `now` and replays nothing (no
   pre-feature history).
+- **Staleness gate (`HXA_CATCHUP_MAX_AGE_MIN`, default `30`)**: on startup/catch-up,
+  if the saved watermark is older than `processStartedAt - HXA_CATCHUP_MAX_AGE_MIN`
+  minutes, it advances directly to `now` without replaying history. Any catch-up
+  message older than that cutoff is persisted as non-deliverable without
+  entering C4. Short reconnects continue to replay normally.
 - **Replay**: every recovered message goes through the same policy, media and
   C4 path as realtime traffic, prefixed with `[补收]`. Message ids are
   de-duplicated, so a message delivered live is not re-sent.

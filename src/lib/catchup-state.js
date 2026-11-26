@@ -353,6 +353,18 @@ export class CatchupStateStore {
     return this.getOrg(label).targets[CatchupStateStore.targetKey(kind, id)] || null;
   }
 
+  /**
+   * Drop all pending per-target scan windows for an org while keeping
+   * already-delivered id records (`recentIds` and `delivered` buckets).
+   */
+  clearTargets(label) {
+    const org = this.getOrg(label);
+    org.targets = {};
+    for (const key of this._targetIdSets.keys()) {
+      if (key.startsWith(`${label}\u0000`)) this._targetIdSets.delete(key);
+    }
+  }
+
   /** All target keys with unfinished work, oldest pending window first. */
   openTargets(label) {
     const org = this.getOrg(label);

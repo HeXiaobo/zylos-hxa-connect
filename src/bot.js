@@ -478,6 +478,7 @@ const HANDLED_EVENTS = new Set([
 ]);
 
 const MAX_CONNECT_ATTEMPTS = 20;
+const PROCESS_STARTED_AT = Date.now();
 
 // ─── Catch-up State (one file for all orgs, atomic writes) ──
 
@@ -1022,6 +1023,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     state: catchupState,
     gate, // shared with the realtime handlers: one de-dup view per connection
     multiOrg: isMultiOrg,
+    processStartedAt: PROCESS_STARTED_AT,
     log: (m) => console.log(redactSecrets(`${lp} ${m}`)), // single choke point: every catch-up log line is redacted
 
     // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).
