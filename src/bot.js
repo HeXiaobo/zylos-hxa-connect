@@ -21,7 +21,7 @@ import {
 } from './lib/delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
-import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
+import { CatchupRunner, DeliveryGate, formatCatchupEventLine, resolveCatchupMaxAgeMs } from './lib/catchup.js';
 import { buildDmContent, buildThreadHeader } from './lib/format.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 // zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
@@ -333,6 +333,11 @@ const HANDLED_EVENTS = new Set([
 ]);
 
 const MAX_CONNECT_ATTEMPTS = 20;
+const PROCESS_STARTED_AT = Date.now();
+const CATCHUP_MAX_AGE_MS = resolveCatchupMaxAgeMs(
+  process.env,
+  (msg) => console.warn(`[hxa-connect] ${redactSecrets(msg)}`),
+);
 
 // ─── Catch-up State (one file for all orgs, atomic writes) ──
 
@@ -728,6 +733,8 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     state: catchupState,
     gate, // shared with the realtime handlers: one de-dup view per connection
     multiOrg: isMultiOrg,
+    processStartedAt: PROCESS_STARTED_AT,
+    maxAgeMs: CATCHUP_MAX_AGE_MS,
     log: (m) => console.log(redactSecrets(`${lp} ${m}`)), // single choke point: every catch-up log line is redacted
 
     // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).

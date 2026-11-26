@@ -63,6 +63,26 @@ export const DEFAULT_LIMITS = Object.freeze({
   queryOverlapMs: 5000,
 });
 
+export const DEFAULT_CATCHUP_MAX_AGE_MIN = 30;
+export const CATCHUP_MAX_AGE_ENV = 'HXA_CATCHUP_MAX_AGE_MIN';
+
+/**
+ * Resolve the catch-up staleness window (in ms) from env.
+ * Defaults to 30 minutes; invalid or negative values fall back to default.
+ */
+export function resolveCatchupMaxAgeMs(env = process.env, log = () => {}) {
+  const raw = env?.[CATCHUP_MAX_AGE_ENV];
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return DEFAULT_CATCHUP_MAX_AGE_MIN * 60_000;
+  }
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    log(`catchup: invalid ${CATCHUP_MAX_AGE_ENV}=${JSON.stringify(String(raw))} — falling back to ${DEFAULT_CATCHUP_MAX_AGE_MIN}m`);
+    return DEFAULT_CATCHUP_MAX_AGE_MIN * 60_000;
+  }
+  return Math.floor(minutes * 60_000);
+}
+
 /** Event types that must be expanded into real messages. */
 const MESSAGE_EVENT_TYPES = new Set(['channel_message_summary', 'thread_message_summary']);
 
@@ -79,15 +99,25 @@ export class DeliveryGate {
     this.state = state;
     this.label = label;
     this.inFlight = new Set();
+    this._pendingAdvanceAt = 0;
+    this._catchupRuns = 0;
   }
 
-  /** Successfully delivered before (live or replayed)? */
+  enterCatchup() {
+    this._catchupRuns++;
+  }
+
+  leaveCatchup() {
+    if (this._catchupRuns > 0) this._catchupRuns--;
+  }
+
+  /** Successfully delivered (or already suppressed) before? */
   isDelivered(id) {
     if (!id) return false;
     return this.state.hasSeen(this.label, id);
   }
 
-  /** Delivered or currently in flight. */
+  /** Delivered/suppressed or currently in flight. */
   isSeen(id) {
     if (!id) return false;
     return this.inFlight.has(id) || this.isDelivered(id);
@@ -105,20 +135,60 @@ export class DeliveryGate {
 
   clear(id) {
     if (id) this.inFlight.delete(id);
+    // An in-flight delivery ended without settling (failure or skip): drop any
+    // buffered advance watermark so a concurrently completed newer message
+    // cannot move `eventsSince` past this unsettled message.
+    this._pendingAdvanceAt = 0;
   }
 
   /**
    * Record a message as handled. Call only after C4 accepted it, or after the
    * delivery pipeline decided the message is terminally out of policy (which is
-   * also a final answer for this message). Never advances the catch-up
-   * boundary: that belongs to the per-target scan records.
+   * also a final answer for this message).
+   *
+   * On live traffic (`advanceCursor = true`), monotonically advances
+   * `eventsSince` once no gap is open, no target scan / event cursor is
+   * unfinished, no catch-up run is active, and no other live delivery is still
+   * in flight. That keeps `eventsSince` moving during long online uptimes
+   * without ever jumping over an open gap.
    */
-  mark(id, at, { kind, targetId } = {}) {
+  mark(id, at, { kind, targetId, advanceCursor = !(kind && targetId) } = {}) {
     if (!id) return;
     this.inFlight.delete(id);
     this.state.remember(this.label, id, at);
     if (kind && targetId) this.state.addTargetId(this.label, kind, targetId, id, at);
-    if (at) this.state.setLastDeliveredAt(this.label, at);
+    const ts = Number(at);
+    const validAt = Number.isFinite(ts) && ts > 0 ? Math.floor(ts) : 0;
+    if (validAt) this.state.setLastDeliveredAt(this.label, validAt);
+
+    if (!advanceCursor) return;
+
+    const clean = !this.state.isDirty(this.label)
+      && this.state.targetsSettled(this.label)
+      && !this.state.getEventCursor(this.label)
+      && this._catchupRuns === 0;
+    if (!clean) {
+      this._pendingAdvanceAt = 0;
+      return;
+    }
+    if (validAt > this._pendingAdvanceAt) {
+      this._pendingAdvanceAt = validAt;
+    }
+    if (this.inFlight.size === 0 && this._pendingAdvanceAt > 0) {
+      this.state.setEventsSince(this.label, this._pendingAdvanceAt);
+      this._pendingAdvanceAt = 0;
+    }
+  }
+
+  /**
+   * Persist a catch-up message as non-deliverable (distinct `not_delivered`
+   * status in state). Never updates `lastDeliveredAt` or `eventsSince`.
+   */
+  markSuppressed(id, at, { kind, targetId, reason = 'stale_cutoff', recordedAt } = {}) {
+    if (!id) return;
+    this.inFlight.delete(id);
+    this.state.rememberSuppressed(this.label, id, { at, reason, recordedAt });
+    if (kind && targetId) this.state.addTargetId(this.label, kind, targetId, id, at);
   }
 }
 
@@ -262,6 +332,8 @@ export class CatchupRunner {
     limits = {},
     multiOrg = true,
     gate,
+    processStartedAt,
+    maxAgeMs,
   }) {
     if (!client) throw new Error('CatchupRunner requires a client');
     if (!label) throw new Error('CatchupRunner requires an org label');
@@ -280,6 +352,15 @@ export class CatchupRunner {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.multiOrg = multiOrg;
     this.gate = gate || new DeliveryGate({ state, label });
+    const resolvedStartedAt = Number(processStartedAt);
+    this.processStartedAt = Number.isFinite(resolvedStartedAt) && resolvedStartedAt > 0
+      ? Math.floor(resolvedStartedAt)
+      : this.now();
+    this.maxAgeMs = typeof maxAgeMs === 'number'
+      && (Number.isFinite(maxAgeMs) || maxAgeMs === Infinity)
+      && maxAgeMs >= 0
+      ? maxAgeMs
+      : resolveCatchupMaxAgeMs(process.env, this.log);
 
     this.running = false;
     this.queued = false;
@@ -322,15 +403,26 @@ export class CatchupRunner {
   }
 
   async _runOnce(reason) {
+    this.gate.enterCatchup?.();
+    try {
+      await this._runOnceBody(reason);
+    } finally {
+      this.gate.leaveCatchup?.();
+    }
+  }
+
+  async _runOnceBody(reason) {
     const startedAt = this.now();
     // If a new gap appears while we work, we must not close it at the end.
     const epochAtStart = this.state.getGapEpoch(this.label);
+    const cutoffAt = Number.isFinite(this.maxAgeMs) ? (this.processStartedAt - this.maxAgeMs) : -Infinity;
 
     const eventsSince = this.state.getEventsSince(this.label);
     if (!eventsSince) {
-      // First run ever: baseline from now, never replay pre-feature history.
+      // Gate 2 (missing cursor): baseline from now, never replay history.
       this.state.setEventsSince(this.label, startedAt);
       this.state.setEventCursor(this.label, null);
+      this.state.clearTargets(this.label);
       this.state.settleGap(this.label, epochAtStart);
       this.state.save();
       this.log(`catchup baseline set to ${new Date(startedAt).toISOString()} — nothing to replay`);
@@ -338,8 +430,28 @@ export class CatchupRunner {
       return;
     }
 
+    if (Number.isFinite(cutoffAt) && eventsSince < cutoffAt) {
+      // Gate 2 (stale cursor): cursor predates (processStartedAt - maxAgeMs) —
+      // advance directly to now and drop stale scan windows without replaying.
+      this.state.setEventsSince(this.label, startedAt);
+      this.state.setEventCursor(this.label, null);
+      this.state.clearTargets(this.label);
+      this.state.settleGap(this.label, epochAtStart);
+      this.state.save();
+      const maxAgeMin = (this.maxAgeMs / 60_000).toFixed(this.maxAgeMs % 60_000 === 0 ? 0 : 1);
+      this.log(
+        `catchup cursor too old (since=${new Date(eventsSince).toISOString()}, ` +
+        `cutoff=${new Date(cutoffAt).toISOString()}, maxAge=${maxAgeMin}m); ` +
+        `advancing watermark to ${new Date(startedAt).toISOString()} without replaying history`
+      );
+      this.lastRun = { reason, skipped: 'stale_cursor', previousSince: eventsSince, at: startedAt };
+      return;
+    }
+
+    const deliveryFloor = Number.isFinite(cutoffAt) ? Math.max(eventsSince, cutoffAt) : eventsSince;
     const querySince = Math.max(0, eventsSince - this.limits.queryOverlapMs);
-    const counters = { delivered: 0, skipped: 0, failed: 0, lifecycle: 0 };
+    const counters = { delivered: 0, skipped: 0, suppressed: 0, failed: 0, lifecycle: 0 };
+    const staleStats = { earliestAt: Infinity, latestAt: 0 };
 
     this.log(`catchup start (${reason}) since ${new Date(eventsSince).toISOString()}${this.state.isDirty(this.label) ? ' (gap suspected)' : ''}`);
 
@@ -408,9 +520,11 @@ export class CatchupRunner {
       cursor = null;
     }
 
-    // ── Phase 2: open the scans for this batch ──
+    // ── Phase 2: open the scans for this batch (bounded by deliveryFloor, never [1, hi]) ──
+    const scanLo = Math.max(1, deliveryFloor);
+    const scanHi = Math.max(startedAt, lastEventAt);
     for (const { kind, id } of summaries.values()) {
-      this.state.extendTarget(this.label, kind, id, startedAt);
+      this.state.extendTarget(this.label, kind, id, scanHi, scanLo);
     }
 
     const pending = this.state.openTargets(this.label);
@@ -492,6 +606,9 @@ export class CatchupRunner {
         const result = await this._scanTarget({
           kind, id, target, fetchPage, counters, maybeSummary,
           budget: budgetFor(key),
+          eventsSince,
+          cutoffAt,
+          staleStats,
         });
         spentPages(key, result.requests);
         if (!result.complete) allComplete = false;
@@ -525,6 +642,17 @@ export class CatchupRunner {
 
     // ── Phase 4: lifecycle events (caller applies policy) ──
     for (const ev of otherEvents) {
+      const evAt = Number(ev.occurred_at) || 0;
+      if (evAt > 0 && ((Number.isFinite(cutoffAt) && evAt < cutoffAt) || (eventsSince > 0 && evAt < eventsSince))) {
+        const reason = Number.isFinite(cutoffAt) && evAt < cutoffAt ? 'stale_cutoff' : 'before_cursor';
+        if (ev.event_id) {
+          this.state.rememberSuppressed(this.label, `event:${ev.event_id}`, { at: evAt, reason });
+        }
+        counters.suppressed++;
+        if (evAt < staleStats.earliestAt) staleStats.earliestAt = evAt;
+        if (evAt > staleStats.latestAt) staleStats.latestAt = evAt;
+        continue;
+      }
       try {
         if (this.deliverEvent) await this.deliverEvent({ ...ev, catchup: true, label: this.label });
         else this.log(`catchup event ${ev.type}: ${JSON.stringify(ev).substring(0, 200)}`);
@@ -532,6 +660,18 @@ export class CatchupRunner {
       } catch (err) {
         this.log(`catchup event ${ev.type} delivery failed (${err?.message || err})`);
       }
+    }
+
+    if (counters.suppressed > 0) {
+      const range = staleStats.earliestAt <= staleStats.latestAt
+        ? `, earliest=${new Date(staleStats.earliestAt).toISOString()}, latest=${new Date(staleStats.latestAt).toISOString()}`
+        : '';
+      this.log(
+        `catchup non-deliverable messages suppressed: count=${counters.suppressed}${range}, ` +
+        `eventsSince=${new Date(eventsSince).toISOString()}` +
+        `${Number.isFinite(cutoffAt) ? `, cutoff=${new Date(cutoffAt).toISOString()}` : ''} ` +
+        `(persisted as not_delivered, not sent to C4)`
+      );
     }
 
     // ── Phase 5: advance the boundary only when everything is done ──
@@ -556,31 +696,65 @@ export class CatchupRunner {
       this.state.pruneTargets(this.label);
       this.state.pruneDelivered(this.label, Date.now());
       this.state.save();
-      this.log(`catchup done: ${counters.delivered} delivered, ${counters.skipped} already handled, ${counters.failed} failed (${counters.lifecycle} lifecycle event(s))`);
+      this.log(`catchup done: ${counters.delivered} delivered, ${counters.skipped} already handled, ${counters.suppressed} suppressed, ${counters.failed} failed (${counters.lifecycle} lifecycle event(s))`);
     } else {
       this.state.save();
       const why = canAdvance ? 'a disconnect happened during the run' : (eventsExhausted ? 'work remains' : 'event cursor saved');
-      this.log(`catchup incomplete: ${counters.delivered} delivered, ${counters.skipped} already handled, ${counters.failed} failed (${why}); resuming next run`);
+      this.log(`catchup incomplete: ${counters.delivered} delivered, ${counters.skipped} already handled, ${counters.suppressed} suppressed, ${counters.failed} failed (${why}); resuming next run`);
     }
 
     this.lastRun = {
       reason,
       delivered: counters.delivered,
       skipped: counters.skipped,
+      suppressed: counters.suppressed,
       failed: counters.failed,
       events: counters.lifecycle,
       complete: gapClosed,
       at: startedAt,
     };
 
-    if (!gapClosed && counters.delivered > 0) this._scheduleContinuation();
+    if (!gapClosed && (counters.delivered > 0 || counters.suppressed > 0)) this._scheduleContinuation();
+  }
+
+  /**
+   * Gate 1 + cursor boundary check for one candidate catch-up message.
+   * Messages older than `(processStartedAt - maxAgeMs)` or strictly before
+   * `eventsSince` are persisted as `not_delivered` and never enter C4/Agent.
+   */
+  _gateMessage(m, { kind, id, at, eventsSince, cutoffAt, counters, staleStats }) {
+    let reason = null;
+    if (Number.isFinite(cutoffAt) && (at <= 0 || at < cutoffAt)) {
+      reason = at <= 0 ? 'invalid_timestamp' : 'stale_cutoff';
+    } else if (eventsSince > 0 && (at <= 0 || at < eventsSince)) {
+      reason = at <= 0 ? 'invalid_timestamp' : 'before_cursor';
+    }
+    if (!reason) return false;
+    this.gate.markSuppressed(m.id, at, { kind, targetId: id, reason });
+    counters.suppressed++;
+    if (at > 0) {
+      if (at < staleStats.earliestAt) staleStats.earliestAt = at;
+      if (at > staleStats.latestAt) staleStats.latestAt = at;
+    }
+    return true;
   }
 
   /**
    * Work through one target's pending windows, oldest first, within the page
    * budget. Returns `{ complete, progressed }`.
    */
-  async _scanTarget({ kind, id, target, fetchPage, counters, maybeSummary = async () => {}, budget = this.limits.messageMaxPages }) {
+  async _scanTarget({
+    kind,
+    id,
+    target,
+    fetchPage,
+    counters,
+    maybeSummary = async () => {},
+    budget = this.limits.messageMaxPages,
+    eventsSince = 0,
+    cutoffAt = -Infinity,
+    staleStats = { earliestAt: Infinity, latestAt: 0 },
+  }) {
     const limits = this.limits;
     let remaining = budget;
     let requests = 0;
@@ -632,6 +806,10 @@ export class CatchupRunner {
             // See the timestamp branch: an in-flight live delivery is not a
             // final answer, so it must not be written into the scan record.
             inFlightHeld = true;
+            continue;
+          }
+          if (this._gateMessage(m, { kind, id, at, eventsSince, cutoffAt, counters, staleStats })) {
+            progressed = true;
             continue;
           }
           await maybeSummary();
@@ -734,6 +912,11 @@ export class CatchupRunner {
           inFlightHeld = true;
           continue;
         }
+        const at = Number(m.created_at) || 0;
+        if (this._gateMessage(m, { kind, id, at, eventsSince, cutoffAt, counters, staleStats })) {
+          progressed = true;
+          continue;
+        }
         // Before the first delivery of a large/long-offline batch, send one
         // notice line so the agent knows what the burst is. If the batch turns
         // out big only after we started, the notice goes out at the threshold.
@@ -754,7 +937,7 @@ export class CatchupRunner {
             });
           counters.delivered++;
           progressed = true;
-          this.gate.mark(m.id, Number(m.created_at) || 0, { kind, targetId: id });
+          this.gate.mark(m.id, at, { kind, targetId: id });
         } catch (err) {
           this.gate.clear(m.id);
           this.state.save();

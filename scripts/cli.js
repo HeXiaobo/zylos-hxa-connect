@@ -198,6 +198,7 @@ try {
         gap_epoch: org.gapEpoch || 0,
         last_delivered_at: org.lastDeliveredAt || null,
         recent_ids: org.recentIds.length,
+        suppressed_count: store.countSuppressed(orgLabel),
         open_targets: Object.entries(org.targets).map(([key, t]) => ({
           target: key,
           done_up_to: t.doneUpTo || null,
@@ -229,14 +230,17 @@ try {
       store.shrinkWindowTop = () => {};
       store.addTargetId = () => {};
       store.setAnchor = () => {};
-      store.extendTarget = (label, kind, id, hi) => {
+      store.clearTargets = () => {};
+      store.rememberSuppressed = () => {};
+      store.extendTarget = (label, kind, id, hi, lo = 0) => {
         const t = { doneUpTo: 0, hi: 0, windows: [], ids: [], anchorId: null, anchorAt: 0 };
         const key = CatchupStateStore.targetKey(kind, id);
         const org = store.getOrg(label);
         const existing = org.targets[key];
         if (existing && existing.windows.length) return existing;
         t.hi = Number(hi) || 0;
-        t.windows = t.hi > 0 ? [[1, t.hi]] : [];
+        const start = Math.max(1, Number(lo) || store.getEventsSince(label) || 1);
+        t.windows = t.hi >= start ? [[start, t.hi]] : [];
         org.targets[key] = t;
         return t;
       };
