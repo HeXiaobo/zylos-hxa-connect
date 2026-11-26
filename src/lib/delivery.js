@@ -103,7 +103,7 @@ export function decideCatchupEvent({ access, event }) {
  *
  * @returns {'delivered'|'rejected'|'skipped'|'failed'}
  */
-export function settleLiveDelivery({ outcome, error, id, at, gate, markGap, save }) {
+export function settleLiveDelivery({ outcome, error, id, at, gate, markGap, save, advanceCursor }) {
   // A pipeline that actually reached C4 answers DELIVERED; a policy decision
   // answers REJECT. Both are final answers for this message. A policy DELIVER
   // verdict never comes back here — that is the go-ahead, not a result.
@@ -115,7 +115,11 @@ export function settleLiveDelivery({ outcome, error, id, at, gate, markGap, save
     return 'failed';
   }
   if (accepted || outcome === REJECT) {
-    gate?.mark?.(id, at);
+    if (typeof advanceCursor === 'boolean') {
+      gate?.mark?.(id, at, { advanceCursor });
+    } else {
+      gate?.mark?.(id, at);
+    }
     save?.();
     return accepted ? DELIVERED : REJECT;
   }

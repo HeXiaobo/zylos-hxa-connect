@@ -21,7 +21,7 @@ import {
 } from './lib/delivery.js';
 import { MEDIA_BASE_DIR, generateFilename } from './lib/media.js';
 // zylos-lab-hxa-catchup: recover messages missed while offline / restarting.
-import { CatchupRunner, DeliveryGate, formatCatchupEventLine } from './lib/catchup.js';
+import { CatchupRunner, DeliveryGate, formatCatchupEventLine, resolveCatchupMaxAgeMs } from './lib/catchup.js';
 import { buildDmContent, buildThreadHeader } from './lib/format.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 // zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
@@ -333,6 +333,10 @@ const HANDLED_EVENTS = new Set([
 ]);
 
 const MAX_CONNECT_ATTEMPTS = 20;
+const CATCHUP_MAX_AGE_MS = resolveCatchupMaxAgeMs(
+  process.env,
+  (msg) => console.warn(`[hxa-connect] ${redactSecrets(msg)}`),
+);
 
 // ─── Catch-up State (one file for all orgs, atomic writes) ──
 
@@ -622,6 +626,10 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
   }
 
   threadCtx.onMention(async ({ threadId, message, snapshot, reason }) => {
+    const wire = message || {};
+    const claimed = reason === 'message' && wire.id ? gate.claim(wire.id) : false;
+    let held = claimed;
+    let settled = false;
     try {
       // zylos-lab-hxa-access: groupPolicy=disabled must stop every thread
       // delivery (messages, invites, thread_created), not only reason==='message'.
@@ -629,13 +637,15 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         console.log(`${lp} Thread ${threadId} skipped (groupPolicy: disabled)`);
         return;
       }
-      const wire = message || {};
       const at = Number(wire.created_at) || Date.now();
-      if (gate.isSeen(wire.id)) {
+      if (!claimed && gate.isSeen(wire.id)) {
         console.log(`${lp} Thread ${threadId} message ${wire.id} already handled, skipping realtime duplicate`);
         return;
       }
-      if (wire.id) gate.begin(wire.id);
+      if (!held && wire.id) {
+        gate.begin(wire.id);
+        held = true;
+      }
       let outcome;
       let error;
       try {
@@ -648,15 +658,31 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
         markGap: () => catchupState.markGap(label),
         save: () => catchupState.scheduleSave(),
       });
+      settled = true;
       if (error) throw error;
     } catch (err) {
       console.error(`${lp} Thread handler error: ${redactSecrets(err.message)}`);
+    } finally {
+      if (held && !settled && wire.id) {
+        gate.clear(wire.id);
+      }
     }
   });
 
   client.on('thread_message', (msg) => {
     const message = msg.message || {};
     if (isSelf(message.sender_id, message.metadata)) return;
+    // Register inFlight before SDK ThreadContext awaits getThread() on cache miss,
+    // so a newer DM cannot advance eventsSince past an unsettled thread message.
+    if (
+      msg.type === 'thread_message'
+      && message.id
+      && threadCtx.started
+      && (org.access?.groupPolicy || 'open') !== 'disabled'
+      && (typeof threadCtx.isMention !== 'function' || threadCtx.isMention(message))
+    ) {
+      gate.reserve(message.id);
+    }
     const sender = message.sender_name || message.sender_id || 'unknown';
     const content = message.content || '';
     console.log(`${lp} Thread ${msg.thread_id} from ${sender} (buffered): ${content.substring(0, 80)}`);
@@ -728,6 +754,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     state: catchupState,
     gate, // shared with the realtime handlers: one de-dup view per connection
     multiOrg: isMultiOrg,
+    maxAgeMs: CATCHUP_MAX_AGE_MS,
     log: (m) => console.log(redactSecrets(`${lp} ${m}`)), // single choke point: every catch-up log line is redacted
 
     // Reuse the realtime DM pipeline verbatim (policy, media, C4 format).
