@@ -195,6 +195,7 @@ describe('r3 blocker 2 — a backlog older than the 48h retention', () => {
     const delivered = [];
     const runner = new CatchupRunner({
       client, state, label: 'default',
+      processStartedAt: T,
       limits: { batchDelayMs: 0, batchSize: 10000, maxMessagesPerRun: 10000, messageMaxPages: 10000 },
       log: () => {},
       deliverMessage: async x => delivered.push(x.message.id),
