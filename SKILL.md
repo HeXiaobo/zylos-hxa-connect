@@ -1,6 +1,6 @@
 ---
 name: hxa-connect
-version: 1.7.10-3ai.1
+version: 1.7.10-3ai.2
 description: HXA-Connect bot-to-bot communication channel via WebSocket. Use when replying to HXA-Connect messages or sending messages to other bots.
 type: communication
 user-invocable: false
@@ -18,6 +18,8 @@ lifecycle:
     post-upgrade: hooks/post-upgrade.js
   preserve:
     - config.json
+    - outbound-guard.json
+    - catchup-state.json
     - logs/
     - dm-inbox-state.json
     - c4-spool/
@@ -109,23 +111,27 @@ request state, and opens no Hub transport. Outbound assistant replies then go
 through explicit `c4-send --request-id`. Set the mode to `canonical` or
 `legacy` to restore automatic delivery.
 
-## Outbound org guard (opt-in)
+## Outbound org guard (default-deny allowlist)
 
-A host can stop sends from reaching a non-internal org by accident. The guard
-turns on only when `~/zylos/components/hxa-connect/outbound-guard.json` exists;
-without that file `scripts/send.js` behaves exactly as before.
+Outbound sends (`scripts/send.js` and `scripts/stream.js`) are **default-deny**:
+customer orgs and non-with3 orgs (or any org not explicitly allowlisted) are
+blocked unless permitted by `~/zylos/components/hxa-connect/outbound-guard.json`
+or explicitly approved on that single command via `HXA_CONFIRM_ORG=<label>`.
 
 ```json
-{ "internal_labels": ["org-1", "org-2"] }
+{
+  "internal_labels": ["org-2"],
+  "internal_org_ids": ["11111111-1111-4111-8111-111111111111"]
+}
 ```
 
-The labels are the **local config labels** (keys under `orgs`), not hub org
-names and not `org_id`s. When the file is present:
-
-- an `internal_labels` member sends normally and prints no guard line;
-- anything else prints the target and the org label to stderr and exits 1
-  without connecting to the hub;
-- `HXA_CONFIRM_ORG=<that same label>` lets it through and prints one
+- `internal_labels` matches **local config labels** (keys under `orgs`);
+  `internal_org_ids` (optional) matches the org's configured `org_id`. At least
+  one array must be present in the file.
+- An allowlisted org sends normally and prints no guard line.
+- Any other org — or any send when `outbound-guard.json` is absent — prints the
+  target and org label to stderr and exits 1 without connecting to the hub.
+- `HXA_CONFIRM_ORG=<that same label>` lets one invocation through and prints one
   `CONFIRMED EXTERNAL` line. The variable must come from the invocation itself:
   a value sitting in `~/zylos/.env` is ignored (and the block message says so),
   because that would approve every send from then on.
@@ -328,10 +334,18 @@ Messages sent while the bot was offline are recovered automatically after the
 first connect and after every reconnect.
 
 - **Watermark**: `~/zylos/components/hxa-connect/catchup-state.json`
-  (`watermark`, `lastDeliveredAt`, `dirty`, `recentIds`). Atomic write, mode 0600.
-  Delete the file only if you want to reset the bot's "since" boundary.
-- **First run** with no state file records `now` and replays nothing (no
-  pre-feature history).
+  (`eventsSince`, `lastDeliveredAt`, `dirty`, `recentIds`, `delivered`, `suppressed`).
+  Atomic write, mode 0600. Online live deliveries advance `eventsSince` whenever
+  no gap is open so long uptimes never leave a stale cursor behind.
+- **First run / stale cursor gate (`HXA_CATCHUP_MAX_AGE_MIN`, default `30`)**:
+  if the saved cursor is missing or older than `processStartedAt - N` minutes,
+  both `CatchupRunner` and `DmInboxReconciler` advance directly to `now` and
+  clear stale scan windows without replaying history.
+- **Message gate & bounded scans**: new targets scan from the cursor lower bound
+  rather than `[1, hi]`, and any catch-up message earlier than `eventsSince` or
+  `processStartedAt - N` minutes is persisted under `suppressed` with status
+  `not_delivered` (distinguishable from `delivered`) and never enters C4/Agent.
+  Short reconnects within the window replay normally.
 - **Replay**: every recovered message goes through the same policy, media and
   C4 path as realtime traffic, prefixed with `[补收]`. Message ids are
   de-duplicated, so a message delivered live is not re-sent.
@@ -358,7 +372,7 @@ bot still delivers its own replay.
 - Config: `~/zylos/components/hxa-connect/config.json`
 - Logs: `~/zylos/components/hxa-connect/logs/`
 - Catch-up state: `~/zylos/components/hxa-connect/catchup-state.json`
-- Outbound guard (optional): `~/zylos/components/hxa-connect/outbound-guard.json`
+- Outbound guard (default-deny allowlist): `~/zylos/components/hxa-connect/outbound-guard.json`
 
 ## Service Management
 

@@ -43,6 +43,8 @@ export const DEFAULT_RETAIN_DELIVERED_MS = 48 * 60 * 60 * 1000;
 export const DELIVERED_BUCKET_MS = 10 * 60 * 1000;
 /** Safety valve for one target's open-window id list. */
 export const MAX_WINDOW_IDS = 50000;
+/** Safety valve for persisted non-delivered (suppressed) catch-up records per org. */
+export const MAX_SUPPRESSED_RECORDS = 10000;
 
 export const CATCHUP_STATE_FILENAME = 'catchup-state.json';
 
@@ -68,6 +70,9 @@ function emptyOrg() {
     recentIds: [],
     // id buckets keyed by DELIVERY-time slice: `{ "<ms>": ["id", ...] }`
     delivered: {},
+    // non-delivered catch-up messages keyed by RECORDING-time slice:
+    // `{ "<ms>": [{ id, at, status: "not_delivered", reason, recordedAt }, ...] }`
+    suppressed: {},
     targets: {},
   };
 }
@@ -138,6 +143,32 @@ function normalizeOrg(raw, maxRecentIds) {
       if (!Number.isFinite(Number(key)) || !Array.isArray(ids)) continue;
       const clean = ids.filter(id => typeof id === 'string' && id);
       if (clean.length) org.delivered[key] = clean;
+    }
+  }
+  if (raw.suppressed && typeof raw.suppressed === 'object') {
+    const seenIds = new Set();
+    let total = 0;
+    const keys = Object.keys(raw.suppressed)
+      .filter(k => Number.isFinite(Number(k)) && Array.isArray(raw.suppressed[k]))
+      .sort((a, b) => Number(b) - Number(a));
+    for (const key of keys) {
+      if (total >= MAX_SUPPRESSED_RECORDS) break;
+      const clean = [];
+      for (const entry of raw.suppressed[key]) {
+        if (total >= MAX_SUPPRESSED_RECORDS) break;
+        if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string' || !entry.id) continue;
+        if (seenIds.has(entry.id)) continue;
+        seenIds.add(entry.id);
+        clean.push({
+          id: entry.id,
+          at: toPositiveInt(entry.at),
+          status: 'not_delivered',
+          reason: typeof entry.reason === 'string' && entry.reason ? entry.reason : 'stale_cutoff',
+          recordedAt: toPositiveInt(entry.recordedAt) || toPositiveInt(key),
+        });
+        total++;
+      }
+      if (clean.length) org.suppressed[key] = clean;
     }
   }
   if (raw.targets && typeof raw.targets === 'object') {
@@ -274,11 +305,103 @@ export class CatchupStateStore {
         if (bucket.includes(id)) return true;
       }
     }
+    if (org.suppressed) {
+      for (const bucket of Object.values(org.suppressed)) {
+        if (bucket.some(entry => entry.id === id)) return true;
+      }
+    }
     for (const [key, target] of Object.entries(org.targets)) {
       const set = this._idSet(label, key, target);
       if (set.has(id)) return true;
     }
     return false;
+  }
+
+  /**
+   * Persist a catch-up message as non-deliverable with a distinct status
+   * (`not_delivered`) separate from `delivered` / `recentIds`.
+   *
+   * Never updates `lastDeliveredAt` and never marks the message as delivered.
+   */
+  rememberSuppressed(label, id, { at = 0, reason = 'stale_cutoff', recordedAt = Date.now() } = {}) {
+    if (typeof id !== 'string' || !id) return;
+    const org = this.getOrg(label);
+    org.suppressed ||= {};
+    // Avoid duplicating an id already persisted as suppressed.
+    if (this.getSuppressedRecord(label, id)) return;
+    const stamp = toPositiveInt(recordedAt) || Date.now();
+    const bucketKey = String(Math.floor(stamp / DELIVERED_BUCKET_MS) * DELIVERED_BUCKET_MS);
+    const bucket = org.suppressed[bucketKey] ||= [];
+    bucket.push({
+      id,
+      at: toPositiveInt(at),
+      status: 'not_delivered',
+      reason: typeof reason === 'string' && reason ? reason : 'stale_cutoff',
+      recordedAt: stamp,
+    });
+    this._trimSuppressed(org);
+  }
+
+  _trimSuppressed(org) {
+    if (!org.suppressed) return;
+    let total = 0;
+    const keys = Object.keys(org.suppressed).sort((a, b) => Number(a) - Number(b));
+    for (const key of keys) total += org.suppressed[key].length;
+    if (total <= MAX_SUPPRESSED_RECORDS) return;
+    let excess = total - MAX_SUPPRESSED_RECORDS;
+    for (const key of keys) {
+      if (excess <= 0) break;
+      const bucket = org.suppressed[key];
+      if (bucket.length <= excess) {
+        excess -= bucket.length;
+        delete org.suppressed[key];
+      } else {
+        bucket.splice(0, excess);
+        excess = 0;
+      }
+    }
+  }
+
+  getSuppressedRecord(label, id) {
+    if (!id) return null;
+    const org = this.getOrg(label);
+    if (!org.suppressed) return null;
+    for (const bucket of Object.values(org.suppressed)) {
+      const found = bucket.find(entry => entry.id === id);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  isSuppressed(label, id) {
+    return this.getSuppressedRecord(label, id) !== null;
+  }
+
+  countSuppressed(label) {
+    const org = this.getOrg(label);
+    if (!org.suppressed) return 0;
+    let total = 0;
+    for (const bucket of Object.values(org.suppressed)) total += bucket.length;
+    return total;
+  }
+
+  /**
+   * Distinguish persisted message disposition:
+   *   - `'delivered'`     — accepted by C4 or policy-settled via `remember()`
+   *   - `'not_delivered'` — gated out of delivery via `rememberSuppressed()`
+   *   - `null`            — not recorded
+   */
+  getMessageStatus(label, id) {
+    if (!id) return null;
+    const org = this.getOrg(label);
+    if (org.recentIds.includes(id)) return 'delivered';
+    if (org.delivered) {
+      for (const bucket of Object.values(org.delivered)) {
+        if (bucket.includes(id)) return 'delivered';
+      }
+    }
+    if (this.getSuppressedRecord(label, id)) return 'not_delivered';
+    return null;
   }
 
   /**
@@ -323,13 +446,19 @@ export class CatchupStateStore {
     if (at) org.lastRememberedAt = Math.max(org.lastRememberedAt || 0, toPositiveInt(at) || 0);
   }
 
-  /** Drop delivery buckets older than the retention window (delivery time). */
+  /** Drop delivery and suppression buckets older than the retention window (wall clock). */
   pruneDelivered(label, now = Date.now()) {
     const org = this.getOrg(label);
-    if (!org.delivered) return;
     const floor = Math.floor((now - this.retainDeliveredMs) / DELIVERED_BUCKET_MS) * DELIVERED_BUCKET_MS;
-    for (const key of Object.keys(org.delivered)) {
-      if (Number(key) < floor) delete org.delivered[key];
+    if (org.delivered) {
+      for (const key of Object.keys(org.delivered)) {
+        if (Number(key) < floor) delete org.delivered[key];
+      }
+    }
+    if (org.suppressed) {
+      for (const key of Object.keys(org.suppressed)) {
+        if (Number(key) < floor) delete org.suppressed[key];
+      }
     }
   }
 
@@ -353,6 +482,18 @@ export class CatchupStateStore {
     return this.getOrg(label).targets[CatchupStateStore.targetKey(kind, id)] || null;
   }
 
+  /**
+   * Drop all pending per-target scan windows for an org while preserving
+   * `recentIds`, `delivered`, and `suppressed` records.
+   */
+  clearTargets(label) {
+    const org = this.getOrg(label);
+    org.targets = {};
+    for (const key of this._targetIdSets.keys()) {
+      if (key.startsWith(`${label}\u0000`)) this._targetIdSets.delete(key);
+    }
+  }
+
   /** All target keys with unfinished work, oldest pending window first. */
   openTargets(label) {
     const org = this.getOrg(label);
@@ -368,13 +509,16 @@ export class CatchupStateStore {
   }
 
   /**
-   * Open or extend a scan for one channel/thread so it covers `[doneUpTo, hi]`.
+   * Open or extend a scan for one channel/thread so it covers `[start, hi]`.
+   * New targets start from `lo` (or the org's `eventsSince` cursor when `lo`
+   * is omitted) instead of scanning full history from timestamp 1.
    * Existing unfinished windows are kept (that is the resume point).
    */
-  extendTarget(label, kind, id, hi) {
+  extendTarget(label, kind, id, hi, lo = 0) {
     const org = this.getOrg(label);
     const key = CatchupStateStore.targetKey(kind, id);
     const end = toPositiveInt(hi);
+    const explicitLo = toPositiveInt(lo);
     let t = org.targets[key];
     if (!t) {
       t = { doneUpTo: 0, hi: 0, windows: [], ids: [], anchorId: null, anchorAt: 0 };
@@ -383,8 +527,10 @@ export class CatchupStateStore {
     const grew = end > t.hi;
     if (grew) t.hi = end;
     if (t.windows.length === 0) {
-      if (t.hi > t.doneUpTo) {
-        t.windows = [[t.doneUpTo + 1, t.hi]];
+      const bound = explicitLo || org.eventsSince || 0;
+      const start = Math.max(t.doneUpTo + 1, bound > 0 ? bound : 1);
+      if (t.hi >= start) {
+        t.windows = [[start, t.hi]];
         t.ids = [];
         t.anchorId = null;
         t.anchorAt = 0;

@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.7.10-3ai.2] - 2026-11-26
+
+### Fixed
+- **Online cursor advancement (`DeliveryGate.mark`)**: live WebSocket deliveries
+  now monotonically advance `eventsSince` whenever no gap is open, no target
+  scan or event cursor is unfinished, no catch-up run is active, and no other
+  live delivery is in flight — preventing cursors from stagnating over days of
+  continuous uptime while preserving gap/in-flight safety invariants.
+- **Bounded target scans & cursor + time gates (no reliance on 48h dedup buckets)**:
+  `CatchupStateStore.extendTarget()` now opens new targets from the cursor lower
+  bound (`lo` / `eventsSince`) instead of scanning full history from `[1, hi]`.
+  Both timestamp-window and `byId` scans enforce `max(eventsSince, cutoffAt)` so
+  expired 48h dedup buckets can never trigger historical replay.
+- **Restart dual gates (`HXA_CATCHUP_MAX_AGE_MIN`, default `30` minutes)**:
+  - **Message gate**: catch-up messages and offline lifecycle events earlier than
+    `eventsSince` or `processStartedAt - HXA_CATCHUP_MAX_AGE_MIN` are never
+    forwarded to C4/Agent; they are persisted in `catchup-state.json` under
+    `suppressed` with explicit status `not_delivered` (distinguishable from
+    `delivered`) and logged in one summary line.
+  - **Cursor gate**: when the cursor is missing or older than
+    `processStartedAt - HXA_CATCHUP_MAX_AGE_MIN`, the watermark jumps directly
+    to `now` and stale target windows are cleared without replaying history.
+  - **DM inbox reconciler parity**: `DmInboxReconciler` enforces the same
+    `processStartedAt` + `HXA_CATCHUP_MAX_AGE_MIN` dual gates on startup/polling.
+- **Outbound org guard is now default-deny (allowlist required)**:
+  `src/lib/outbound-guard.js` now fails closed when `outbound-guard.json` is
+  absent, blocking customer and non-with3 orgs by default across both
+  `scripts/send.js` and `scripts/stream.js`. Orgs are opened explicitly via
+  `outbound-guard.json` (`internal_labels` and/or optional `internal_org_ids`),
+  while command-level `HXA_CONFIRM_ORG` (never `.env`) remains supported.
+- **CI & security hygiene**: bumped `undici` to `^7.30.2` to clear high-severity
+  `npm audit` findings, and updated `test/stream-outbound-guard.test.js` +
+  `.github/workflows/ci.yml` (`fetch-depth: 0`) so clean clones and CI execute
+  the historical `9835fc72` guard tests automatically.
+
 ## [1.7.10-3ai.1] - 2026-11-22
 
 ### Fixed

@@ -200,16 +200,48 @@ describe('outbound org guard — scripts/send.js', () => {
     }
   });
 
-  it('does not guard at all when outbound-guard.json is absent', async () => {
+  it('blocks by default when outbound-guard.json is absent (customer and non-with3 orgs denied)', async () => {
     const home = makeHome({ guard: null });
     sentRequests = [];
     try {
-      const res = await runSend(home, ['org:customer-org|some-bot', 'hello customer']);
+      const extRes = await runSend(home, ['org:customer-org|some-bot', 'hello customer']);
+      assert.notEqual(extRes.code, 0, 'customer org must be blocked by default without outbound-guard.json');
+      assert.equal(sentRequests.length, 0, 'nothing may reach the hub');
+      assert.match(extRes.stderr, /BLOCKED/);
+      assert.match(extRes.stderr, /outbound-guard\.json not found/);
+      assert.ok(!extRes.stderr.includes('hello customer'), 'body must not be echoed');
 
-      assert.equal(res.code, 0, `expected exit 0, got ${res.code}: ${res.stderr}`);
-      assert.equal(sentRequests.length, 1, 'unguarded host keeps sending to external orgs');
-      assert.ok(!res.stderr.includes('BLOCKED'));
-      assert.ok(!res.stdout.includes('CONFIRMED EXTERNAL'));
+      const otherRes = await runSend(home, ['org:internal|some-bot', 'hello unlisted']);
+      assert.notEqual(otherRes.code, 0, 'unlisted org must also be blocked when no allowlist exists');
+      assert.equal(sentRequests.length, 0, 'nothing may reach the hub');
+      assert.match(otherRes.stderr, /BLOCKED/);
+
+      // Explicit one-shot command confirmation still works when needed.
+      const confirmedRes = await runSend(home, ['org:customer-org|some-bot', 'approved send'], {
+        env: { HXA_CONFIRM_ORG: 'customer-org' },
+      });
+      assert.equal(confirmedRes.code, 0, `expected exit 0, got ${confirmedRes.code}: ${confirmedRes.stderr}`);
+      assert.equal(sentRequests.length, 1);
+      assert.match(confirmedRes.stdout, /CONFIRMED EXTERNAL/);
+    } finally {
+      cleanup(home);
+    }
+  });
+
+  it('allows an org whitelisted by internal_org_ids while blocking customer and non-with3 orgs', async () => {
+    const home = makeHome({ guard: { internal_org_ids: [INTERNAL_ORG_ID] } });
+    sentRequests = [];
+    try {
+      const allowedRes = await runSend(home, ['org:internal|some-bot', 'hello with3']);
+      assert.equal(allowedRes.code, 0, `expected exit 0, got ${allowedRes.code}: ${allowedRes.stderr}`);
+      assert.equal(sentRequests.length, 1);
+      assert.ok(!allowedRes.stderr.includes('BLOCKED'));
+
+      const blockedRes = await runSend(home, ['org:customer-org|some-bot', 'hello customer']);
+      assert.notEqual(blockedRes.code, 0, 'customer org not in internal_org_ids must be blocked');
+      assert.equal(sentRequests.length, 1, 'blocked send must not reach the hub');
+      assert.match(blockedRes.stderr, /BLOCKED/);
+      assert.ok(blockedRes.stderr.includes(EXTERNAL_ORG_ID), 'blocked output should show org id');
     } finally {
       cleanup(home);
     }

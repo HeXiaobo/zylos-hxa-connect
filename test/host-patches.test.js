@@ -110,6 +110,10 @@ function makeHome() {
       },
     },
   }, null, 2));
+  fs.writeFileSync(
+    path.join(dir, 'outbound-guard.json'),
+    JSON.stringify({ internal_labels: ['default'] }, null, 2),
+  );
   return home;
 }
 

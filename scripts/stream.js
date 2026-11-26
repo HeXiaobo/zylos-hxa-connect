@@ -38,9 +38,10 @@ function readStdin() {
  * therefore never returns a success receipt — the caller gets a non-zero exit
  * and an explicit "not delivered" line.
  */
-function enforceOutboundGuard({ guard, label }) {
+function enforceOutboundGuard({ guard, label, orgId }) {
   const decision = evaluateSend({
     effectiveLabel: label,
+    orgId,
     target: label,
     guard,
     confirmOrg: process.env[CONFIRM_ENV],
@@ -86,7 +87,7 @@ async function main() {
       const org = resolved.orgs[label];
       if (!org) throw new Error(`HXA response org not found: ${label}`);
       if (!org.hubUrl) throw new Error(`HXA response org has no hub URL: ${label}`);
-      enforceOutboundGuard({ guard, label });
+      enforceOutboundGuard({ guard, label, orgId: org.orgId });
       if (!clients.has(label)) {
         clients.set(label, new HxaConnectClient({
           url: org.hubUrl,

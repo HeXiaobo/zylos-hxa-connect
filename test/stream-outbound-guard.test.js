@@ -22,14 +22,16 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-const STREAM_SCRIPT = path.join(import.meta.dirname, '..', 'scripts', 'stream.js');
+const REPO_ROOT = path.join(import.meta.dirname, '..');
+const STREAM_SCRIPT = path.join(REPO_ROOT, 'scripts', 'stream.js');
+const LEGACY_COMMIT = '9835fc721c1ccf52bb530a8021228a8857cbfd3a';
 const FIXTURE_TOKEN = 'test-token-not-a-real-secret';
 const INTERNAL_ORG_ID = '11111111-1111-4111-8111-111111111111';
 const EXTERNAL_ORG_ID = 'b13e6733-50bd-4cb2-a022-d27c935e7d47';
@@ -370,6 +372,26 @@ describe('outbound org guard — scripts/stream.js', () => {
     }
   });
 
+  it('fails closed when outbound-guard.json is absent (default-deny for legacy and canonical)', async () => {
+    const home = makeHome({ guard: null });
+    sentRequests = [];
+    try {
+      const legacyRes = await runStream(home, legacyPayload('customer-org'), {
+        env: { HXA_FINAL_DELIVERY_MODE: 'legacy' },
+      });
+      assertBlockedStep(legacyRes, 'legacy default-deny');
+
+      const canonicalRes = await runStream(home, canonicalPayload('customer-org'), {
+        env: { HXA_FINAL_DELIVERY_MODE: 'canonical' },
+      });
+      assertBlockedStep(canonicalRes, 'canonical default-deny');
+
+      assert.equal(sentCount(), 0, 'nothing may reach the hub when outbound-guard.json is absent');
+    } finally {
+      cleanup(home);
+    }
+  });
+
   it('fails closed on a malformed guard', async () => {
     const home = makeHome({ guard: null });
     fs.writeFileSync(path.join(home, 'zylos', 'components', 'hxa-connect', 'outbound-guard.json'), '{not json');
@@ -479,11 +501,43 @@ describe('outbound org guard — canonical replay and reconcile stay hard failur
  * HXA_ROUTE_MISMATCH` record produced through a genuine routing failure.
  */
 describe('outbound org guard — records left by an older build', () => {
-  before(startFakeHub);
-  after(stopFakeHub);
+  let legacyTempDir = null;
+  let legacyStreamPath = process.env.HXA_LEGACY_STREAM || '';
 
-  const LEGACY_STREAM = process.env.HXA_LEGACY_STREAM || '';
-  const legacyAvailable = LEGACY_STREAM !== '' && fs.existsSync(LEGACY_STREAM);
+  before(async () => {
+    await startFakeHub();
+    if (!legacyStreamPath) {
+      // Materialize the real 9835fc72 checkout from local git history so clean
+      // clones and CI exercise the exact historical script without weakening.
+      try {
+        execFileSync('git', ['rev-parse', '--verify', LEGACY_COMMIT], { cwd: REPO_ROOT, stdio: 'ignore' });
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hxa-legacy-9835fc72-'));
+        const tarBuf = execFileSync('git', ['archive', LEGACY_COMMIT], {
+          cwd: REPO_ROOT,
+          maxBuffer: 20 * 1024 * 1024,
+        });
+        execFileSync('tar', ['-xf', '-', '-C', dir], { input: tarBuf });
+        const repoModules = path.join(REPO_ROOT, 'node_modules');
+        if (fs.existsSync(repoModules)) {
+          fs.symlinkSync(repoModules, path.join(dir, 'node_modules'), 'dir');
+        }
+        legacyTempDir = dir;
+        legacyStreamPath = path.join(dir, 'scripts', 'stream.js');
+      } catch {
+        legacyStreamPath = '';
+      }
+    }
+  });
+
+  after(async () => {
+    await stopFakeHub();
+    if (legacyTempDir) {
+      fs.rmSync(legacyTempDir, { recursive: true, force: true });
+      legacyTempDir = null;
+    }
+  });
+
+  const legacyAvailable = () => legacyStreamPath !== '' && fs.existsSync(legacyStreamPath);
 
   function storeDir(home) {
     return path.join(home, 'zylos', 'components', 'hxa-connect', 'assistant-response-deliveries');
@@ -498,11 +552,11 @@ describe('outbound org guard — records left by an older build', () => {
   }
 
   it('replaying an older build\'s unknown/rejected record is still a refusal', async () => {
-    if (!legacyAvailable) {
+    if (!legacyAvailable()) {
       // Without the legacy script the historical record cannot be produced, and
       // a self-made one would not prove the reported case. Fail loudly rather
       // than pass on a substitute.
-      assert.fail(`HXA_LEGACY_STREAM must point at a checkout of 9835fc72 (got "${LEGACY_STREAM}")`);
+      assert.fail(`HXA_LEGACY_STREAM must point at a checkout of 9835fc72 (got "${legacyStreamPath}")`);
     }
     const home = makeHome({ guard: GUARD });
     const env = { HXA_FINAL_DELIVERY_MODE: 'canonical' };
@@ -511,8 +565,8 @@ describe('outbound org guard — records left by an older build', () => {
     try {
       // Step 1-2: the legacy build refuses the send after writing a `sending`
       // claim, then mistakes it for an interrupted send.
-      await runStream(home, claim, { env, script: LEGACY_STREAM });
-      await runStream(home, claim, { env, script: LEGACY_STREAM });
+      await runStream(home, claim, { env, script: legacyStreamPath });
+      await runStream(home, claim, { env, script: legacyStreamPath });
       const legacyRecords = records(home);
       assert.equal(legacyRecords.length, 1, 'the legacy build must have left exactly one record');
       assert.ok(
@@ -531,8 +585,8 @@ describe('outbound org guard — records left by an older build', () => {
   });
 
   it('replaying an older build\'s route-rejected reconcile claim is still a refusal', async () => {
-    if (!legacyAvailable) {
-      assert.fail(`HXA_LEGACY_STREAM must point at a checkout of 9835fc72 (got "${LEGACY_STREAM}")`);
+    if (!legacyAvailable()) {
+      assert.fail(`HXA_LEGACY_STREAM must point at a checkout of 9835fc72 (got "${legacyStreamPath}")`);
     }
     const home = makeHome({ guard: GUARD });
     const env = { HXA_FINAL_DELIVERY_MODE: 'canonical' };
@@ -541,8 +595,8 @@ describe('outbound org guard — records left by an older build', () => {
     sentRequests = [];
     try {
       // Step 4: the legacy build records the refusal as rejected/ROUTE_MISMATCH.
-      await runStream(home, claim, { env, script: LEGACY_STREAM });
-      await runStream(home, reconcileClaim, { env, script: LEGACY_STREAM });
+      await runStream(home, claim, { env, script: legacyStreamPath });
+      await runStream(home, reconcileClaim, { env, script: legacyStreamPath });
       const legacyRecords = records(home);
       assert.equal(legacyRecords.length, 1);
       assert.ok(

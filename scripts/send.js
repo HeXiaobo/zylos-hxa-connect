@@ -131,9 +131,9 @@ if (!org.hubUrl) {
   process.exit(1);
 }
 
-// Outbound org guard — no-op unless outbound-guard.json exists (see
-// src/lib/outbound-guard.js). Runs after the label is resolved and before any
-// client is built, so a blocked send opens no connection.
+// Outbound org guard — default-deny allowlist (see src/lib/outbound-guard.js).
+// Runs after the label is resolved and before any client is built, so a
+// blocked send opens no connection.
 let guard;
 try {
   guard = loadGuardConfig();
@@ -144,6 +144,7 @@ try {
 
 const guardDecision = evaluateSend({
   effectiveLabel,
+  orgId: org.orgId,
   target,
   guard,
   confirmOrg: process.env[CONFIRM_ENV],

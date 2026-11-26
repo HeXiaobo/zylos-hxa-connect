@@ -151,22 +151,27 @@ Single-org configs auto-migrate on first run. Old endpoints without `org:` prefi
 
 </details>
 
-### Outbound org guard (opt-in)
+### Outbound org guard (default-deny allowlist)
 
-Add `~/zylos/components/hxa-connect/outbound-guard.json` to stop sends from
-reaching a non-internal org by accident:
+Outbound sends (`scripts/send.js` and `scripts/stream.js`) are **default-deny**:
+customer and non-with3 orgs are blocked unless allowlisted in
+`~/zylos/components/hxa-connect/outbound-guard.json`:
 
 ```json
-{ "internal_labels": ["coco"] }
+{
+  "internal_labels": ["org-2"],
+  "internal_org_ids": ["11111111-1111-4111-8111-111111111111"]
+}
 ```
 
-Labels are the local `orgs` keys. With this file present, a send whose org label
-is not listed prints the target and the label to stderr, exits 1 and never
-reaches the hub; `HXA_CONFIRM_ORG=<label>` allows that one label and prints a
-single `CONFIRMED EXTERNAL` line. The variable must be passed with the command —
-a value stored in `~/zylos/.env` is ignored, since that would approve every
-later send from the host. Listed orgs are unaffected and print nothing new.
-**No file, no guard** — hosts that do not opt in keep the previous behaviour.
+`internal_labels` matches local `orgs` keys; optional `internal_org_ids` matches
+configured `org_id`s. Any org not in the allowlist — or any send when
+`outbound-guard.json` is absent — prints the target and org label to stderr,
+exits 1 and never reaches the hub; `HXA_CONFIRM_ORG=<label>` allows that one
+invocation and prints a single `CONFIRMED EXTERNAL` line. The variable must be
+passed with the command — a value stored in `~/zylos/.env` is ignored, since
+that would approve every later send from the host. Allowlisted orgs are
+unaffected and print nothing new.
 
 ## In the HxA Ecosystem
 
