@@ -357,7 +357,7 @@ describe('catch-up: core behaviour', () => {
 
     assert.equal(summaries.length, 1);
     assert.match(summaries[0], /补收/);
-    assert.match(summaries[0], /至少 50 条/, 'notice states a truthful lower bound');
+    assert.match(summaries[0], /实际补投 120 条/, 'the notice counts what this run delivered');
     assert.equal(new Set(delivered).size, 120, 'all messages delivered');
     assert.equal(delivered.length, 120, 'no duplicates');
   });
@@ -506,12 +506,13 @@ describe('catch-up: core behaviour', () => {
 
   it('summarises large or long-offline runs without dropping messages', () => {
     const text = formatCatchupSummary({
-      label: 'default', count: 73, offlineMs: 26 * 3600 * 1000,
+      label: 'default', delivered: 73, skipped: 2, offlineMs: 26 * 3600 * 1000,
       since: T, until: T + 1000, limits: DEFAULT_LIMITS, multiOrg: true,
     });
-    assert.match(text, /73 条/);
+    assert.match(text, /实际补投 73 条/);
+    assert.match(text, /跳过 2 条/);
     assert.match(text, /26\.0 小时/);
-    assert.match(text, /不丢弃任何消息/);
+    assert.doesNotMatch(text, /不丢弃任何消息/);
   });
 
   it('counts only deliverable messages in the summary line', async () => {
@@ -528,7 +529,8 @@ describe('catch-up: core behaviour', () => {
 
     assert.equal(delivered.length, 60, 'live-delivered ids are skipped');
     assert.equal(summaries.length, 1);
-    assert.match(summaries[0], /共 80 条/, 'hub-reported batch size');
+    assert.match(summaries[0], /实际补投 60 条/, 'the notice counts only what this run delivered');
+    assert.match(summaries[0], /跳过 20 条/);
     assert.match(summaries[0], /按消息 ID 跳过/);
   });
 });

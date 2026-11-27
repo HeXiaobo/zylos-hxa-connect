@@ -549,7 +549,7 @@ describe('volume — nothing is discarded', () => {
 
     assert.equal(summaries.length, 1, 'exactly one notice line');
     assert.match(summaries[0], /700 条/);
-    assert.match(summaries[0], /不丢弃任何消息/);
+    assert.match(summaries[0], /实际补投 700 条/);
     assert.equal(delivered.length, 700);
     assert.equal(new Set(delivered).size, 700);
   });

@@ -24,6 +24,10 @@ import { cameFromEnvFile, migrateConfig, resolveOrgs, setupFetchProxy } from '..
 import {
   CONFIRM_ENV, evaluateSend, formatGuardMessage, loadGuardConfig,
 } from '../src/lib/outbound-guard.js';
+import { createReplyReceipt } from '../src/lib/c4-receipt.js';
+import { isLocalEndpoint } from '../src/lib/local-endpoint.js';
+
+const receipts = createReplyReceipt({ token: process.env.ZYLOS_REPLY_RECEIPT_TOKEN || '' });
 
 const ORG_PREFIX_RE = /^org:([a-z0-9][a-z0-9-]*)\|(.+)$/;
 
@@ -69,6 +73,13 @@ const MSG_SUFFIX_RE = /\|msg:([a-f0-9-]+)$/i;
 const msgMatch = rawTarget.match(MSG_SUFFIX_RE);
 const replyToId = msgMatch ? msgMatch[1] : null;
 const target = msgMatch ? rawTarget.slice(0, msgMatch.index) : rawTarget;
+
+// `admin` is the C4 notice target written by bot.js, not a hub bot. It is
+// recorded locally and never sent: the hub answers `Bot not found: admin`.
+if (isLocalEndpoint(target)) {
+  console.log(`[hxa-connect] local endpoint ${target}: recorded, not sent`);
+  process.exit(0);
+}
 
 const config = migrateConfig();
 const resolved = resolveOrgs(config);
@@ -138,12 +149,13 @@ async function sendAsThread(threadId) {
   const opts = replyToId ? { reply_to: replyToId } : undefined;
   let usedReplyTo = !!replyToId;
   try {
-    await client.sendThreadMessage(threadId, message, opts);
+    const sent = await client.sendThreadMessage(threadId, message, opts);
+    receipts.note(sent);
   } catch (err) {
     // If reply_to fails (message deleted), retry without it
     if (replyToId && (err?.status === 400 || err?.body?.code === 'NOT_FOUND')) {
       console.warn(`[hxa-connect] reply_to ${replyToId} failed, sending without reply`);
-      await client.sendThreadMessage(threadId, message);
+      receipts.note(await client.sendThreadMessage(threadId, message));
       usedReplyTo = false;
     } else {
       throw err;
@@ -153,7 +165,7 @@ async function sendAsThread(threadId) {
 }
 
 async function sendAsDM(to) {
-  await client.send(to, message);
+  receipts.note(await client.send(to, message));
   console.log(`Sent to ${to}: ${message.substring(0, 50)}...`);
 }
 
@@ -182,3 +194,5 @@ try {
   console.error(`Error sending to ${target}: ${redactSecrets(err.message)}`);
   process.exit(1);
 }
+
+receipts.emit();
