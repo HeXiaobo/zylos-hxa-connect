@@ -1,12 +1,19 @@
 /**
  * C4-local pseudo targets.
  *
- * `bot.js` writes admin notices to `org:<label>|admin` so the agent sees them
- * in the same context as real DMs. `admin` is not a hub bot: sending it to the
- * hub fails with `Bot not found: admin`. These targets must stay local.
+ * `bot.js` writes system notices to `org:<label>|local:<name>` so the agent
+ * sees them in the same context as real DMs. The hub has no such bot; sending
+ * the bare name would fail with `Bot not found`.
  */
-export const LOCAL_ENDPOINTS = Object.freeze(['admin']);
+// A prefixed marker, not a bare name: a real hub bot may legitimately be
+// called `admin`, and that send must keep working. Bot names cannot contain a
+// colon, so `local:` cannot collide with one.
+export const LOCAL_ENDPOINT_PREFIX = 'local:';
+
+export function localEndpoint(name) {
+  return `${LOCAL_ENDPOINT_PREFIX}${name}`;
+}
 
 export function isLocalEndpoint(target) {
-  return LOCAL_ENDPOINTS.includes(String(target ?? ''));
+  return String(target ?? '').startsWith(LOCAL_ENDPOINT_PREFIX);
 }

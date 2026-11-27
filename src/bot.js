@@ -26,6 +26,7 @@ import { buildDmContent, buildThreadHeader } from './lib/format.js';
 import { CatchupStateStore, resolveCatchupStatePath } from './lib/catchup-state.js';
 // zylos-lab-hxa-redact: never log tokens/tickets/Authorization values.
 import { redactSecrets } from './lib/redact.js';
+import { localEndpoint } from './lib/local-endpoint.js';
 
 const HOME = process.env.HOME;
 const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -65,12 +66,15 @@ function fallbackFormatThreadLifecycleEvent(event) {
 
 const formatThreadLifecycleEvent = hxaSdk.formatThreadLifecycleEvent || fallbackFormatThreadLifecycleEvent;
 
-// `admin` is a C4-local target, not a hub bot: notices written here are for
-// the agent's context only. send.js recognises it and never posts it to the
-// hub, which would answer `Bot not found: admin`.
 function c4Endpoint(label, endpoint) {
   if (!isMultiOrg && label === 'default') return endpoint;
   return `org:${label}|${endpoint}`;
+}
+
+// System notices are C4-local. A `local:` prefix keeps them out of the hub
+// without shadowing a real bot that happens to be named `admin`.
+function c4LocalEndpoint(label, name) {
+  return c4Endpoint(label, localEndpoint(name));
 }
 
 function displayPrefix(label) {
@@ -735,7 +739,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botId = msg.bot?.id || 'unknown';
     console.log(`${lp} Bot join request: ${botName} (awaiting approval)`);
     const formatted = `[${dp}] [priority:high] [action:notify-owner] Bot "${botName}" (id: ${botId}) is requesting to join the org (pending admin approval)`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4LocalEndpoint(label, 'admin'), formatted);
   });
 
   client.on('bot_status_changed', (msg) => {
@@ -743,7 +747,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     const botName = msg.name || msg.bot_id || 'unknown';
     console.log(`${lp} Bot status changed: ${botName} → ${status}`);
     const formatted = `[${dp}] Bot "${botName}" status changed to ${status}${msg.reason ? ` (reason: ${msg.reason})` : ''}`;
-    sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), formatted);
+    sendToC4(C4_CHANNEL, c4LocalEndpoint(label, 'admin'), formatted);
   });
 
   // ─── Connection Lifecycle ──────────────────────────────
@@ -775,7 +779,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
     // One notice line before a large replay. Goes to the same channel as the
     // messages themselves (admin endpoint) so it shows up in context.
     deliverSummary: async (text) => {
-      sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+      sendToC4(C4_CHANNEL, c4LocalEndpoint(label, 'admin'), text);
     },
 
     // Invites / status changes that happened while offline: reuse the realtime
@@ -791,7 +795,7 @@ for (const [label, org] of Object.entries(resolved.orgs)) {
       }
       const text = formatCatchupEventLine({ label, event, multiOrg: isMultiOrg });
       if (event.type === 'thread_invited' || event.type === 'thread_status_changed') {
-        sendToC4(C4_CHANNEL, c4Endpoint(label, 'admin'), text);
+        sendToC4(C4_CHANNEL, c4LocalEndpoint(label, 'admin'), text);
       } else {
         console.log(`${lp} catch-up event: ${text}`);
       }
