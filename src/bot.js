@@ -65,6 +65,9 @@ function fallbackFormatThreadLifecycleEvent(event) {
 
 const formatThreadLifecycleEvent = hxaSdk.formatThreadLifecycleEvent || fallbackFormatThreadLifecycleEvent;
 
+// `admin` is a C4-local target, not a hub bot: notices written here are for
+// the agent's context only. send.js recognises it and never posts it to the
+// hub, which would answer `Bot not found: admin`.
 function c4Endpoint(label, endpoint) {
   if (!isMultiOrg && label === 'default') return endpoint;
   return `org:${label}|${endpoint}`;

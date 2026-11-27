@@ -224,18 +224,20 @@ export class DeliveryGate {
 }
 
 /**
- * One notice line before a large replay.
- * `exact === false` means `count` is a lower bound (we found out the batch was
- * big only by delivering it, the hub did not give us totals).
+ * One notice line after a replay, with what this run actually did.
+ *
+ * The hub's `channel_message_summary.count` is a rolling per-channel counter,
+ * not the number of messages in the printed window: it does not reset after a
+ * delivery, and 238 of them can sit behind a one-message gap. Reporting that
+ * number as "replayed 238" overstates the batch by two orders of magnitude.
+ * Only `delivered`/`skipped` are facts about this run.
  */
-export function formatCatchupSummary({ label, count, exact = true, offlineMs, since, until, limits = DEFAULT_LIMITS, multiOrg }) {
+export function formatCatchupSummary({ label, delivered = 0, skipped = 0, offlineMs, since, until, limits = DEFAULT_LIMITS, multiOrg }) {
   const tag = multiOrg === false ? 'HXA-Connect' : `HXA:${label}`;
   const hours = offlineMs > 0 ? (offlineMs / 3600000) : 0;
   const window = `${new Date(since).toISOString()} → ${new Date(until).toISOString()}`;
-  const size = exact ? `共 ${count} 条` : `至少 ${count} 条`;
-  return `[${tag}] 补收：离线约 ${hours.toFixed(1)} 小时，${size}消息（${window}）。` +
-    `按每批 ${limits.batchSize} 条、间隔 ${Math.round(limits.batchDelayMs / 1000)} 秒全部补投，不丢弃任何消息；` +
-    `已投递过的按消息 ID 跳过。`;
+  return `[${tag}] 补收：离线约 ${hours.toFixed(1)} 小时，实际补投 ${delivered} 条，跳过 ${skipped} 条（${window}）。` +
+    `按每批 ${limits.batchSize} 条、间隔 ${Math.round(limits.batchDelayMs / 1000)} 秒处理；已投递过的按消息 ID 跳过。`;
 }
 
 export function formatCatchupEventLine({ label, event, multiOrg }) {
@@ -570,8 +572,10 @@ export class CatchupRunner {
     if (overThreshold) this.log(`catchup: large batch expected (${expected} message(s), offline ${(offlineMs / 3600000).toFixed(1)}h)`);
 
     let summarySent = false;
-    const maybeSummary = async () => {
-      if (summarySent) return;
+    // Sent after the scans finish, never before: the counters are only facts
+    // once the run has delivered or skipped something.
+    const maybeSummary = async (final = false) => {
+      if (!final || summarySent) return;
       const knownBig = expected > this.limits.notifyThreshold
         || offlineMs > this.limits.offlineThresholdMs;
       const discoveredBig = counters.delivered >= this.limits.notifyThreshold;
@@ -580,8 +584,8 @@ export class CatchupRunner {
       try {
         await this.deliverSummary(formatCatchupSummary({
           label: this.label,
-          count: knownBig ? Math.max(expected, 1) : counters.delivered,
-          exact: knownBig,
+          delivered: counters.delivered,
+          skipped: counters.skipped,
           offlineMs,
           since: eventsSince,
           until: startedAt,
@@ -717,6 +721,7 @@ export class CatchupRunner {
     // A gap that appeared while this run was in flight belongs to the *next*
     // run: closing it now would move the boundary past messages this run never
     // looked at.
+    await maybeSummary(true);
     const gapClosed = canAdvance && this.state.settleGap(this.label, epochAtStart);
 
     if (gapClosed) {
@@ -843,7 +848,6 @@ export class CatchupRunner {
             progressed = true;
             continue;
           }
-          await maybeSummary();
           this.gate.begin(m.id);
           try {
             await this.deliverMessage({
@@ -948,10 +952,6 @@ export class CatchupRunner {
           progressed = true;
           continue;
         }
-        // Before the first delivery of a large/long-offline batch, send one
-        // notice line so the agent knows what the burst is. If the batch turns
-        // out big only after we started, the notice goes out at the threshold.
-        await maybeSummary();
         this.gate.begin(m.id);
         try {
           await this.deliverMessage({
